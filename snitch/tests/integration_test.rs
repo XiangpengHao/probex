@@ -55,10 +55,18 @@ fn test_version_output() {
 #[test]
 #[ignore = "requires root privileges and eBPF support"]
 fn test_trace_sleep() {
-    use std::io::Read;
+    use std::fs::File;
+
+    use arrow::array::Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let temp_file = "/tmp/snitch_test_sleep.parquet";
+
+    // Clean up any existing file
+    let _ = std::fs::remove_file(temp_file);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_snitch"))
-        .args(["--", "sleep", "0.1"])
+        .args(["-o", temp_file, "--", "sleep", "0.1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -85,38 +93,53 @@ fn test_trace_sleep() {
         }
     }
 
-    // Read stdout and verify we got some JSON events
-    let mut stdout = String::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut stdout)
-        .expect("failed to read stdout");
+    // Read and verify Parquet output
+    let file = File::open(temp_file).expect("failed to open parquet file");
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).expect("failed to create parquet reader");
+
+    let reader = builder.build().expect("failed to build reader");
+
+    let mut total_rows = 0;
+    let mut has_process_exit = false;
+
+    for batch_result in reader {
+        let batch = batch_result.expect("failed to read batch");
+        total_rows += batch.num_rows();
+
+        // Check event_type column for process_exit
+        let event_type_col = batch
+            .column_by_name("event_type")
+            .expect("missing event_type column");
+        let event_types = event_type_col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("event_type should be StringArray");
+
+        for i in 0..event_types.len() {
+            if event_types.value(i) == "process_exit" {
+                has_process_exit = true;
+            }
+        }
+    }
 
     // Should have at least one event (process_exit at minimum)
-    assert!(!stdout.is_empty(), "expected some output events");
+    assert!(total_rows > 0, "expected some output events");
+    assert!(has_process_exit, "expected at least one process_exit event");
 
-    // Verify output is valid JSON lines
-    for line in stdout.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let parsed: serde_json::Value =
-            serde_json::from_str(line).expect(&format!("invalid JSON: {}", line));
-        assert!(parsed.get("type").is_some(), "event missing 'type' field");
-        assert!(parsed.get("ts_ns").is_some(), "event missing 'ts_ns' field");
-        assert!(parsed.get("pid").is_some(), "event missing 'pid' field");
-    }
+    // Clean up
+    let _ = std::fs::remove_file(temp_file);
 }
 
-/// Test output to file
+/// Test output to file (default behavior)
 #[test]
 #[ignore = "requires root privileges and eBPF support"]
 fn test_output_to_file() {
-    use std::fs;
+    use std::fs::{self, File};
 
-    let temp_file = "/tmp/snitch_test_output.jsonl";
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    let temp_file = "/tmp/snitch_test_output.parquet";
 
     // Clean up any existing file
     let _ = fs::remove_file(temp_file);
@@ -128,10 +151,68 @@ fn test_output_to_file() {
 
     assert!(status.success(), "snitch exited with error");
 
-    // Verify file was created and contains valid JSON
-    let content = fs::read_to_string(temp_file).expect("failed to read output file");
-    assert!(!content.is_empty(), "output file is empty");
+    // Verify file was created and contains valid Parquet data
+    let file = File::open(temp_file).expect("failed to open parquet file");
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).expect("failed to create parquet reader");
+
+    // Verify schema has expected columns
+    let schema = builder.schema();
+    assert!(
+        schema.column_with_name("event_type").is_some(),
+        "missing event_type column"
+    );
+    assert!(
+        schema.column_with_name("ts_ns").is_some(),
+        "missing ts_ns column"
+    );
+    assert!(
+        schema.column_with_name("pid").is_some(),
+        "missing pid column"
+    );
+    assert!(
+        schema.column_with_name("cpu").is_some(),
+        "missing cpu column"
+    );
+
+    // Read all batches to verify file is valid
+    let reader = builder.build().expect("failed to build reader");
+    let mut total_rows = 0;
+    for batch_result in reader {
+        let batch = batch_result.expect("failed to read batch");
+        total_rows += batch.num_rows();
+    }
+
+    assert!(total_rows > 0, "output file has no events");
 
     // Clean up
     let _ = fs::remove_file(temp_file);
+}
+
+/// Test that default output file is trace.parquet
+#[test]
+#[ignore = "requires root privileges and eBPF support"]
+fn test_default_output_file() {
+    use std::fs;
+
+    let default_file = "trace.parquet";
+
+    // Clean up any existing file
+    let _ = fs::remove_file(default_file);
+
+    let status = Command::new(env!("CARGO_BIN_EXE_snitch"))
+        .args(["--", "true"])
+        .status()
+        .expect("failed to run snitch");
+
+    assert!(status.success(), "snitch exited with error");
+
+    // Verify default file was created
+    assert!(
+        fs::metadata(default_file).is_ok(),
+        "default output file trace.parquet was not created"
+    );
+
+    // Clean up
+    let _ = fs::remove_file(default_file);
 }

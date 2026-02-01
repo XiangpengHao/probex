@@ -55,11 +55,11 @@
 //!    │  Check TRACED_PIDS map      │    Parse event struct      │
 //!    │       │                     │         │                  │
 //!    │       ▼                     │         ▼                  │
-//!    │  If PID tracked:            │    Serialize to JSON       │
+//!    │  If PID tracked:            │    Buffer events in batch  │
 //!    │  Write event to ring buffer │         │                  │
 //!    │                             │         ▼                  │
-//!    │  (Fork events also add      │    Write to output         │
-//!    │   child PID to map)         │    (file or stdout)        │
+//!    │  (Fork events also add      │    Write batch to Parquet  │
+//!    │   child PID to map)         │    when batch is full      │
 //!    └──────────────────────────────────────────────────────────┘
 //!         │
 //!         ▼
@@ -91,9 +91,14 @@
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
+use arrow::array::{
+    ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt32Builder, UInt64Builder, UInt8Builder,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use aya::maps::{HashMap, RingBuf};
 use aya::programs::TracePoint;
 use clap::Parser;
@@ -101,7 +106,9 @@ use log::{debug, info, warn};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
-use serde::Serialize;
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use snitch_common::{
     EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent,
     SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
@@ -109,83 +116,199 @@ use snitch_common::{
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
+/// Batch size for Parquet writes (10,000 events per batch)
+const BATCH_SIZE: usize = 10_000;
+
 #[derive(Parser, Debug)]
 #[command(name = "snitch")]
 #[command(about = "eBPF process tracing tool")]
 #[command(version)]
 struct Args {
-    /// Output file for JSON lines (default: stdout)
-    #[arg(short, long)]
-    output: Option<String>,
+    /// Output parquet file (default: trace.parquet)
+    #[arg(short, long, default_value = "trace.parquet")]
+    output: String,
 
     /// Command to run
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
-/// JSON output event types
-#[derive(Serialize)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum JsonEvent {
-    SchedSwitch {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        prev_pid: u32,
-        next_pid: u32,
-        prev_state: i64,
-    },
-    ProcessFork {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        parent_pid: u32,
-        child_pid: u32,
-    },
-    ProcessExit {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        exit_code: i32,
-    },
-    PageFault {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        address: u64,
-        error_code: u64,
-    },
-    SyscallReadEnter {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        fd: i64,
-        count: u64,
-    },
-    SyscallReadExit {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        ret: i64,
-    },
-    SyscallWriteEnter {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        fd: i64,
-        count: u64,
-    },
-    SyscallWriteExit {
-        ts_ns: u64,
-        pid: u32,
-        cpu: u8,
-        ret: i64,
-    },
+/// Flattened event structure for Parquet output.
+/// All event types share common fields, with type-specific fields being optional.
+#[derive(Default)]
+struct Event {
+    event_type: &'static str,
+    ts_ns: u64,
+    pid: u32,
+    cpu: u8,
+    // SchedSwitch fields
+    prev_pid: Option<u32>,
+    next_pid: Option<u32>,
+    prev_state: Option<i64>,
+    // ProcessFork fields
+    parent_pid: Option<u32>,
+    child_pid: Option<u32>,
+    // ProcessExit fields
+    exit_code: Option<i32>,
+    // PageFault fields
+    address: Option<u64>,
+    error_code: Option<u64>,
+    // Syscall fields
+    fd: Option<i64>,
+    count: Option<u64>,
+    ret: Option<i64>,
 }
 
-/// Parse event from ring buffer data
-fn parse_event(data: &[u8]) -> Option<JsonEvent> {
+/// Creates the Arrow schema for the unified event table
+fn create_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("event_type", DataType::Utf8, false),
+        Field::new("ts_ns", DataType::UInt64, false),
+        Field::new("pid", DataType::UInt32, false),
+        Field::new("cpu", DataType::UInt8, false),
+        // SchedSwitch fields (nullable)
+        Field::new("prev_pid", DataType::UInt32, true),
+        Field::new("next_pid", DataType::UInt32, true),
+        Field::new("prev_state", DataType::Int64, true),
+        // ProcessFork fields (nullable)
+        Field::new("parent_pid", DataType::UInt32, true),
+        Field::new("child_pid", DataType::UInt32, true),
+        // ProcessExit fields (nullable)
+        Field::new("exit_code", DataType::Int32, true),
+        // PageFault fields (nullable)
+        Field::new("address", DataType::UInt64, true),
+        Field::new("error_code", DataType::UInt64, true),
+        // Syscall fields (nullable)
+        Field::new("fd", DataType::Int64, true),
+        Field::new("count", DataType::UInt64, true),
+        Field::new("ret", DataType::Int64, true),
+    ])
+}
+
+/// Parquet batch writer that buffers events and writes them in batches
+/// to minimize memory usage and improve write efficiency.
+struct ParquetBatchWriter {
+    writer: ArrowWriter<File>,
+    schema: Arc<Schema>,
+    batch: Vec<Event>,
+    total_written: usize,
+}
+
+impl ParquetBatchWriter {
+    /// Create a new ParquetBatchWriter that writes to the specified file
+    fn new(path: &str) -> Result<Self> {
+        let schema = Arc::new(create_schema());
+        let file = File::create(path)
+            .with_context(|| format!("failed to create output file {}", path))?;
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .with_context(|| "failed to create Parquet writer")?;
+
+        Ok(Self {
+            writer,
+            schema,
+            batch: Vec::with_capacity(BATCH_SIZE),
+            total_written: 0,
+        })
+    }
+
+    /// Push an event to the batch. Automatically flushes when batch is full.
+    fn push(&mut self, event: Event) -> Result<()> {
+        self.batch.push(event);
+        if self.batch.len() >= BATCH_SIZE {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    /// Flush the current batch to the Parquet file
+    fn flush_batch(&mut self) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+
+        let batch_len = self.batch.len();
+
+        // Build Arrow arrays from the batch
+        let mut event_type_builder = StringBuilder::with_capacity(batch_len, batch_len * 20);
+        let mut ts_ns_builder = UInt64Builder::with_capacity(batch_len);
+        let mut pid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut cpu_builder = UInt8Builder::with_capacity(batch_len);
+        let mut prev_pid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut next_pid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut prev_state_builder = Int64Builder::with_capacity(batch_len);
+        let mut parent_pid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut child_pid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut exit_code_builder = Int32Builder::with_capacity(batch_len);
+        let mut address_builder = UInt64Builder::with_capacity(batch_len);
+        let mut error_code_builder = UInt64Builder::with_capacity(batch_len);
+        let mut fd_builder = Int64Builder::with_capacity(batch_len);
+        let mut count_builder = UInt64Builder::with_capacity(batch_len);
+        let mut ret_builder = Int64Builder::with_capacity(batch_len);
+
+        for event in self.batch.drain(..) {
+            event_type_builder.append_value(event.event_type);
+            ts_ns_builder.append_value(event.ts_ns);
+            pid_builder.append_value(event.pid);
+            cpu_builder.append_value(event.cpu);
+            prev_pid_builder.append_option(event.prev_pid);
+            next_pid_builder.append_option(event.next_pid);
+            prev_state_builder.append_option(event.prev_state);
+            parent_pid_builder.append_option(event.parent_pid);
+            child_pid_builder.append_option(event.child_pid);
+            exit_code_builder.append_option(event.exit_code);
+            address_builder.append_option(event.address);
+            error_code_builder.append_option(event.error_code);
+            fd_builder.append_option(event.fd);
+            count_builder.append_option(event.count);
+            ret_builder.append_option(event.ret);
+        }
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(event_type_builder.finish()),
+            Arc::new(ts_ns_builder.finish()),
+            Arc::new(pid_builder.finish()),
+            Arc::new(cpu_builder.finish()),
+            Arc::new(prev_pid_builder.finish()),
+            Arc::new(next_pid_builder.finish()),
+            Arc::new(prev_state_builder.finish()),
+            Arc::new(parent_pid_builder.finish()),
+            Arc::new(child_pid_builder.finish()),
+            Arc::new(exit_code_builder.finish()),
+            Arc::new(address_builder.finish()),
+            Arc::new(error_code_builder.finish()),
+            Arc::new(fd_builder.finish()),
+            Arc::new(count_builder.finish()),
+            Arc::new(ret_builder.finish()),
+        ];
+
+        let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .with_context(|| "failed to create record batch")?;
+
+        self.writer
+            .write(&record_batch)
+            .with_context(|| "failed to write record batch")?;
+
+        self.total_written += batch_len;
+        debug!("Flushed {} events to Parquet (total: {})", batch_len, self.total_written);
+
+        Ok(())
+    }
+
+    /// Finish writing and close the file. Returns total events written.
+    fn finish(mut self) -> Result<usize> {
+        self.flush_batch()?;
+        self.writer.close().with_context(|| "failed to close Parquet writer")?;
+        Ok(self.total_written)
+    }
+}
+
+/// Parse event from ring buffer data into a flattened Event struct
+fn parse_event(data: &[u8]) -> Option<Event> {
     if data.len() < std::mem::size_of::<EventHeader>() {
         return None;
     }
@@ -200,13 +323,15 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &SchedSwitchEvent = unsafe { &*(data.as_ptr() as *const SchedSwitchEvent) };
-            Some(JsonEvent::SchedSwitch {
+            Some(Event {
+                event_type: "sched_switch",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                prev_pid: event.prev_pid,
-                next_pid: event.next_pid,
-                prev_state: event.prev_state,
+                prev_pid: Some(event.prev_pid),
+                next_pid: Some(event.next_pid),
+                prev_state: Some(event.prev_state),
+                ..Default::default()
             })
         }
         EventType::ProcessFork => {
@@ -214,12 +339,14 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &ProcessForkEvent = unsafe { &*(data.as_ptr() as *const ProcessForkEvent) };
-            Some(JsonEvent::ProcessFork {
+            Some(Event {
+                event_type: "process_fork",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                parent_pid: event.parent_pid,
-                child_pid: event.child_pid,
+                parent_pid: Some(event.parent_pid),
+                child_pid: Some(event.child_pid),
+                ..Default::default()
             })
         }
         EventType::ProcessExit => {
@@ -227,11 +354,13 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &ProcessExitEvent = unsafe { &*(data.as_ptr() as *const ProcessExitEvent) };
-            Some(JsonEvent::ProcessExit {
+            Some(Event {
+                event_type: "process_exit",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                exit_code: event.exit_code,
+                exit_code: Some(event.exit_code),
+                ..Default::default()
             })
         }
         EventType::PageFault => {
@@ -239,12 +368,14 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &PageFaultEvent = unsafe { &*(data.as_ptr() as *const PageFaultEvent) };
-            Some(JsonEvent::PageFault {
+            Some(Event {
+                event_type: "page_fault",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                address: event.address,
-                error_code: event.error_code,
+                address: Some(event.address),
+                error_code: Some(event.error_code),
+                ..Default::default()
             })
         }
         EventType::SyscallReadEnter => {
@@ -252,12 +383,14 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &SyscallEnterEvent = unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(JsonEvent::SyscallReadEnter {
+            Some(Event {
+                event_type: "syscall_read_enter",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                fd: event.fd,
-                count: event.count,
+                fd: Some(event.fd),
+                count: Some(event.count),
+                ..Default::default()
             })
         }
         EventType::SyscallReadExit => {
@@ -265,11 +398,13 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(JsonEvent::SyscallReadExit {
+            Some(Event {
+                event_type: "syscall_read_exit",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                ret: event.ret,
+                ret: Some(event.ret),
+                ..Default::default()
             })
         }
         EventType::SyscallWriteEnter => {
@@ -277,12 +412,14 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &SyscallEnterEvent = unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(JsonEvent::SyscallWriteEnter {
+            Some(Event {
+                event_type: "syscall_write_enter",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                fd: event.fd,
-                count: event.count,
+                fd: Some(event.fd),
+                count: Some(event.count),
+                ..Default::default()
             })
         }
         EventType::SyscallWriteExit => {
@@ -290,11 +427,13 @@ fn parse_event(data: &[u8]) -> Option<JsonEvent> {
                 return None;
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(JsonEvent::SyscallWriteExit {
+            Some(Event {
+                event_type: "syscall_write_exit",
                 ts_ns: event.header.timestamp_ns,
                 pid: event.header.pid,
                 cpu: event.header.cpu,
-                ret: event.ret,
+                ret: Some(event.ret),
+                ..Default::default()
             })
         }
     }
@@ -437,15 +576,9 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to resume child process {}", child_pid))?;
     info!("Resumed child process {}", child_pid);
 
-    // Open output file or use stdout
-    let mut output: Box<dyn Write + Send> = match &args.output {
-        Some(path) => {
-            let file = File::create(path)
-                .with_context(|| format!("failed to create output file {}", path))?;
-            Box::new(BufWriter::new(file))
-        }
-        None => Box::new(BufWriter::new(std::io::stdout())),
-    };
+    // Create Parquet batch writer
+    let mut writer = ParquetBatchWriter::new(&args.output)?;
+    info!("Writing events to {}", args.output);
 
     // Get ring buffer
     let ring_buf = RingBuf::try_from(ebpf.map_mut("EVENTS").unwrap())?;
@@ -470,8 +603,7 @@ async fn main() -> Result<()> {
                 // Drain any remaining events
                 while let Some(item) = async_ring_buf.get_mut().next() {
                     if let Some(event) = parse_event(&item) {
-                        let json = serde_json::to_string(&event)?;
-                        writeln!(output, "{}", json)?;
+                        writer.push(event)?;
                     }
                 }
                 info!("Child process {} exited", child_pid);
@@ -494,14 +626,9 @@ async fn main() -> Result<()> {
                 // Process all available events
                 while let Some(item) = guard.get_inner_mut().next() {
                     if let Some(event) = parse_event(&item) {
-                        // Write JSON line
-                        let json = serde_json::to_string(&event)?;
-                        writeln!(output, "{}", json)?;
+                        writer.push(event)?;
                     }
                 }
-
-                // Flush output
-                output.flush()?;
 
                 guard.clear_ready();
             }
@@ -512,9 +639,9 @@ async fn main() -> Result<()> {
         let _ = child_wait.await;
     }
 
-    // Final flush
-    output.flush()?;
-    info!("Done.");
+    // Finish writing and close the Parquet file
+    let total_events = writer.finish()?;
+    info!("Done. Wrote {} events to {}", total_events, args.output);
 
     Ok(())
 }
