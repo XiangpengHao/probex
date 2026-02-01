@@ -9,3 +9,4 @@ target/
 **/*.rs.bk
 
 vendor/
+trace.parquet

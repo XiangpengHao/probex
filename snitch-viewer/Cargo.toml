@@ -1,0 +1,26 @@
+[package]
+name = "snitch-viewer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Web-based visualization for snitch trace files"
+
+[[bin]]
+name = "snitch-viewer"
+path = "src/main.rs"
+
+[dependencies]
+dioxus = { workspace = true, features = ["fullstack", "launch", "asset", "macro", "hooks", "signals", "html", "document"] }
+serde = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "help", "env"] }
+log.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["full"] }
+datafusion.workspace = true
+env_logger.workspace = true
+
+[features]
+default = []
+server = ["dioxus/server"]
+web = ["dioxus/web"]

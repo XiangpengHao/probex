@@ -4,8 +4,9 @@ members = [
     "snitch",
     "snitch-common",
     "snitch-ebpf",
+    "snitch-viewer",
 ]
-default-members = ["snitch", "snitch-common"]
+default-members = ["snitch", "snitch-common", "snitch-viewer"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
@@ -30,9 +31,11 @@ log = { version = "0.4.22", default-features = false }
 nix = { version = "0.29", default-features = false }
 serde = { version = "1.0", default-features = false }
 tokio = { version = "1.40.0", default-features = false }
-arrow = { version = "54", default-features = false }
-parquet = { version = "54", default-features = false, features = ["arrow", "snap"] }
+arrow = { version = "57", default-features = false }
+parquet = { version = "57", default-features = false, features = ["arrow", "snap"] }
 which = { version = "6.0.0", default-features = false }
+dioxus = { version = "0.7", default-features = false }
+datafusion = { version = "52", default-features = true }
 
 [profile.release.package.snitch-ebpf]
 debug = 2

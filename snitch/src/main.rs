@@ -89,32 +89,36 @@
 //! | syscall_write_enter | syscalls:sys_enter_write | fd, count |
 //! | syscall_write_exit | syscalls:sys_exit_write | ret |
 
-use std::ffi::CString;
-use std::fs::File;
-use std::sync::Arc;
+use std::{ffi::CString, fs::File, sync::Arc};
 
 use anyhow::{Context as _, Result, anyhow};
-use arrow::array::{
-    ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt32Builder, UInt64Builder, UInt8Builder,
+use arrow::{
+    array::{
+        ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt8Builder, UInt32Builder,
+        UInt64Builder,
+    },
+    datatypes::{DataType, Field, Schema},
+    record_batch::RecordBatch,
 };
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use aya::maps::{HashMap, RingBuf};
-use aya::programs::TracePoint;
+use aya::{
+    maps::{HashMap, RingBuf},
+    programs::TracePoint,
+};
 use clap::Parser;
 use log::{debug, info, warn};
-use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, fork};
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
-use snitch_common::{
-    EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent,
-    SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+use nix::{
+    sys::{
+        signal::{Signal, kill},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
+    unistd::{ForkResult, Pid, fork},
 };
-use tokio::io::unix::AsyncFd;
-use tokio::signal;
+use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+use snitch_common::{
+    EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, SchedSwitchEvent,
+    SyscallEnterEvent, SyscallExitEvent,
+};
+use tokio::{io::unix::AsyncFd, signal};
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
@@ -127,6 +131,14 @@ struct Args {
     /// Output parquet file (default: trace.parquet)
     #[arg(short, long, default_value = "trace.parquet")]
     output: String,
+
+    /// Port for the viewer web interface
+    #[arg(short, long, default_value = "8080")]
+    port: u16,
+
+    /// Don't launch the viewer after tracing
+    #[arg(long)]
+    no_viewer: bool,
 
     /// Command to run
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -198,8 +210,8 @@ impl ParquetBatchWriter {
     /// Create a new ParquetBatchWriter that writes to the specified file
     fn new(path: &str) -> Result<Self> {
         let schema = Arc::new(create_schema());
-        let file = File::create(path)
-            .with_context(|| format!("failed to create output file {}", path))?;
+        let file =
+            File::create(path).with_context(|| format!("failed to create output file {}", path))?;
 
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -294,7 +306,10 @@ impl ParquetBatchWriter {
             .with_context(|| "failed to write record batch")?;
 
         self.total_written += batch_len;
-        debug!("Flushed {} events to Parquet (total: {})", batch_len, self.total_written);
+        debug!(
+            "Flushed {} events to Parquet (total: {})",
+            batch_len, self.total_written
+        );
 
         Ok(())
     }
@@ -302,7 +317,9 @@ impl ParquetBatchWriter {
     /// Finish writing and close the file. Returns total events written.
     fn finish(mut self) -> Result<usize> {
         self.flush_batch()?;
-        self.writer.close().with_context(|| "failed to close Parquet writer")?;
+        self.writer
+            .close()
+            .with_context(|| "failed to close Parquet writer")?;
         Ok(self.total_written)
     }
 }
@@ -382,7 +399,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
                 return None;
             }
-            let event: &SyscallEnterEvent = unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
                 event_type: "syscall_read_enter",
                 ts_ns: event.header.timestamp_ns,
@@ -411,7 +429,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
                 return None;
             }
-            let event: &SyscallEnterEvent = unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
                 event_type: "syscall_write_enter",
                 ts_ns: event.header.timestamp_ns,
@@ -460,13 +479,15 @@ fn attach_tracepoint(
 
 fn spawn_child(program: &str, args: &[String]) -> Result<Pid> {
     let mut cstrings = Vec::with_capacity(args.len() + 1);
-    cstrings.push(CString::new(program).with_context(|| {
-        format!("failed to spawn {program}: program contains NUL")
-    })?);
+    cstrings.push(
+        CString::new(program)
+            .with_context(|| format!("failed to spawn {program}: program contains NUL"))?,
+    );
     for arg in args {
-        cstrings.push(CString::new(arg.as_str()).with_context(|| {
-            format!("failed to spawn {program}: argument contains NUL")
-        })?);
+        cstrings.push(
+            CString::new(arg.as_str())
+                .with_context(|| format!("failed to spawn {program}: argument contains NUL"))?,
+        );
     }
     let mut argv: Vec<*const libc::c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
     argv.push(std::ptr::null());
@@ -529,8 +550,7 @@ async fn main() -> Result<()> {
             warn!("failed to initialize eBPF logger: {e}");
         }
         Ok(logger) => {
-            let mut logger =
-                AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
+            let mut logger = AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
             tokio::task::spawn(async move {
                 loop {
                     let mut guard = logger.readable_mut().await.unwrap();
@@ -563,9 +583,24 @@ async fn main() -> Result<()> {
 
     // Attach all tracepoints
     attach_tracepoint(&mut ebpf, "sched_switch", "sched", "sched_switch")?;
-    attach_tracepoint(&mut ebpf, "sched_process_fork", "sched", "sched_process_fork")?;
-    attach_tracepoint(&mut ebpf, "sched_process_exit", "sched", "sched_process_exit")?;
-    attach_tracepoint(&mut ebpf, "page_fault_user", "exceptions", "page_fault_user")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sched_process_fork",
+        "sched",
+        "sched_process_fork",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sched_process_exit",
+        "sched",
+        "sched_process_exit",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "page_fault_user",
+        "exceptions",
+        "page_fault_user",
+    )?;
     attach_tracepoint(&mut ebpf, "sys_enter_read", "syscalls", "sys_enter_read")?;
     attach_tracepoint(&mut ebpf, "sys_exit_read", "syscalls", "sys_exit_read")?;
     attach_tracepoint(&mut ebpf, "sys_enter_write", "syscalls", "sys_enter_write")?;
@@ -642,6 +677,51 @@ async fn main() -> Result<()> {
     // Finish writing and close the Parquet file
     let total_events = writer.finish()?;
     info!("Done. Wrote {} events to {}", total_events, args.output);
+
+    // Launch the viewer if we have events and --no-viewer wasn't specified
+    if total_events > 0 && !args.no_viewer {
+        launch_viewer(&args.output, args.port)?;
+    }
+
+    Ok(())
+}
+
+/// Launch the snitch-viewer subprocess
+fn launch_viewer(parquet_file: &str, port: u16) -> Result<()> {
+    // Get absolute path to the parquet file
+    let parquet_path = std::path::Path::new(parquet_file)
+        .canonicalize()
+        .with_context(|| format!("failed to resolve path: {}", parquet_file))?;
+
+    // Find snitch-viewer binary - try same directory as current executable first
+    let viewer_path = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.join("snitch-viewer")))
+        .filter(|p| p.exists())
+        .or_else(|| which::which("snitch-viewer").ok())
+        .ok_or_else(|| anyhow!("snitch-viewer not found in PATH or alongside snitch binary"))?;
+
+    info!(
+        "Launching viewer at http://0.0.0.0:{} for {}",
+        port,
+        parquet_path.display()
+    );
+
+    // Spawn the viewer process
+    let mut cmd = std::process::Command::new(&viewer_path);
+    cmd.arg("--file")
+        .arg(&parquet_path)
+        .arg("--port")
+        .arg(port.to_string());
+
+    // Run in foreground so user can Ctrl-C to stop
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run snitch-viewer: {:?}", viewer_path))?;
+
+    if !status.success() {
+        warn!("snitch-viewer exited with status: {}", status);
+    }
 
     Ok(())
 }

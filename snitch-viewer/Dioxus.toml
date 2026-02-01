@@ -1,0 +1,18 @@
+[application]
+name = "snitch-viewer"
+default_platform = "fullstack"
+
+[web.app]
+title = "Snitch Trace Viewer"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+
+[web.resource.dev]
+style = []
+script = []
+
+[web.resource.release]
+style = []
+script = []
