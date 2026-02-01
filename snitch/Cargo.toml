@@ -11,9 +11,13 @@ snitch-common = { path = "../snitch-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
+clap = { workspace = true, features = ["derive", "help"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+nix = { workspace = true, features = ["signal", "process"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
     "rt",
@@ -21,6 +25,10 @@ tokio = { workspace = true, features = [
     "net",
     "signal",
 ] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

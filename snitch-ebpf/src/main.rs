@@ -1,19 +1,383 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{macros::tracepoint, programs::TracePointContext};
-use aya_log_ebpf::info;
+use aya_ebpf::{
+    bindings::BPF_RB_FORCE_WAKEUP,
+    helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns},
+    macros::{map, tracepoint},
+    maps::{HashMap, RingBuf},
+    programs::TracePointContext,
+    EbpfContext,
+};
+use snitch_common::{
+    EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, SchedSwitchEvent,
+    SyscallEnterEvent, SyscallExitEvent, MAX_TRACKED_PIDS, RING_BUF_SIZE,
+};
 
-#[tracepoint]
-pub fn snitch(ctx: TracePointContext) -> u32 {
-    match try_snitch(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
+/// Ring buffer for sending events to userspace
+#[map]
+static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BUF_SIZE, 0);
+
+/// HashMap to track which PIDs we're tracing
+#[map]
+static TRACED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_TRACKED_PIDS, 0);
+
+/// Check if a PID is being traced
+#[inline(always)]
+fn is_traced(pid: u32) -> bool {
+    unsafe { TRACED_PIDS.get(&pid).is_some() }
+}
+
+/// Create an event header
+#[inline(always)]
+fn make_header(ctx: &TracePointContext, event_type: EventType) -> EventHeader {
+    EventHeader {
+        timestamp_ns: unsafe { bpf_ktime_get_ns() },
+        pid: ctx.pid(),
+        tgid: ctx.tgid(),
+        event_type: event_type as u8,
+        cpu: unsafe { bpf_get_smp_processor_id() } as u8,
+        _padding: [0; 2],
     }
 }
 
-fn try_snitch(ctx: TracePointContext) -> Result<u32, u32> {
-    info!(&ctx, "tracepoint sched_switch called");
+/// sched_switch tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/sched/sched_switch/format:
+/// - prev_comm[16]: offset 8
+/// - prev_pid: offset 24
+/// - prev_prio: offset 28
+/// - prev_state: offset 32
+/// - next_comm[16]: offset 40
+/// - next_pid: offset 56
+/// - next_prio: offset 60
+#[tracepoint]
+pub fn sched_switch(ctx: TracePointContext) -> u32 {
+    match try_sched_switch(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sched_switch(ctx: &TracePointContext) -> Result<u32, i64> {
+    // Read prev_pid at offset 24
+    let prev_pid: u32 = unsafe { ctx.read_at(24)? };
+    // Read prev_state at offset 32
+    let prev_state: i64 = unsafe { ctx.read_at(32)? };
+    // Read next_pid at offset 56
+    let next_pid: u32 = unsafe { ctx.read_at(56)? };
+
+    // Only emit event if either prev or next PID is being traced
+    if !is_traced(prev_pid) && !is_traced(next_pid) {
+        return Ok(0);
+    }
+
+    // Reserve space in ring buffer for the event
+    if let Some(mut buf) = EVENTS.reserve::<SchedSwitchEvent>(0) {
+        let event = SchedSwitchEvent {
+            header: EventHeader {
+                timestamp_ns: unsafe { bpf_ktime_get_ns() },
+                pid: if is_traced(prev_pid) {
+                    prev_pid
+                } else {
+                    next_pid
+                },
+                tgid: ctx.tgid(),
+                event_type: EventType::SchedSwitch as u8,
+                cpu: unsafe { bpf_get_smp_processor_id() } as u8,
+                _padding: [0; 2],
+            },
+            prev_pid,
+            prev_tgid: 0, // Not available in tracepoint
+            next_pid,
+            next_tgid: 0, // Not available in tracepoint
+            prev_state,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sched_process_fork tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/sched/sched_process_fork/format:
+/// - parent_comm[16]: offset 8
+/// - parent_pid: offset 24
+/// - child_comm[16]: offset 28
+/// - child_pid: offset 44
+#[tracepoint]
+pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
+    match try_sched_process_fork(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sched_process_fork(ctx: &TracePointContext) -> Result<u32, i64> {
+    // Read parent_pid at offset 24
+    let parent_pid: u32 = unsafe { ctx.read_at(24)? };
+    // Read child_pid at offset 44
+    let child_pid: u32 = unsafe { ctx.read_at(44)? };
+
+    // Only track if parent is being traced
+    if !is_traced(parent_pid) {
+        return Ok(0);
+    }
+
+    // Add child to traced PIDs
+    let _ = TRACED_PIDS.insert(&child_pid, &1, 0);
+
+    // Emit fork event
+    if let Some(mut buf) = EVENTS.reserve::<ProcessForkEvent>(0) {
+        let event = ProcessForkEvent {
+            header: make_header(ctx, EventType::ProcessFork),
+            parent_pid,
+            child_pid,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sched_process_exit tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/sched/sched_process_exit/format:
+/// - comm[16]: offset 8
+/// - pid: offset 24
+/// - prio: offset 28
+#[tracepoint]
+pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
+    match try_sched_process_exit(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sched_process_exit(ctx: &TracePointContext) -> Result<u32, i64> {
+    let pid = ctx.pid();
+
+    // Only emit if this PID is being traced
+    if !is_traced(pid) {
+        return Ok(0);
+    }
+
+    // Emit exit event
+    if let Some(mut buf) = EVENTS.reserve::<ProcessExitEvent>(0) {
+        let event = ProcessExitEvent {
+            header: make_header(ctx, EventType::ProcessExit),
+            exit_code: 0, // Exit code not directly available in tracepoint
+            _padding: 0,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    // Remove PID from traced set
+    let _ = TRACED_PIDS.remove(&pid);
+
+    Ok(0)
+}
+
+/// page_fault_user tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/exceptions/page_fault_user/format:
+/// - address: offset 8
+/// - ip: offset 16
+/// - error_code: offset 24
+#[tracepoint]
+pub fn page_fault_user(ctx: TracePointContext) -> u32 {
+    match try_page_fault_user(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_page_fault_user(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+
+    // Only emit if this process is being traced
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    // Read address at offset 8
+    let address: u64 = unsafe { ctx.read_at(8)? };
+    // Read error_code at offset 24
+    let error_code: u64 = unsafe { ctx.read_at(24)? };
+
+    // Emit page fault event
+    if let Some(mut buf) = EVENTS.reserve::<PageFaultEvent>(0) {
+        let event = PageFaultEvent {
+            header: make_header(ctx, EventType::PageFault),
+            address,
+            error_code,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_enter_read tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_read/format:
+/// - __syscall_nr: offset 8
+/// - fd: offset 16
+/// - buf: offset 24
+/// - count: offset 32
+#[tracepoint]
+pub fn sys_enter_read(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_read(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_read(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    // Read fd at offset 16
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+    // Read count at offset 32
+    let count: u64 = unsafe { ctx.read_at(32)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallReadEnter),
+            fd,
+            count,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_read tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_read/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_read(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_read(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_read(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    // Read ret at offset 16
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallReadExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_enter_write tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_write/format:
+/// - __syscall_nr: offset 8
+/// - fd: offset 16
+/// - buf: offset 24
+/// - count: offset 32
+#[tracepoint]
+pub fn sys_enter_write(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_write(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_write(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    // Read fd at offset 16
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+    // Read count at offset 32
+    let count: u64 = unsafe { ctx.read_at(32)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallWriteEnter),
+            fd,
+            count,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_write tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_write/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_write(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_write(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_write(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    // Read ret at offset 16
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallWriteExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
     Ok(0)
 }
 
