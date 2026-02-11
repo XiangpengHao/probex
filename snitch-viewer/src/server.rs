@@ -33,13 +33,6 @@ pub struct TraceEvent {
     pub ret: Option<i64>,
 }
 
-/// Time range filter for queries.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-pub struct TimeRange {
-    pub start_ns: u64,
-    pub end_ns: u64,
-}
-
 /// Histogram bucket for density visualization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistogramBucket {
@@ -619,7 +612,10 @@ mod backend {
     ) -> Result<SyscallLatencyStats, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = get_ctx()?;
 
-        let mut conditions = vec![format!("ts_ns >= {}", start_ns), format!("ts_ns <= {}", end_ns)];
+        let mut conditions = vec![
+            format!("ts_ns >= {}", start_ns),
+            format!("ts_ns <= {}", end_ns),
+        ];
         if let Some(pid) = pid {
             conditions.push(format!("pid = {}", pid));
         }
@@ -783,8 +779,8 @@ mod backend {
         })
     }
 
-    pub async fn query_process_lifetimes(
-    ) -> Result<ProcessLifetimesResponse, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn query_process_lifetimes()
+    -> Result<ProcessLifetimesResponse, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = get_ctx()?;
 
         // Get all fork events (child creation)
@@ -817,10 +813,14 @@ mod backend {
         };
 
         // Build maps
-        let mut fork_info: std::collections::HashMap<u32, (u32, u64)> = std::collections::HashMap::new(); // child -> (parent, ts)
-        let mut exit_info: std::collections::HashMap<u32, (i32, u64)> = std::collections::HashMap::new(); // pid -> (exit_code, ts)
-        let mut pid_times: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new(); // pid -> (first, last)
-        let mut pid_names: std::collections::HashMap<u32, String> = std::collections::HashMap::new(); // pid -> name
+        let mut fork_info: std::collections::HashMap<u32, (u32, u64)> =
+            std::collections::HashMap::new(); // child -> (parent, ts)
+        let mut exit_info: std::collections::HashMap<u32, (i32, u64)> =
+            std::collections::HashMap::new(); // pid -> (exit_code, ts)
+        let mut pid_times: std::collections::HashMap<u32, (u64, u64)> =
+            std::collections::HashMap::new(); // pid -> (first, last)
+        let mut pid_names: std::collections::HashMap<u32, String> =
+            std::collections::HashMap::new(); // pid -> name
 
         // Parse fork events
         for batch in &fork_batches {
@@ -867,11 +867,12 @@ mod backend {
         // Build process lifetimes
         let mut processes: Vec<ProcessLifetime> = Vec::new();
         for (pid, (first_seen, last_seen)) in &pid_times {
-            let (parent_pid, start_ns, was_forked) = if let Some((parent, fork_ts)) = fork_info.get(pid) {
-                (Some(*parent), *fork_ts, true)
-            } else {
-                (None, *first_seen, false)
-            };
+            let (parent_pid, start_ns, was_forked) =
+                if let Some((parent, fork_ts)) = fork_info.get(pid) {
+                    (Some(*parent), *fork_ts, true)
+                } else {
+                    (None, *first_seen, false)
+                };
 
             let (end_ns, exit_code, did_exit) = if let Some((code, exit_ts)) = exit_info.get(pid) {
                 (Some(*exit_ts), Some(*code), true)

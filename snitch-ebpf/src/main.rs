@@ -2,16 +2,16 @@
 #![no_main]
 
 use aya_ebpf::{
+    EbpfContext,
     bindings::BPF_RB_FORCE_WAKEUP,
     helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns},
     macros::{map, tracepoint},
     maps::{HashMap, RingBuf},
     programs::TracePointContext,
-    EbpfContext,
 };
 use snitch_common::{
-    EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, SchedSwitchEvent,
-    SyscallEnterEvent, SyscallExitEvent, MAX_TRACKED_PIDS, RING_BUF_SIZE,
+    EventHeader, EventType, MAX_TRACKED_PIDS, PageFaultEvent, ProcessExitEvent, ProcessForkEvent,
+    RING_BUF_SIZE, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 
 /// Ring buffer for sending events to userspace

@@ -731,7 +731,12 @@ async fn main() -> Result<()> {
     attach_tracepoint(&mut ebpf, "sys_exit_write", "syscalls", "sys_exit_write")?;
     attach_tracepoint(&mut ebpf, "sys_enter_mmap", "syscalls", "sys_enter_mmap")?;
     attach_tracepoint(&mut ebpf, "sys_exit_mmap", "syscalls", "sys_exit_mmap")?;
-    attach_tracepoint(&mut ebpf, "sys_enter_munmap", "syscalls", "sys_enter_munmap")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_munmap",
+        "syscalls",
+        "sys_enter_munmap",
+    )?;
     attach_tracepoint(&mut ebpf, "sys_exit_munmap", "syscalls", "sys_exit_munmap")?;
     attach_tracepoint(&mut ebpf, "sys_enter_brk", "syscalls", "sys_enter_brk")?;
     attach_tracepoint(&mut ebpf, "sys_exit_brk", "syscalls", "sys_exit_brk")?;
@@ -813,10 +818,11 @@ async fn main() -> Result<()> {
     info!("Done. Wrote {} events to {}", total_events, args.output);
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
-    if total_events > 0 && !args.no_viewer {
-        if let Err(error) = launch_viewer(&args.output, args.port) {
-            warn!("Skipping viewer launch: {error}");
-        }
+    if total_events > 0
+        && !args.no_viewer
+        && let Err(error) = launch_viewer(&args.output, args.port)
+    {
+        warn!("Skipping viewer launch: {error}");
     }
 
     Ok(())
