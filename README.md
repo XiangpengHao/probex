@@ -45,6 +45,12 @@ You need Linux with eBPF tracepoint support and sufficient privileges (typically
 
 ### 2. Trace a command
 
+First build the snitch-viewer app:
+```shell
+dx bundle --release --fullstack -p snitch-viewer
+```
+
+Then run the snitch to collect events.
 ```shell
 sudo -E cargo run --release -p snitch -- -- sleep 1
 ```

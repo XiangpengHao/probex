@@ -742,8 +742,9 @@ fn resolve_viewer_binary() -> Result<PathBuf> {
     }
 
     Err(anyhow!(
-        "snitch-viewer not found in PATH or known bundle locations; trace was saved, but viewer \
-was not launched"
+        "snitch-viewer not found (or missing fullstack web assets) in PATH/known locations; trace \
+was saved, but viewer was not launched. Build it with: dx bundle --platform server --fullstack \
+--release -p snitch-viewer"
     ))
 }
 
@@ -796,7 +797,44 @@ fn find_existing_viewer_binary() -> Option<PathBuf> {
 }
 
 fn viewer_binary_is_runnable(path: &Path) -> bool {
-    path.parent()
-        .map(|dir| dir.join("public").is_dir())
-        .unwrap_or(false)
+    let Some(viewer_dir) = path.parent() else {
+        return false;
+    };
+
+    let public_dir = viewer_dir.join("public");
+    if !public_dir.is_dir() || !public_dir.join("index.html").is_file() {
+        return false;
+    }
+
+    let mut has_js = false;
+    let mut has_wasm = false;
+    let mut stack = vec![public_dir];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+                match ext {
+                    "js" => has_js = true,
+                    "wasm" => has_wasm = true,
+                    _ => {}
+                }
+            }
+
+            if has_js && has_wasm {
+                return true;
+            }
+        }
+    }
+
+    false
 }
