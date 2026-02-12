@@ -139,6 +139,8 @@ pub struct EventMarker {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessEventsResponse {
     pub events_by_pid: HashMap<u32, Vec<EventMarker>>,
+    pub cpu_sample_counts_by_pid: HashMap<u32, Vec<u16>>,
+    pub cpu_sample_bucket_count: usize,
 }
 
 /// Aggregated flamegraph response for one event type in a range.
@@ -972,9 +974,13 @@ mod backend {
         end_ns: u64,
         max_events_per_pid: usize,
     ) -> Result<ProcessEventsResponse, Box<dyn std::error::Error + Send + Sync>> {
+        const CPU_SAMPLE_BUCKETS: usize = 200;
+
         if max_events_per_pid == 0 {
             return Ok(ProcessEventsResponse {
                 events_by_pid: std::collections::HashMap::new(),
+                cpu_sample_counts_by_pid: std::collections::HashMap::new(),
+                cpu_sample_bucket_count: CPU_SAMPLE_BUCKETS,
             });
         }
 
@@ -994,12 +1000,29 @@ mod backend {
             std::collections::HashMap::new();
         let mut events_seen_by_pid: std::collections::HashMap<u32, usize> =
             std::collections::HashMap::new();
+        let mut cpu_sample_counts_by_pid: std::collections::HashMap<u32, Vec<u16>> =
+            std::collections::HashMap::new();
+
+        let range_ns = end_ns.saturating_sub(start_ns).max(1);
+        let bucket_size_ns = range_ns.div_ceil(CPU_SAMPLE_BUCKETS as u64).max(1);
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
                 let pid = extract_u32(batch, "pid", row);
                 let ts_ns = extract_u64(batch, "ts_ns", row);
                 let event_type = extract_string(batch, "event_type", row);
+
+                if event_type == "cpu_sample" {
+                    let mut bucket_idx = ts_ns.saturating_sub(start_ns) / bucket_size_ns;
+                    if bucket_idx >= CPU_SAMPLE_BUCKETS as u64 {
+                        bucket_idx = (CPU_SAMPLE_BUCKETS - 1) as u64;
+                    }
+                    let counts = cpu_sample_counts_by_pid
+                        .entry(pid)
+                        .or_insert_with(|| vec![0u16; CPU_SAMPLE_BUCKETS]);
+                    let bucket = &mut counts[bucket_idx as usize];
+                    *bucket = bucket.saturating_add(1);
+                }
 
                 let events = events_by_pid.entry(pid).or_default();
                 let seen = events_seen_by_pid.entry(pid).or_default();
@@ -1023,7 +1046,11 @@ mod backend {
             events.sort_by_key(|e| e.ts_ns);
         }
 
-        Ok(ProcessEventsResponse { events_by_pid })
+        Ok(ProcessEventsResponse {
+            events_by_pid,
+            cpu_sample_counts_by_pid,
+            cpu_sample_bucket_count: CPU_SAMPLE_BUCKETS,
+        })
     }
 
     #[derive(Clone, Debug)]

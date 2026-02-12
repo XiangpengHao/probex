@@ -1,5 +1,3 @@
-use crate::server::TraceEvent;
-
 pub fn get_event_marker_color(event_type: &str) -> &'static str {
     match event_type {
         "sched_switch" => "bg-blue-600",
@@ -8,17 +6,6 @@ pub fn get_event_marker_color(event_type: &str) -> &'static str {
         "page_fault" => "bg-orange-500",
         _ if event_type.contains("syscall") => "bg-purple-600",
         _ => "bg-gray-600",
-    }
-}
-
-pub fn get_event_text_color(event_type: &str) -> &'static str {
-    match event_type {
-        "sched_switch" => "text-blue-600",
-        "process_fork" => "text-green-600",
-        "process_exit" => "text-red-600",
-        "page_fault" => "text-orange-600",
-        _ if event_type.contains("syscall") => "text-purple-600",
-        _ => "text-gray-600",
     }
 }
 
@@ -76,101 +63,5 @@ pub fn format_net_bytes_signed(allocated: u64, freed: u64) -> String {
         format!("+{}", format_bytes(allocated - freed))
     } else {
         format!("-{}", format_bytes(freed - allocated))
-    }
-}
-
-pub fn format_event_details(event: &TraceEvent) -> String {
-    match event.event_type.as_str() {
-        "sched_switch" => {
-            let prev = event.prev_pid.map(|p| p.to_string()).unwrap_or_default();
-            let next = event.next_pid.map(|p| p.to_string()).unwrap_or_default();
-            format!("{} → {}", prev, next)
-        }
-        "process_fork" => {
-            let parent = event.parent_pid.map(|p| p.to_string()).unwrap_or_default();
-            let child = event.child_pid.map(|p| p.to_string()).unwrap_or_default();
-            format!("{} → {}", parent, child)
-        }
-        "process_exit" => {
-            format!("exit: {}", event.exit_code.unwrap_or(0))
-        }
-        "page_fault" => {
-            let addr = event
-                .address
-                .map(|a| format!("0x{:x}", a))
-                .unwrap_or_default();
-            format!("@ {}", addr)
-        }
-        "syscall_read_enter" | "syscall_write_enter" => {
-            format!(
-                "fd:{} len:{}",
-                event.fd.unwrap_or(-1),
-                event.count.unwrap_or(0)
-            )
-        }
-        "syscall_read_exit" | "syscall_write_exit" => {
-            format!("ret:{}", event.ret.unwrap_or(0))
-        }
-        "syscall_mmap_enter" => {
-            let addr = event
-                .address
-                .map(|a| format!("0x{:x}", a))
-                .unwrap_or_default();
-            format!("addr:{} len:{}", addr, event.count.unwrap_or(0))
-        }
-        "syscall_mmap_exit" => {
-            format!("ret:{}", event.ret.unwrap_or(0))
-        }
-        "syscall_munmap_enter" => {
-            let addr = event
-                .address
-                .map(|a| format!("0x{:x}", a))
-                .unwrap_or_default();
-            format!("addr:{} len:{}", addr, event.count.unwrap_or(0))
-        }
-        "syscall_munmap_exit" => {
-            format!("ret:{}", event.ret.unwrap_or(0))
-        }
-        "syscall_brk_enter" => {
-            let addr = event
-                .address
-                .map(|a| format!("0x{:x}", a))
-                .unwrap_or_default();
-            format!("brk:{}", addr)
-        }
-        "syscall_brk_exit" => {
-            format!("ret:{}", event.ret.unwrap_or(0))
-        }
-        "syscall_io_uring_setup_enter" => {
-            format!(
-                "entries:{} params_ptr:0x{:x}",
-                event.fd.unwrap_or(0),
-                event.count.unwrap_or(0)
-            )
-        }
-        "syscall_io_uring_setup_exit" => {
-            format!("ret:{}", event.ret.unwrap_or(0))
-        }
-        "syscall_io_uring_enter_enter" => {
-            format!(
-                "fd:{} to_submit:{}",
-                event.fd.unwrap_or(-1),
-                event.count.unwrap_or(0)
-            )
-        }
-        "syscall_io_uring_enter_exit" => {
-            format!("ret:{}", event.ret.unwrap_or(0))
-        }
-        "syscall_io_uring_register_enter" => {
-            format!(
-                "fd:{} opcode:{}",
-                event.fd.unwrap_or(-1),
-                event.count.unwrap_or(0)
-            )
-        }
-        "syscall_io_uring_register_exit" => {
-            format!("ret:{}", event.ret.unwrap_or(0))
-        }
-        _ => String::new(),
     }
 }

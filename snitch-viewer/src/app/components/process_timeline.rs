@@ -28,7 +28,6 @@ pub fn ProcessTimeline(
     summary: Option<TraceSummary>,
     pid_summary: PidEventSummary,
     latency_stats: Option<SyscallLatencyStats>,
-    total_event_count: usize,
     selected_flame_event_type: Option<String>,
     flame_event_type_options: Vec<String>,
     flamegraph: Option<EventFlamegraphResponse>,
@@ -208,7 +207,14 @@ pub fn ProcessTimeline(
                                 .flatten()
                         }
                     }
-                    span { class: "text-xs text-gray-400", "{total_event_count} ev" }
+                    {
+                        let ev_count = if selected_pid.is_some() {
+                            pid_summary.total
+                        } else {
+                            summary.as_ref().map(|s| s.total_events).unwrap_or(0)
+                        };
+                        rsx! { span { class: "text-xs text-gray-400", "{ev_count} ev" } }
+                    }
                 }
 
                 div { class: "w-px h-4 bg-gray-200 shrink-0" }
@@ -411,7 +417,6 @@ pub fn ProcessTimeline(
                                 .collect()
                         })
                         .unwrap_or_default();
-
                     // Build tree line prefixes
                     let tree_pos_clone = tree_pos.clone();
                     let row_is_selected = is_selected;
@@ -594,6 +599,28 @@ pub fn ProcessTimeline(
     }
 }
 
+/// What part of the timeline window is being dragged.
+#[derive(Clone, Copy, PartialEq)]
+enum DragKind {
+    LeftEdge,
+    RightEdge,
+    Pan,
+}
+
+/// State captured at the start of a drag gesture.
+#[derive(Clone, Copy)]
+struct DragState {
+    kind: DragKind,
+    /// Mouse X in page coordinates at drag start.
+    start_page_x: f64,
+    /// Container width in pixels (estimated at drag start).
+    container_width: f64,
+    /// View start offset (ns from full_start) at drag start.
+    initial_start_offset: u64,
+    /// View end offset (ns from full_start) at drag start.
+    initial_end_offset: u64,
+}
+
 #[component]
 fn TimelineOverview(
     histogram: Option<HistogramResponse>,
@@ -610,12 +637,22 @@ fn TimelineOverview(
         return rsx! {};
     }
 
+    let mut drag = use_signal(|| Option::<DragState>::None);
+    let mut drag_preview_range = use_signal(|| Option::<(u64, u64)>::None);
+    let mut container_width_px = use_signal(|| 0.0f64);
     let min_window_ns = (full_range_ns / 200).max(1);
-    let drag_step_ns = (full_range_ns / 2500).max(1);
-    let window_ns = view_end_ns.saturating_sub(view_start_ns).max(min_window_ns);
-    let max_window_start_offset = full_range_ns.saturating_sub(window_ns);
-    let view_left_pct = ((view_start_ns - full_start_ns) as f64 / full_range * 100.0).max(0.0);
-    let view_width_pct = ((view_end_ns - view_start_ns) as f64 / full_range * 100.0).max(0.5);
+
+    let (display_view_start_ns, display_view_end_ns) =
+        drag_preview_range().unwrap_or((view_start_ns, view_end_ns));
+    let view_start_offset = display_view_start_ns.saturating_sub(full_start_ns);
+    let view_end_offset = display_view_end_ns.saturating_sub(full_start_ns);
+    let view_left_pct = (view_start_offset as f64 / full_range * 100.0).max(0.0);
+    let view_width_pct =
+        ((view_end_offset - view_start_offset) as f64 / full_range * 100.0).max(0.5);
+    // Handle hit area: 20px total (10px each side of edge)
+    let handle_half_px = 10.0;
+    // Visual handle width in pixels
+    let handle_width_px = 10.0;
 
     let max_count = histogram
         .as_ref()
@@ -635,10 +672,183 @@ fn TimelineOverview(
         .unwrap_or(1)
         .max(1);
 
+    let is_dragging = drag().is_some();
+    let drag_kind = drag().map(|d| d.kind);
+
+    // Compute new range from a drag delta in pixels
+    let compute_range = move |d: DragState, current_page_x: f64| -> (u64, u64) {
+        let cw = d.container_width;
+        if cw <= 0.0 {
+            return (view_start_ns, view_end_ns);
+        }
+        let dx_px = current_page_x - d.start_page_x;
+        let dx_frac = dx_px / cw;
+        let dx_ns = (dx_frac * full_range).round() as i64;
+
+        match d.kind {
+            DragKind::Pan => {
+                let window_ns = d.initial_end_offset.saturating_sub(d.initial_start_offset);
+                let max_start = full_range_ns.saturating_sub(window_ns);
+                let new_start =
+                    (d.initial_start_offset as i64 + dx_ns).clamp(0, max_start as i64) as u64;
+                (
+                    full_start_ns + new_start,
+                    full_start_ns + new_start + window_ns,
+                )
+            }
+            DragKind::LeftEdge => {
+                let max_start = d.initial_end_offset.saturating_sub(min_window_ns);
+                let new_start =
+                    (d.initial_start_offset as i64 + dx_ns).clamp(0, max_start as i64) as u64;
+                (
+                    full_start_ns + new_start,
+                    full_start_ns + d.initial_end_offset,
+                )
+            }
+            DragKind::RightEdge => {
+                let min_end = d.initial_start_offset + min_window_ns;
+                let new_end = (d.initial_end_offset as i64 + dx_ns)
+                    .clamp(min_end as i64, full_range_ns as i64)
+                    as u64;
+                (
+                    full_start_ns + d.initial_start_offset,
+                    full_start_ns + new_end,
+                )
+            }
+        }
+    };
+
+    // Determine which zone a click falls in based on element_x position
+    let classify_click = move |element_x: f64, cw: f64| -> Option<DragKind> {
+        if cw <= 0.0 {
+            return None;
+        }
+        let left_edge_px = view_left_pct / 100.0 * cw;
+        let right_edge_px = (view_left_pct + view_width_pct) / 100.0 * cw;
+
+        // Handles sit inside the window: left handle spans [left_edge, left_edge + handle_width]
+        // right handle spans [right_edge - handle_width, right_edge]
+        let in_left_handle = element_x >= left_edge_px - handle_half_px
+            && element_x <= left_edge_px + handle_width_px;
+        let in_right_handle = element_x >= right_edge_px - handle_width_px
+            && element_x <= right_edge_px + handle_half_px;
+
+        if in_left_handle {
+            Some(DragKind::LeftEdge)
+        } else if in_right_handle {
+            Some(DragKind::RightEdge)
+        } else if element_x > left_edge_px + handle_width_px
+            && element_x < right_edge_px - handle_width_px
+        {
+            Some(DragKind::Pan)
+        } else if element_x < left_edge_px {
+            // Clicked in left dimmed region
+            Some(DragKind::LeftEdge)
+        } else {
+            // Clicked in right dimmed region
+            Some(DragKind::RightEdge)
+        }
+    };
+
+    // Cursor style based on hover/drag state
+    let container_class = if is_dragging {
+        match drag_kind {
+            Some(DragKind::LeftEdge) | Some(DragKind::RightEdge) => {
+                "relative h-14 bg-gray-100 rounded overflow-hidden select-none cursor-ew-resize"
+            }
+            Some(DragKind::Pan) => {
+                "relative h-14 bg-gray-100 rounded overflow-hidden select-none cursor-grabbing"
+            }
+            None => "relative h-14 bg-gray-100 rounded overflow-hidden select-none cursor-grab",
+        }
+    } else {
+        "relative h-14 bg-gray-100 rounded overflow-hidden select-none cursor-grab"
+    };
+
     rsx! {
-        div { class: "relative h-10 bg-gray-100 rounded overflow-hidden",
+        div {
+            class: container_class,
+            // Measure container width on mount
+            onmounted: move |evt| async move {
+                if let Ok(rect) = evt.data().get_client_rect().await {
+                    container_width_px.set(rect.width());
+                }
+            },
+            onmousedown: move |evt: MouseEvent| {
+                evt.prevent_default();
+                let cw = container_width_px();
+                let element_x = evt.element_coordinates().x;
+                if let Some(kind) = classify_click(element_x, cw) {
+                    // When clicking in dimmed regions, snap the edge to click position first
+                    let left_edge_px = view_left_pct / 100.0 * cw;
+                    let right_edge_px = (view_left_pct + view_width_pct) / 100.0 * cw;
+                    let in_dimmed = element_x < left_edge_px
+                        || element_x > right_edge_px;
+
+                    let (snap_start, snap_end) = if in_dimmed && cw > 0.0 {
+                        let click_frac = element_x / cw;
+                        let click_ns =
+                            (click_frac * full_range).round() as u64;
+                        match kind {
+                            DragKind::LeftEdge => {
+                                let new_start = click_ns.min(
+                                    view_end_offset.saturating_sub(min_window_ns),
+                                );
+                                (new_start, view_end_offset)
+                            }
+                            DragKind::RightEdge => {
+                                let new_end = click_ns
+                                    .max(view_start_offset + min_window_ns)
+                                    .min(full_range_ns);
+                                (view_start_offset, new_end)
+                            }
+                            _ => (view_start_offset, view_end_offset),
+                        }
+                    } else {
+                        (view_start_offset, view_end_offset)
+                    };
+
+                    drag_preview_range
+                        .set(Some((full_start_ns + snap_start, full_start_ns + snap_end)));
+
+                    drag.set(Some(DragState {
+                        kind,
+                        start_page_x: evt.page_coordinates().x,
+                        container_width: cw,
+                        initial_start_offset: snap_start,
+                        initial_end_offset: snap_end,
+                    }));
+                }
+            },
+            onmousemove: move |evt: MouseEvent| {
+                let Some(d) = drag() else { return };
+                let (start, end) = compute_range(d, evt.page_coordinates().x);
+                if drag_preview_range() != Some((start, end)) {
+                    drag_preview_range.set(Some((start, end)));
+                }
+            },
+            onmouseup: move |_| {
+                if drag().is_some() {
+                    if let Some((start, end)) = drag_preview_range() {
+                        on_change_range.call((start, end, true));
+                    }
+                    drag.set(None);
+                    drag_preview_range.set(None);
+                }
+            },
+            onmouseleave: move |_| {
+                if drag().is_some() {
+                    if let Some((start, end)) = drag_preview_range() {
+                        on_change_range.call((start, end, true));
+                    }
+                    drag.set(None);
+                    drag_preview_range.set(None);
+                }
+            },
+
+            // Histogram background
             if let Some(h) = histogram {
-                div { class: "absolute inset-0 flex items-end",
+                div { class: "absolute inset-0 flex items-end pointer-events-none",
                     {h.buckets.iter().map(|bucket| {
                         let count: usize = bucket
                             .counts_by_type
@@ -659,80 +869,62 @@ fn TimelineOverview(
                 }
             }
 
+            // Dimmed regions outside the view window
             div {
-                class: "absolute top-0 bottom-0 bg-blue-500 opacity-25 border-x-2 border-blue-600",
+                class: "absolute top-0 bottom-0 left-0 bg-gray-900/25 pointer-events-none",
+                style: "width: {view_left_pct}%;",
+            }
+            div {
+                class: "absolute top-0 bottom-0 right-0 bg-gray-900/25 pointer-events-none",
+                style: "width: {(100.0 - view_left_pct - view_width_pct).max(0.0)}%;",
+            }
+
+            // Selected window top/bottom border
+            div {
+                class: "absolute top-0 h-0.5 bg-blue-500 pointer-events-none z-10",
+                style: "left: {view_left_pct}%; width: {view_width_pct}%;",
+            }
+            div {
+                class: "absolute bottom-0 h-0.5 bg-blue-500 pointer-events-none z-10",
                 style: "left: {view_left_pct}%; width: {view_width_pct}%;",
             }
 
-            input {
-                r#type: "range",
-                class: "timeline-window-slider",
-                style: "--window-thumb-width: {view_width_pct}%;",
-                min: "0",
-                max: "{max_window_start_offset}",
-                step: "{drag_step_ns}",
-                value: "{view_start_ns.saturating_sub(full_start_ns)}",
-                disabled: max_window_start_offset == 0,
-                oninput: move |evt| {
-                    if let Ok(offset) = evt.value().parse::<u64>() {
-                        let start = (full_start_ns + offset).min(full_end_ns.saturating_sub(window_ns));
-                        let end = start.saturating_add(window_ns).min(full_end_ns);
-                        on_change_range.call((start, end, false));
+            // Left handle – sits inside the left edge of the window
+            div {
+                class: "absolute top-0 bottom-0 pointer-events-none z-20 flex items-center justify-center",
+                style: "left: {view_left_pct}%; width: {handle_width_px}px;",
+                div {
+                    class: if is_dragging && drag_kind == Some(DragKind::LeftEdge) {
+                        "w-full h-full rounded-l-md bg-blue-600 flex items-center justify-center"
+                    } else {
+                        "w-full h-full rounded-l-md bg-blue-500 hover:bg-blue-600 flex items-center justify-center"
+                    },
+                    // Grip dots
+                    div { class: "flex flex-col gap-[3px] items-center",
+                        div { class: "w-[3px] h-[3px] rounded-full bg-white/70" }
+                        div { class: "w-[3px] h-[3px] rounded-full bg-white/70" }
+                        div { class: "w-[3px] h-[3px] rounded-full bg-white/70" }
                     }
-                },
-                onchange: move |evt| {
-                    if let Ok(offset) = evt.value().parse::<u64>() {
-                        let start = (full_start_ns + offset).min(full_end_ns.saturating_sub(window_ns));
-                        let end = start.saturating_add(window_ns).min(full_end_ns);
-                        on_change_range.call((start, end, true));
-                    }
-                },
+                }
             }
 
-            input {
-                r#type: "range",
-                class: "timeline-range-slider",
-                min: "0",
-                max: "{full_range_ns}",
-                step: "{drag_step_ns}",
-                value: "{view_start_ns.saturating_sub(full_start_ns)}",
-                oninput: move |evt| {
-                    if let Ok(offset) = evt.value().parse::<u64>() {
-                        let max_start = view_end_ns.saturating_sub(min_window_ns).max(full_start_ns);
-                        let start = (full_start_ns + offset).min(max_start);
-                        on_change_range.call((start, view_end_ns, false));
+            // Right handle – sits inside the right edge of the window
+            div {
+                class: "absolute top-0 bottom-0 pointer-events-none z-20 flex items-center justify-center",
+                style: "left: calc({(view_left_pct + view_width_pct).min(100.0)}% - {handle_width_px}px); width: {handle_width_px}px;",
+                div {
+                    class: if is_dragging && drag_kind == Some(DragKind::RightEdge) {
+                        "w-full h-full rounded-r-md bg-blue-600 flex items-center justify-center"
+                    } else {
+                        "w-full h-full rounded-r-md bg-blue-500 hover:bg-blue-600 flex items-center justify-center"
+                    },
+                    // Grip dots
+                    div { class: "flex flex-col gap-[3px] items-center",
+                        div { class: "w-[3px] h-[3px] rounded-full bg-white/70" }
+                        div { class: "w-[3px] h-[3px] rounded-full bg-white/70" }
+                        div { class: "w-[3px] h-[3px] rounded-full bg-white/70" }
                     }
-                },
-                onchange: move |evt| {
-                    if let Ok(offset) = evt.value().parse::<u64>() {
-                        let max_start = view_end_ns.saturating_sub(min_window_ns).max(full_start_ns);
-                        let start = (full_start_ns + offset).min(max_start);
-                        on_change_range.call((start, view_end_ns, true));
-                    }
-                },
-            }
-
-            input {
-                r#type: "range",
-                class: "timeline-range-slider",
-                min: "0",
-                max: "{full_range_ns}",
-                step: "{drag_step_ns}",
-                value: "{view_end_ns.saturating_sub(full_start_ns)}",
-                oninput: move |evt| {
-                    if let Ok(offset) = evt.value().parse::<u64>() {
-                        let min_end = (view_start_ns + min_window_ns).min(full_end_ns);
-                        let end = (full_start_ns + offset).max(min_end).min(full_end_ns);
-                        on_change_range.call((view_start_ns, end, false));
-                    }
-                },
-                onchange: move |evt| {
-                    if let Ok(offset) = evt.value().parse::<u64>() {
-                        let min_end = (view_start_ns + min_window_ns).min(full_end_ns);
-                        let end = (full_start_ns + offset).max(min_end).min(full_end_ns);
-                        on_change_range.call((view_start_ns, end, true));
-                    }
-                },
+                }
             }
         }
     }
