@@ -78,8 +78,87 @@
           ];
           LLVM_PREFIX = llvm-combined;
         };
+
+        snitch-runner = pkgs.writeShellApplication {
+          name = "snitch";
+          runtimeInputs = with pkgs; [
+            binaryen
+            bpftools
+            bpf-linker-crane
+            clang
+            coreutils
+            dioxus-cli
+            findutils
+            gnugrep
+            llvmPackages.bintools
+            openssl
+            pkg-config
+            rustToolchain
+            wasm-bindgen-cli
+            which
+          ];
+          text = ''
+            set -euo pipefail
+
+            if [ "$#" -eq 0 ]; then
+              echo "Usage: nix run .#snitch -- <program> [args...]"
+              exit 2
+            fi
+
+            if [ ! -f Cargo.toml ] || [ ! -d snitch ] || [ ! -d snitch-viewer ]; then
+              echo "Run this command from the snitch workspace root."
+              exit 2
+            fi
+
+            mkdir -p vendor
+            cp -f "${daisyui-bundle}" vendor/daisyui.mjs
+            cp -f "${daisyui-theme-bundle}" vendor/daisyui-theme.mjs
+
+            viewer_bin="target/dx/snitch-viewer/release/web/snitch-viewer"
+            viewer_public_dir="target/dx/snitch-viewer/release/web/public"
+            if [ "''${SNITCH_REBUILD_VIEWER:-0}" = "1" ] || [ ! -x "$viewer_bin" ] || [ ! -f "$viewer_public_dir/index.html" ]; then
+              echo "Building snitch-viewer bundle..."
+              dx bundle --release --platform server --fullstack -p snitch-viewer
+            fi
+
+            echo "Building snitch..."
+            cargo build --release -p snitch
+
+            if [ "''${EUID:-$(id -u)}" -ne 0 ]; then
+              sudo_cmd=""
+              if [ -x /run/wrappers/bin/sudo ]; then
+                sudo_cmd=/run/wrappers/bin/sudo
+              elif [ -x /usr/bin/sudo ]; then
+                sudo_cmd=/usr/bin/sudo
+              elif command -v sudo >/dev/null 2>&1; then
+                sudo_cmd="$(command -v sudo)"
+              fi
+
+              if [ -z "$sudo_cmd" ]; then
+                echo "Root privileges required for eBPF tracing, but sudo was not found."
+                echo "Run as root, or install/configure sudo and retry."
+                exit 1
+              fi
+
+              echo "Re-running snitch with $sudo_cmd for eBPF privileges..."
+              exec "$sudo_cmd" -E target/release/snitch "$@"
+            fi
+
+            exec target/release/snitch "$@"
+          '';
+        };
       in
-      {
+      rec {
+        packages = {
+          snitch = snitch-runner;
+          default = snitch-runner;
+        };
+
+        apps = {
+          snitch = flake-utils.lib.mkApp { drv = snitch-runner; };
+          default = apps.snitch;
+        };
+
         devShells.default =
           with pkgs;
           mkShell {

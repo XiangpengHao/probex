@@ -57,6 +57,11 @@ Then run the snitch to collect events.
 sudo -E cargo run --release -p snitch -- -- sleep 1
 ```
 
+Nix one-command flow (builds missing artifacts, traces, then opens viewer):
+```shell
+nix run .#snitch -- sleep 1
+```
+
 Default behavior:
 
 1. Writes `trace.parquet`
