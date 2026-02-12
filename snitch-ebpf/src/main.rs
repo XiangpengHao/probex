@@ -32,7 +32,8 @@ static TRACED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_TRACKED_PID
 
 /// Per-CPU counters for cpu sampling diagnostics.
 #[map]
-static CPU_SAMPLE_STATS: PerCpuArray<[u64; CPU_SAMPLE_STATS_LEN]> = PerCpuArray::with_max_entries(1, 0);
+static CPU_SAMPLE_STATS: PerCpuArray<[u64; CPU_SAMPLE_STATS_LEN]> =
+    PerCpuArray::with_max_entries(1, 0);
 
 /// Check if a PID is being traced
 #[inline(always)]
@@ -113,7 +114,10 @@ fn is_plausible_user_stack_ptr(ptr: u64) -> bool {
 }
 
 #[inline(always)]
-fn capture_user_frames_fp(ctx: &PerfEventContext, frames: &mut [u64; MAX_CPU_SAMPLE_FRAMES]) -> u16 {
+fn capture_user_frames_fp(
+    ctx: &PerfEventContext,
+    frames: &mut [u64; MAX_CPU_SAMPLE_FRAMES],
+) -> u16 {
     let regs = unsafe { &(*ctx.ctx).regs };
 
     let mut depth = 0usize;

@@ -94,7 +94,11 @@ pub fn ProcessTimeline(
 
     let all_process_rows: Vec<(&ProcessLifetime, TreePosition)> = ordered_pid_rows
         .iter()
-        .filter_map(|(pid, tree_pos)| process_by_pid.get(pid).map(|proc| (*proc, tree_pos.clone())))
+        .filter_map(|(pid, tree_pos)| {
+            process_by_pid
+                .get(pid)
+                .map(|proc| (*proc, tree_pos.clone()))
+        })
         .collect();
 
     let visible_in_range_count = sorted_processes
@@ -753,7 +757,12 @@ fn event_badge_tone(event_type: &str) -> &'static str {
         "page_fault" => "border-amber-300 text-amber-700",
         _ if event_type.contains("read") => "border-sky-300 text-sky-700",
         _ if event_type.contains("write") => "border-orange-300 text-orange-700",
-        _ if event_type.contains("mmap") || event_type.contains("munmap") || event_type.contains("brk") => "border-purple-300 text-purple-700",
+        _ if event_type.contains("mmap")
+            || event_type.contains("munmap")
+            || event_type.contains("brk") =>
+        {
+            "border-purple-300 text-purple-700"
+        }
         _ if event_type.contains("syscall") => "border-indigo-300 text-indigo-700",
         _ => "border-gray-300 text-gray-700",
     }

@@ -1064,11 +1064,7 @@ mod backend {
             }
         }
 
-        fn runtime_file_offset(
-            runtime_ip: u64,
-            map_start: u64,
-            map_file_offset: u64,
-        ) -> u64 {
+        fn runtime_file_offset(runtime_ip: u64, map_start: u64, map_file_offset: u64) -> u64 {
             runtime_ip
                 .saturating_sub(map_start)
                 .saturating_add(map_file_offset)
@@ -1111,7 +1107,10 @@ mod backend {
 
             self.ensure_symbol_map_loaded(path).await;
 
-            let Some(symbol_map) = self.symbol_map_cache.get(&path_key).and_then(|m| m.as_ref())
+            let Some(symbol_map) = self
+                .symbol_map_cache
+                .get(&path_key)
+                .and_then(|m| m.as_ref())
             else {
                 for addr in unresolved {
                     self.symbol_cache.insert((path_key.clone(), addr), None);
