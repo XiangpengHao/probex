@@ -1,41 +1,35 @@
 # snitch
 
-`snitch` is an eBPF-based Linux process tracer.
-It runs a command, traces kernel events for that command (and forked children), writes a Parquet file, and can launch a web viewer for exploration.
+`snitch` is an low-friction Linux profiler.
+It runs a command, collect everything you need, and visualize it. 
 
-## What It Traces
+## Usage
 
-`snitch` currently attaches these tracepoints:
+```
+nix run github:XiangpengHao/snitch -- sleep 1
+```
 
-1. `sched:sched_switch`
-2. `sched:sched_process_fork`
-3. `sched:sched_process_exit`
-4. `exceptions:page_fault_user`
-5. `syscalls:sys_enter_read`
-6. `syscalls:sys_exit_read`
-7. `syscalls:sys_enter_write`
-8. `syscalls:sys_exit_write`
+Other package managers coming soon, contributions welcome!
 
-9. `perf_event` CPU clock sampler (perf-style frequency sampling, default `999` Hz)
+### Frame pointers
 
-Events are filtered by a kernel-side PID map (`TRACED_PIDS`):
+`snitch` uses frame pointers to collect call stacks during CPU sampling.
+Without them, stack traces may be shallow or incomplete.
+[Why you should enable them](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html).
 
-1. The target child PID is inserted before the command starts executing.
-2. On fork, children are automatically added.
-3. On process exit, that PID is removed.
+**Rust** — add to `.cargo/config.toml`:
+```toml
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
+```
 
-## How It Works (Runtime Flow)
+**C / C++** — compile with `-fno-omit-frame-pointer`.
 
-1. `snitch` loads embedded eBPF bytecode.
-2. It forks a child and pauses it with `SIGSTOP` before `exec`.
-3. It inserts the child PID into `TRACED_PIDS`.
-4. It attaches all tracepoints.
-5. It sends `SIGCONT`, so the child starts running the target command.
-6. eBPF programs emit typed events into a ring buffer.
-7. Userspace reads events, flattens them, and writes batched Parquet output.
-8. When tracing ends, it optionally launches `snitch-viewer`.
+## What it looks like
+![](doc/screenshots/screenshot.png)
 
-## Quick Start (Linux)
+
+## Contributing 
 
 ### 1. Prerequisites
 
