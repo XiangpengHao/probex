@@ -16,6 +16,7 @@ pub struct TraceEvent {
     pub tgid: u32,
     pub process_name: Option<String>,
     pub stack_id: Option<i32>,
+    pub kernel_stack_id: Option<i32>,
     pub stack_kind: Option<String>,
     pub stack_frames: Option<String>,
     pub stack_trace: Option<String>,
@@ -157,11 +158,10 @@ mod backend {
     use datafusion::prelude::*;
     use inferno::flamegraph;
     use std::collections::{BTreeMap, HashSet};
-    use std::fs::File;
-    use std::io::{Error as IoError, ErrorKind, Read, Seek, SeekFrom};
-    use std::path::PathBuf;
-    use std::process::Command;
+    use std::io::{Error as IoError, ErrorKind};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, OnceLock};
+    use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
     static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
 
@@ -471,6 +471,7 @@ mod backend {
                     tgid: extract_u32(batch, "tgid", row),
                     process_name: extract_option_string(batch, "process_name", row),
                     stack_id: extract_option_i32(batch, "stack_id", row),
+                    kernel_stack_id: extract_option_i32(batch, "kernel_stack_id", row),
                     stack_kind: extract_option_string(batch, "stack_kind", row),
                     stack_frames: extract_option_string(batch, "stack_frames", row),
                     stack_trace: extract_option_string(batch, "stack_trace", row),
@@ -1048,258 +1049,118 @@ mod backend {
         stack_trace: Option<String>,
     }
 
-    #[derive(Clone, Debug)]
-    struct ElfLoadSegment {
-        file_offset: u64,
-        file_size: u64,
-        vaddr: u64,
-    }
-
-    #[derive(Clone, Copy)]
-    enum ElfEndian {
-        Little,
-        Big,
-    }
-
-    #[derive(Default)]
     struct OfflineUserSymbolizer {
-        tool: Option<String>,
-        symbol_cache: std::collections::HashMap<(String, u64), Option<String>>,
-        elf_segments_cache: std::collections::HashMap<String, Option<Vec<ElfLoadSegment>>>,
+        symbol_manager: SymbolManager,
+        symbol_cache: std::collections::HashMap<(String, u64), Option<Vec<String>>>,
+        symbol_map_cache: std::collections::HashMap<String, Option<wholesym::SymbolMap>>,
     }
 
     impl OfflineUserSymbolizer {
         fn new() -> Self {
-            let tool = ["addr2line", "llvm-addr2line"]
-                .iter()
-                .find_map(|candidate| {
-                    Command::new(candidate)
-                        .arg("--version")
-                        .output()
-                        .ok()
-                        .filter(|output| output.status.success())
-                        .map(|_| (*candidate).to_string())
-                });
             Self {
-                tool,
+                symbol_manager: SymbolManager::with_config(SymbolManagerConfig::default()),
                 symbol_cache: std::collections::HashMap::new(),
-                elf_segments_cache: std::collections::HashMap::new(),
+                symbol_map_cache: std::collections::HashMap::new(),
             }
         }
 
-        fn symbolize_runtime_addr(
-            &mut self,
-            path: &str,
+        fn runtime_file_offset(
             runtime_ip: u64,
             map_start: u64,
             map_file_offset: u64,
-        ) -> Option<String> {
-            let file_offset = runtime_ip
+        ) -> u64 {
+            runtime_ip
                 .saturating_sub(map_start)
-                .saturating_add(map_file_offset);
-            let normalized_addr = self
-                .file_offset_to_elf_vaddr(path, file_offset)
-                .unwrap_or(file_offset);
-            self.symbolize_addr(path, normalized_addr)
+                .saturating_add(map_file_offset)
         }
 
-        fn symbolize_addr(&mut self, path: &str, addr: u64) -> Option<String> {
-            let cache_key = (path.to_string(), addr);
-            if let Some(cached) = self.symbol_cache.get(&cache_key) {
-                return cached.clone();
+        async fn ensure_symbol_map_loaded(&mut self, path: &str) {
+            if self.symbol_map_cache.contains_key(path) {
+                return;
+            }
+            let symbol_map = self
+                .symbol_manager
+                .load_symbol_map_for_binary_at_path(Path::new(path), None)
+                .await
+                .ok();
+            self.symbol_map_cache.insert(path.to_string(), symbol_map);
+        }
+
+        async fn symbolize_addrs_batch(&mut self, path: &str, addrs: &[u64]) {
+            if addrs.is_empty() {
+                return;
             }
 
-            let Some(tool) = self.tool.as_ref() else {
-                self.symbol_cache.insert(cache_key, None);
-                return None;
+            let path_key = path.to_string();
+            let mut unresolved = Vec::new();
+            let mut seen = HashSet::new();
+            for addr in addrs {
+                if !seen.insert(*addr) {
+                    continue;
+                }
+                let cache_key = (path_key.clone(), *addr);
+                if self.symbol_cache.contains_key(&cache_key) {
+                    continue;
+                }
+                unresolved.push(*addr);
+            }
+
+            if unresolved.is_empty() {
+                return;
+            }
+
+            self.ensure_symbol_map_loaded(path).await;
+
+            let Some(symbol_map) = self.symbol_map_cache.get(&path_key).and_then(|m| m.as_ref())
+            else {
+                for addr in unresolved {
+                    self.symbol_cache.insert((path_key.clone(), addr), None);
+                }
+                return;
             };
 
-            let symbol = Command::new(tool)
-                .arg("-Cf")
-                .arg("-e")
-                .arg(path)
-                .arg(format!("0x{addr:x}"))
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    stdout.lines().next().map(str::trim).map(str::to_string)
+            for addr in unresolved {
+                let symbol = symbol_map
+                    .lookup(LookupAddress::FileOffset(addr))
+                    .await
+                    .and_then(symbol_labels_from_address_info);
+                self.symbol_cache.insert((path_key.clone(), addr), symbol);
+            }
+        }
+
+        fn lookup_symbol_labels(&self, path: &str, addr: u64) -> Option<Vec<String>> {
+            self.symbol_cache
+                .get(&(path.to_string(), addr))
+                .cloned()
+                .flatten()
+        }
+    }
+
+    fn symbol_labels_from_address_info(address_info: wholesym::AddressInfo) -> Option<Vec<String>> {
+        if let Some(frames) = &address_info.frames {
+            let mut labels: Vec<String> = frames
+                .iter()
+                .filter_map(|frame| {
+                    frame
+                        .function
+                        .as_ref()
+                        .filter(|function| !function.is_empty())
+                        .cloned()
                 })
-                .filter(|symbol| !symbol.is_empty() && symbol != "??");
-
-            self.symbol_cache.insert(cache_key, symbol.clone());
-            symbol
-        }
-
-        fn file_offset_to_elf_vaddr(&mut self, path: &str, file_offset: u64) -> Option<u64> {
-            let segments = self
-                .elf_segments_cache
-                .entry(path.to_string())
-                .or_insert_with(|| parse_elf_load_segments(path))
-                .as_ref()?;
-            file_offset_to_vaddr(segments, file_offset)
-        }
-    }
-
-    fn read_u16(bytes: &[u8], offset: usize, endian: ElfEndian) -> Option<u16> {
-        let slice = bytes.get(offset..offset + 2)?;
-        let value = [slice[0], slice[1]];
-        Some(match endian {
-            ElfEndian::Little => u16::from_le_bytes(value),
-            ElfEndian::Big => u16::from_be_bytes(value),
-        })
-    }
-
-    fn read_u32(bytes: &[u8], offset: usize, endian: ElfEndian) -> Option<u32> {
-        let slice = bytes.get(offset..offset + 4)?;
-        let value = [slice[0], slice[1], slice[2], slice[3]];
-        Some(match endian {
-            ElfEndian::Little => u32::from_le_bytes(value),
-            ElfEndian::Big => u32::from_be_bytes(value),
-        })
-    }
-
-    fn read_u64(bytes: &[u8], offset: usize, endian: ElfEndian) -> Option<u64> {
-        let slice = bytes.get(offset..offset + 8)?;
-        let value = [
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ];
-        Some(match endian {
-            ElfEndian::Little => u64::from_le_bytes(value),
-            ElfEndian::Big => u64::from_be_bytes(value),
-        })
-    }
-
-    fn parse_elf_load_segments(path: &str) -> Option<Vec<ElfLoadSegment>> {
-        const PT_LOAD: u32 = 1;
-
-        let mut file = File::open(path).ok()?;
-        let mut ident = [0u8; 16];
-        file.read_exact(&mut ident).ok()?;
-
-        if ident[0] != 0x7f || ident[1] != b'E' || ident[2] != b'L' || ident[3] != b'F' {
-            return None;
-        }
-
-        let class = ident[4];
-        let endian = match ident[5] {
-            1 => ElfEndian::Little,
-            2 => ElfEndian::Big,
-            _ => return None,
-        };
-
-        let header_len = match class {
-            1 => 52usize,
-            2 => 64usize,
-            _ => return None,
-        };
-        let mut header = vec![0u8; header_len];
-        header[..16].copy_from_slice(&ident);
-        file.read_exact(&mut header[16..]).ok()?;
-
-        let (phoff, phentsize, phnum) = match class {
-            1 => (
-                read_u32(&header, 28, endian)? as u64,
-                read_u16(&header, 42, endian)? as usize,
-                read_u16(&header, 44, endian)? as usize,
-            ),
-            2 => (
-                read_u64(&header, 32, endian)?,
-                read_u16(&header, 54, endian)? as usize,
-                read_u16(&header, 56, endian)? as usize,
-            ),
-            _ => return None,
-        };
-
-        if phentsize == 0 || phnum == 0 {
-            return Some(Vec::new());
-        }
-
-        let table_len = phentsize.checked_mul(phnum)?;
-        if table_len == 0 {
-            return Some(Vec::new());
-        }
-
-        let mut phdr_table = vec![0u8; table_len];
-        file.seek(SeekFrom::Start(phoff)).ok()?;
-        file.read_exact(&mut phdr_table).ok()?;
-
-        let mut segments: Vec<ElfLoadSegment> = Vec::new();
-        for idx in 0..phnum {
-            let start = idx.saturating_mul(phentsize);
-            let end = start.saturating_add(phentsize);
-            let Some(ph) = phdr_table.get(start..end) else {
-                continue;
-            };
-
-            match class {
-                1 => {
-                    if ph.len() < 32 {
-                        continue;
-                    }
-                    let Some(p_type) = read_u32(ph, 0, endian) else {
-                        continue;
-                    };
-                    if p_type != PT_LOAD {
-                        continue;
-                    }
-                    let (Some(p_offset), Some(p_vaddr), Some(p_filesz)) = (
-                        read_u32(ph, 4, endian),
-                        read_u32(ph, 8, endian),
-                        read_u32(ph, 16, endian),
-                    ) else {
-                        continue;
-                    };
-                    segments.push(ElfLoadSegment {
-                        file_offset: p_offset as u64,
-                        file_size: p_filesz as u64,
-                        vaddr: p_vaddr as u64,
-                    });
-                }
-                2 => {
-                    if ph.len() < 56 {
-                        continue;
-                    }
-                    let Some(p_type) = read_u32(ph, 0, endian) else {
-                        continue;
-                    };
-                    if p_type != PT_LOAD {
-                        continue;
-                    }
-                    let (Some(p_offset), Some(p_vaddr), Some(p_filesz)) = (
-                        read_u64(ph, 8, endian),
-                        read_u64(ph, 16, endian),
-                        read_u64(ph, 32, endian),
-                    ) else {
-                        continue;
-                    };
-                    segments.push(ElfLoadSegment {
-                        file_offset: p_offset,
-                        file_size: p_filesz,
-                        vaddr: p_vaddr,
-                    });
-                }
-                _ => return None,
+                .collect();
+            if !labels.is_empty() {
+                // wholesym returns inline frames from innermost to outermost.
+                // Folded stacks should be root to leaf.
+                labels.reverse();
+                return Some(labels);
             }
         }
 
-        Some(segments)
-    }
-
-    fn file_offset_to_vaddr(segments: &[ElfLoadSegment], file_offset: u64) -> Option<u64> {
-        segments.iter().find_map(|segment| {
-            let end = segment.file_offset.checked_add(segment.file_size)?;
-            if file_offset >= segment.file_offset && file_offset < end {
-                Some(
-                    segment
-                        .vaddr
-                        .saturating_add(file_offset.saturating_sub(segment.file_offset)),
-                )
-            } else {
-                None
-            }
-        })
+        if address_info.symbol.name.is_empty() || address_info.symbol.name == "??" {
+            None
+        } else {
+            Some(vec![address_info.symbol.name])
+        }
     }
 
     fn parse_stack_frames(stack_frames: &str) -> Vec<u64> {
@@ -1335,7 +1196,7 @@ mod backend {
             .find(|segment| ip >= segment.start_addr && ip < segment.end_addr)
     }
 
-    fn symbolize_user_frames(
+    async fn symbolize_user_frames(
         tgid: u32,
         ts_ns: u64,
         frames: &[u64],
@@ -1358,23 +1219,56 @@ mod backend {
             .iter()
             .map(|ip| find_segment_for_ip(snapshot, *ip))
             .collect();
-        // When we do have a snapshot, leading unmapped entries are usually unwind
-        // noise; trimming them keeps folded stacks stable.
-        let start_idx = mapped_segments
-            .iter()
-            .position(|segment| segment.is_some())
-            .unwrap_or(0);
 
-        for (ip, maybe_segment) in frames.iter().zip(mapped_segments).skip(start_idx) {
-            let maybe_symbol = maybe_segment.and_then(|segment| {
-                symbolizer.symbolize_runtime_addr(
-                    &segment.path,
+        let mut frame_symbol_keys: Vec<Option<(String, u64)>> = Vec::with_capacity(frames.len());
+        let mut unresolved_by_path: std::collections::HashMap<String, Vec<u64>> =
+            std::collections::HashMap::new();
+
+        for (ip, maybe_segment) in frames.iter().zip(mapped_segments.iter()) {
+            if let Some(segment) = maybe_segment {
+                let file_offset = OfflineUserSymbolizer::runtime_file_offset(
                     *ip,
                     segment.start_addr,
                     segment.file_offset,
-                )
-            });
-            labels.push(maybe_symbol.unwrap_or_else(|| format!("0x{ip:x}")));
+                );
+                frame_symbol_keys.push(Some((segment.path.clone(), file_offset)));
+                unresolved_by_path
+                    .entry(segment.path.clone())
+                    .or_default()
+                    .push(file_offset);
+            } else {
+                frame_symbol_keys.push(None);
+            }
+        }
+
+        for (path, addrs) in unresolved_by_path {
+            symbolizer.symbolize_addrs_batch(&path, &addrs).await;
+        }
+
+        for (ip, maybe_key) in frames.iter().zip(frame_symbol_keys.into_iter()) {
+            if let Some((path, addr)) = maybe_key
+                && let Some(symbols) = symbolizer.lookup_symbol_labels(&path, addr)
+            {
+                labels.extend(symbols);
+            } else {
+                labels.push(format!("0x{ip:x}"));
+            }
+        }
+        labels
+    }
+
+    fn parse_kernel_labels_from_stack_trace(stack_trace: &str) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut in_kernel_section = false;
+        for frame in stack_trace.split(';').filter(|frame| !frame.is_empty()) {
+            if frame == "[kernel]" {
+                in_kernel_section = true;
+                labels.push(frame.to_string());
+                continue;
+            }
+            if in_kernel_section {
+                labels.push(frame.to_string());
+            }
         }
         labels
     }
@@ -1591,7 +1485,10 @@ mod backend {
 
         let user_tgids: HashSet<u32> = sampled_rows
             .iter()
-            .filter(|row| row.stack_kind.as_deref() == Some("user") && row.stack_frames.is_some())
+            .filter(|row| {
+                matches!(row.stack_kind.as_deref(), Some("user") | Some("both"))
+                    && row.stack_frames.is_some()
+            })
             .map(|row| row.tgid)
             .collect();
 
@@ -1614,6 +1511,22 @@ mod backend {
                         &map_snapshots,
                         &mut user_symbolizer,
                     )
+                    .await
+                }
+                (Some("both"), Some(frames_hex)) if !frames_hex.is_empty() => {
+                    let frames = parse_stack_frames(frames_hex);
+                    let mut labels = symbolize_user_frames(
+                        row.tgid,
+                        row.ts_ns,
+                        &frames,
+                        &map_snapshots,
+                        &mut user_symbolizer,
+                    )
+                    .await;
+                    if let Some(stack_trace) = row.stack_trace.as_deref() {
+                        labels.extend(parse_kernel_labels_from_stack_trace(stack_trace));
+                    }
+                    labels
                 }
                 _ => row
                     .stack_trace

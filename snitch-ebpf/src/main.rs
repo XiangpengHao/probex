@@ -48,34 +48,57 @@ fn bump_cpu_sample_stat(index: usize) {
     }
 }
 
-/// Capture stack id for the current event.
-///
-/// We try user stack first (for "who in user code triggered this"), then
-/// fallback to kernel stack if user stack capture fails.
+/// Capture both user and kernel stack ids for the current sample.
 #[inline(always)]
-fn capture_stack<C: EbpfContext>(ctx: &C) -> (i32, u8) {
-    if let Ok(stack_id) = unsafe { STACK_TRACES.get_stackid::<C>(ctx, BPF_F_USER_STACK as u64) } {
-        return (stack_id as i32, STACK_KIND_USER);
+fn capture_stacks<C: EbpfContext>(ctx: &C) -> (i32, i32, u8) {
+    let user_stack_id = unsafe { STACK_TRACES.get_stackid::<C>(ctx, BPF_F_USER_STACK as u64) }
+        .map(|stack_id| stack_id as i32)
+        .unwrap_or(-1);
+    let kernel_stack_id = unsafe { STACK_TRACES.get_stackid::<C>(ctx, 0) }
+        .map(|stack_id| stack_id as i32)
+        .unwrap_or(-1);
+
+    let mut stack_kind = STACK_KIND_NONE;
+    if user_stack_id >= 0 {
+        stack_kind |= STACK_KIND_USER;
     }
-    if let Ok(stack_id) = unsafe { STACK_TRACES.get_stackid::<C>(ctx, 0) } {
-        return (stack_id as i32, STACK_KIND_KERNEL);
+    if kernel_stack_id >= 0 {
+        stack_kind |= STACK_KIND_KERNEL;
     }
-    (-1, STACK_KIND_NONE)
+
+    (user_stack_id, kernel_stack_id, stack_kind)
 }
 
-/// Create an event header
+/// Create an event header without stack capture.
 #[inline(always)]
 fn make_header<C: EbpfContext>(ctx: &C, event_type: EventType) -> EventHeader {
-    let (stack_id, stack_kind) = capture_stack(ctx);
+    EventHeader {
+        timestamp_ns: unsafe { bpf_ktime_get_ns() },
+        pid: ctx.pid(),
+        tgid: ctx.tgid(),
+        stack_id: -1,
+        kernel_stack_id: -1,
+        stack_kind: STACK_KIND_NONE,
+        event_type: event_type as u8,
+        cpu: unsafe { bpf_get_smp_processor_id() } as u8,
+        _padding: [0; 5],
+    }
+}
+
+/// Create a cpu sample header with dual-stack capture.
+#[inline(always)]
+fn make_cpu_sample_header(ctx: &PerfEventContext) -> EventHeader {
+    let (stack_id, kernel_stack_id, stack_kind) = capture_stacks(ctx);
     EventHeader {
         timestamp_ns: unsafe { bpf_ktime_get_ns() },
         pid: ctx.pid(),
         tgid: ctx.tgid(),
         stack_id,
+        kernel_stack_id,
         stack_kind,
-        event_type: event_type as u8,
+        event_type: EventType::CpuSample as u8,
         cpu: unsafe { bpf_get_smp_processor_id() } as u8,
-        _padding: [0; 1],
+        _padding: [0; 5],
     }
 }
 
@@ -96,12 +119,16 @@ fn try_cpu_sample(ctx: &PerfEventContext) -> Result<u32, i64> {
     }
 
     if let Some(mut buf) = EVENTS.reserve::<EventHeader>(0) {
-        let event = make_header(ctx, EventType::CpuSample);
+        let event = make_cpu_sample_header(ctx);
         bump_cpu_sample_stat(CPU_SAMPLE_STAT_EMITTED);
-        match event.stack_kind {
-            STACK_KIND_USER => bump_cpu_sample_stat(CPU_SAMPLE_STAT_USER_STACK),
-            STACK_KIND_KERNEL => bump_cpu_sample_stat(CPU_SAMPLE_STAT_KERNEL_STACK),
-            _ => bump_cpu_sample_stat(CPU_SAMPLE_STAT_NO_STACK),
+        if (event.stack_kind & STACK_KIND_USER) != 0 {
+            bump_cpu_sample_stat(CPU_SAMPLE_STAT_USER_STACK);
+        }
+        if (event.stack_kind & STACK_KIND_KERNEL) != 0 {
+            bump_cpu_sample_stat(CPU_SAMPLE_STAT_KERNEL_STACK);
+        }
+        if event.stack_kind == STACK_KIND_NONE {
+            bump_cpu_sample_stat(CPU_SAMPLE_STAT_NO_STACK);
         }
         unsafe {
             (*buf.as_mut_ptr()) = event;

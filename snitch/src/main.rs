@@ -141,8 +141,8 @@ use snitch_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
     CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, EventHeader, EventType, PageFaultEvent,
-    ProcessExitEvent, ProcessForkEvent, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent,
-    SyscallEnterEvent, SyscallExitEvent,
+    ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER,
+    SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 
@@ -185,7 +185,10 @@ struct Event {
     pid: u32,
     tgid: u32,
     process_name: Option<String>,
+    /// User-space stack id.
     stack_id: Option<i32>,
+    /// Kernel-space stack id.
+    kernel_stack_id: Option<i32>,
     stack_kind: Option<&'static str>,
     stack_frames: Option<String>,
     stack_trace: Option<String>,
@@ -217,6 +220,7 @@ fn create_schema() -> Schema {
         Field::new("tgid", DataType::UInt32, false),
         Field::new("process_name", DataType::Utf8, true),
         Field::new("stack_id", DataType::Int32, true),
+        Field::new("kernel_stack_id", DataType::Int32, true),
         Field::new("stack_kind", DataType::Utf8, true),
         Field::new("stack_frames", DataType::Utf8, true),
         Field::new("stack_trace", DataType::Utf8, true),
@@ -295,6 +299,7 @@ impl ParquetBatchWriter {
         let mut tgid_builder = UInt32Builder::with_capacity(batch_len);
         let mut process_name_builder = StringBuilder::with_capacity(batch_len, batch_len * 24);
         let mut stack_id_builder = Int32Builder::with_capacity(batch_len);
+        let mut kernel_stack_id_builder = Int32Builder::with_capacity(batch_len);
         let mut stack_kind_builder = StringBuilder::with_capacity(batch_len, batch_len * 8);
         let mut stack_frames_builder = StringBuilder::with_capacity(batch_len, batch_len * 64);
         let mut stack_trace_builder = StringBuilder::with_capacity(batch_len, batch_len * 48);
@@ -318,6 +323,7 @@ impl ParquetBatchWriter {
             tgid_builder.append_value(event.tgid);
             process_name_builder.append_option(event.process_name.as_deref());
             stack_id_builder.append_option(event.stack_id);
+            kernel_stack_id_builder.append_option(event.kernel_stack_id);
             stack_kind_builder.append_option(event.stack_kind);
             stack_frames_builder.append_option(event.stack_frames.as_deref());
             stack_trace_builder.append_option(event.stack_trace.as_deref());
@@ -342,6 +348,7 @@ impl ParquetBatchWriter {
             Arc::new(tgid_builder.finish()),
             Arc::new(process_name_builder.finish()),
             Arc::new(stack_id_builder.finish()),
+            Arc::new(kernel_stack_id_builder.finish()),
             Arc::new(stack_kind_builder.finish()),
             Arc::new(stack_frames_builder.finish()),
             Arc::new(stack_trace_builder.finish()),
@@ -389,6 +396,7 @@ fn stack_kind_from_header(header: &EventHeader) -> Option<&'static str> {
     match header.stack_kind {
         STACK_KIND_USER => Some("user"),
         STACK_KIND_KERNEL => Some("kernel"),
+        STACK_KIND_BOTH => Some("both"),
         _ => None,
     }
 }
@@ -400,6 +408,7 @@ fn event_base(event_type: &'static str, header: &EventHeader) -> Event {
         pid: header.pid,
         tgid: header.tgid,
         stack_id: (header.stack_id >= 0).then_some(header.stack_id),
+        kernel_stack_id: (header.kernel_stack_id >= 0).then_some(header.kernel_stack_id),
         stack_kind: stack_kind_from_header(header),
         cpu: header.cpu,
         ..Default::default()
@@ -658,7 +667,7 @@ fn enrich_process_name(
     event.process_name = maybe_name;
 }
 
-const STACK_FRAME_LIMIT: usize = 64;
+const STACK_FRAME_LIMIT: usize = 127;
 
 fn format_kernel_ip(ip: u64, symbols: Option<&BTreeMap<u64, String>>) -> String {
     if let Some(symbols) = symbols
@@ -900,17 +909,16 @@ fn is_plausible_user_instruction_ip(ip: u64) -> bool {
     ip >= 0x1000 && ip < (1u64 << 63) && ip != u64::MAX
 }
 
-fn materialize_stack(
+fn read_stack_frames(
     stack_id: i32,
-    stack_kind: Option<&'static str>,
+    is_user_stack: bool,
     stack_traces: &StackTraceMap<MapData>,
-    kernel_syms: Option<&BTreeMap<u64, String>>,
-) -> MaterializedStack {
+) -> Vec<u64> {
     if stack_id < 0 {
-        return MaterializedStack::default();
+        return Vec::new();
     }
     let Ok(stack) = stack_traces.get(&(stack_id as u32), 0) else {
-        return MaterializedStack::default();
+        return Vec::new();
     };
 
     let mut frames: Vec<u64> = stack
@@ -919,34 +927,68 @@ fn materialize_stack(
         .take(STACK_FRAME_LIMIT)
         .map(|frame| frame.ip)
         .collect();
-    if stack_kind == Some("user") {
+    if is_user_stack {
         // Aya exposes raw frames as produced by bpf_get_stackid(). Filtering out
         // impossible user IPs here avoids polluting flamegraph roots with junk
         // values when user-space unwinding is partial.
         frames.retain(|ip| is_plausible_user_instruction_ip(*ip));
     }
-    if frames.is_empty() {
-        return MaterializedStack::default();
-    }
     frames.reverse();
+    frames
+}
 
-    let stack_frames = format_stack_frames_hex(&frames);
-    let stack_trace = match stack_kind {
-        Some("kernel") => {
-            let mut parts = Vec::with_capacity(frames.len() + 1);
-            parts.push("[kernel]".to_string());
-            parts.extend(frames.iter().map(|ip| format_kernel_ip(*ip, kernel_syms)));
-            Some(parts.join(";"))
+fn format_kernel_stack_trace(frames: &[u64], symbols: Option<&BTreeMap<u64, String>>) -> Option<String> {
+    if frames.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(frames.len() + 1);
+    parts.push("[kernel]".to_string());
+    parts.extend(frames.iter().map(|ip| format_kernel_ip(*ip, symbols)));
+    Some(parts.join(";"))
+}
+
+fn materialize_stacks(
+    user_stack_id: Option<i32>,
+    kernel_stack_id: Option<i32>,
+    stack_kind: Option<&'static str>,
+    stack_traces: &StackTraceMap<MapData>,
+    kernel_syms: Option<&BTreeMap<u64, String>>,
+) -> MaterializedStack {
+    let user_frames = user_stack_id
+        .map(|stack_id| read_stack_frames(stack_id, true, stack_traces))
+        .unwrap_or_default();
+    let kernel_frames = kernel_stack_id
+        .map(|stack_id| read_stack_frames(stack_id, false, stack_traces))
+        .unwrap_or_default();
+
+    match stack_kind {
+        Some("user") => {
+            let stack_frames = format_stack_frames_hex(&user_frames);
+            let stack_trace = stack_frames
+                .as_ref()
+                .map(|frames| format!("[user];{frames}"));
+            MaterializedStack {
+                stack_frames,
+                stack_trace,
+            }
         }
-        Some("user") => stack_frames
-            .as_ref()
-            .map(|frames| format!("[user];{frames}")),
-        _ => stack_frames.clone(),
-    };
-
-    MaterializedStack {
-        stack_frames,
-        stack_trace,
+        Some("kernel") => MaterializedStack {
+            stack_frames: format_stack_frames_hex(&kernel_frames),
+            stack_trace: format_kernel_stack_trace(&kernel_frames, kernel_syms),
+        },
+        Some("both") => MaterializedStack {
+            // Keep user frames in hex for later userspace symbolization in viewer.
+            stack_frames: format_stack_frames_hex(&user_frames),
+            // Keep kernel chain pre-symbolized to avoid per-request kernel lookups.
+            stack_trace: format_kernel_stack_trace(&kernel_frames, kernel_syms),
+        },
+        _ => {
+            let stack_frames = format_stack_frames_hex(&user_frames);
+            MaterializedStack {
+                stack_trace: stack_frames.clone(),
+                stack_frames,
+            }
+        }
     }
 }
 
@@ -954,19 +996,28 @@ fn enrich_stack_data(
     event: &mut Event,
     stack_traces: &StackTraceMap<MapData>,
     kernel_syms: Option<&BTreeMap<u64, String>>,
-    stack_cache: &mut std::collections::HashMap<(i32, Option<&'static str>), MaterializedStack>,
+    stack_cache: &mut std::collections::HashMap<
+        (Option<i32>, Option<i32>, Option<&'static str>),
+        MaterializedStack,
+    >,
 ) {
-    let Some(stack_id) = event.stack_id else {
+    if event.stack_id.is_none() && event.kernel_stack_id.is_none() {
         return;
-    };
-    let key = (stack_id, event.stack_kind);
+    }
+    let key = (event.stack_id, event.kernel_stack_id, event.stack_kind);
     if let Some(cached) = stack_cache.get(&key) {
         event.stack_frames = cached.stack_frames.clone();
         event.stack_trace = cached.stack_trace.clone();
         return;
     }
 
-    let materialized = materialize_stack(stack_id, event.stack_kind, stack_traces, kernel_syms);
+    let materialized = materialize_stacks(
+        event.stack_id,
+        event.kernel_stack_id,
+        event.stack_kind,
+        stack_traces,
+        kernel_syms,
+    );
     event.stack_frames = materialized.stack_frames.clone();
     event.stack_trace = materialized.stack_trace.clone();
     stack_cache.insert(key, materialized);
@@ -1258,7 +1309,7 @@ async fn main() -> Result<()> {
     let mut pid_name_cache: std::collections::HashMap<u32, Option<String>> =
         std::collections::HashMap::new();
     let mut stack_trace_cache: std::collections::HashMap<
-        (i32, Option<&'static str>),
+        (Option<i32>, Option<i32>, Option<&'static str>),
         MaterializedStack,
     > = std::collections::HashMap::new();
     let mut proc_map_snapshot_cache: std::collections::HashMap<u32, Vec<ProcMapEntry>> =
