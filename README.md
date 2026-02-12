@@ -1,7 +1,7 @@
 # snitch
 
-`snitch` is an low-friction Linux profiler.
-It runs a command, collect everything you need, and visualize it. 
+`snitch` is a low-friction Linux profiler.
+It runs a command, collects everything you need, and visualizes it.
 
 ## Usage
 
@@ -11,25 +11,25 @@ nix run github:XiangpengHao/snitch -- sleep 1
 
 Other package managers coming soon, contributions welcome!
 
-### Frame pointers
+#### Frame pointers
 
-`snitch` uses frame pointers to collect call stacks during CPU sampling.
+`snitch` works best with frame pointers enabled.
 Without them, stack traces may be shallow or incomplete.
 [Why you should enable them](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html).
 
-**Rust** — add to `.cargo/config.toml`:
+Rust — add to `.cargo/config.toml`:
 ```toml
 [build]
 rustflags = ["-C", "force-frame-pointers=yes"]
 ```
 
-**C / C++** — compile with `-fno-omit-frame-pointer`.
+C / C++ — compile with `-fno-omit-frame-pointer`.
 
 ## What it looks like
 ![](doc/screenshots/screenshot.png)
 
 
-## Contributing 
+## Contributing
 
 ### 1. Prerequisites
 
@@ -46,7 +46,7 @@ First build the snitch-viewer app:
 dx bundle --release --fullstack -p snitch-viewer
 ```
 
-Then run the snitch to collect events.
+Then run snitch to collect events.
 ```shell
 sudo -E cargo run --release -p snitch -- -- sleep 1
 ```
@@ -84,7 +84,7 @@ sudo -E cargo run --release -p snitch -- --sample-freq 99 -- sleep 5
 
 For deep user-space call stacks, build traced binaries with frame pointers
 enabled (for Rust: `RUSTFLAGS="-C force-frame-pointers=yes"`), otherwise
-sampling stacks can look shallow or noisy.
+stack traces may appear shallow or noisy.
 
 Change viewer port used by auto-launch:
 
