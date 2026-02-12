@@ -2,14 +2,15 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
+use super::flamegraph::EventFlamegraphCard;
 use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
     get_event_marker_color,
 };
 use crate::app::view_model::PidEventSummary;
 use crate::server::{
-    EventMarker, HistogramResponse, ProcessEventsResponse, ProcessLifetime, SyscallLatencyStats,
-    TraceSummary,
+    EventFlamegraphResponse, EventMarker, HistogramResponse, ProcessEventsResponse,
+    ProcessLifetime, SyscallLatencyStats, TraceSummary,
 };
 
 #[component]
@@ -28,12 +29,17 @@ pub fn ProcessTimeline(
     pid_summary: PidEventSummary,
     latency_stats: Option<SyscallLatencyStats>,
     total_event_count: usize,
+    selected_flame_event_type: Option<String>,
+    flame_event_type_options: Vec<String>,
+    flamegraph: Option<EventFlamegraphResponse>,
+    flamegraph_loading: bool,
     // Event handlers
     on_select_pid: EventHandler<u32>,
     on_select_pid_option: EventHandler<Option<u32>>,
     on_focus_process: EventHandler<(u32, u64, u64)>,
     on_change_range: EventHandler<(u64, u64, bool)>,
     on_toggle_event_type: EventHandler<String>,
+    on_select_flame_event_type: EventHandler<Option<String>>,
 ) -> Element {
     let mut collapsed_nodes = use_signal(HashSet::<u32>::new);
 
@@ -121,6 +127,10 @@ pub fn ProcessTimeline(
         .map(|pe| &pe.events_by_pid)
         .cloned()
         .unwrap_or_default();
+    let stats = latency_stats.unwrap_or_default();
+    let has_read_stats = stats.read.count > 0;
+    let has_write_stats = stats.write.count > 0;
+    let has_mem_stats = stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0;
 
     rsx! {
         div { class: "bg-white border border-gray-200 rounded-lg p-2.5",
@@ -264,9 +274,9 @@ pub fn ProcessTimeline(
                 }
             }
 
-            // Event type badges row (when PID selected)
-            if selected_pid.is_some() && !pid_summary.breakdown.is_empty() {
-                div { class: "flex flex-wrap gap-1 mb-1.5",
+            // Event type badges row (always rendered to avoid layout flicker)
+            div { class: "flex flex-wrap items-center gap-1 mb-1.5 min-h-[1.5rem]",
+                if selected_pid.is_some() && !pid_summary.breakdown.is_empty() {
                     {pid_summary.breakdown.iter().map(|(event_type, count)| {
                         let enabled = enabled_event_types.contains(event_type);
                         let event_type_clone = event_type.clone();
@@ -283,36 +293,41 @@ pub fn ProcessTimeline(
                             }
                         }
                     })}
+                } else if selected_pid.is_some() {
+                    span { class: "text-xs text-gray-400", "No event badges for selected PID in this range" }
+                } else {
+                    span { class: "text-xs text-gray-400", "Select a PID to enable event badges and flamegraph filters" }
                 }
             }
 
-            // Latency stats row (when PID selected and has data)
-            if let Some(stats) = &latency_stats {
-                if stats.read.count > 0 || stats.write.count > 0 || stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0 {
-                    div { class: "flex flex-wrap gap-4 text-xs text-gray-600 mb-1.5",
-                        if stats.read.count > 0 {
-                            span { class: "whitespace-nowrap",
-                                span { class: "text-gray-400", "read " }
-                                span { class: "text-gray-400", "{stats.read.count}× " }
-                                span { class: "text-gray-400", "avg/p50/p95/max " }
-                                "{format_duration(stats.read.avg_ns)}/{format_duration(stats.read.p50_ns)}/{format_duration(stats.read.p95_ns)}/{format_duration(stats.read.max_ns)}"
-                            }
-                        }
-                        if stats.write.count > 0 {
-                            span { class: "whitespace-nowrap",
-                                span { class: "text-gray-400", "write " }
-                                span { class: "text-gray-400", "{stats.write.count}× " }
-                                span { class: "text-gray-400", "avg/p50/p95/max " }
-                                "{format_duration(stats.write.avg_ns)}/{format_duration(stats.write.p50_ns)}/{format_duration(stats.write.p95_ns)}/{format_duration(stats.write.max_ns)}"
-                            }
-                        }
-                        if stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0 {
-                            span { class: "whitespace-nowrap",
-                                span { class: "text-gray-400", "mem " }
-                                span { class: "text-gray-400", "+/−/net " }
-                                "{format_bytes(stats.mmap_alloc_bytes)}/{format_bytes(stats.munmap_free_bytes)}/{format_net_bytes_signed(stats.mmap_alloc_bytes, stats.munmap_free_bytes)}"
-                            }
-                        }
+            // Latency stats row (always rendered to avoid layout flicker)
+            div { class: "flex flex-wrap items-center gap-4 text-xs text-gray-600 mb-1.5 min-h-[1.25rem]",
+                span { class: "whitespace-nowrap",
+                    span { class: "text-gray-400", "read " }
+                    if has_read_stats {
+                        span { class: "text-gray-400", "{stats.read.count}× " }
+                        span { class: "text-gray-400", "avg/p50/p95/max " }
+                        "{format_duration(stats.read.avg_ns)}/{format_duration(stats.read.p50_ns)}/{format_duration(stats.read.p95_ns)}/{format_duration(stats.read.max_ns)}"
+                    } else {
+                        span { class: "text-gray-400", "—" }
+                    }
+                }
+                span { class: "whitespace-nowrap",
+                    span { class: "text-gray-400", "write " }
+                    if has_write_stats {
+                        span { class: "text-gray-400", "{stats.write.count}× " }
+                        span { class: "text-gray-400", "avg/p50/p95/max " }
+                        "{format_duration(stats.write.avg_ns)}/{format_duration(stats.write.p50_ns)}/{format_duration(stats.write.p95_ns)}/{format_duration(stats.write.max_ns)}"
+                    } else {
+                        span { class: "text-gray-400", "—" }
+                    }
+                }
+                span { class: "whitespace-nowrap",
+                    span { class: "text-gray-400", "mem +/−/net " }
+                    if has_mem_stats {
+                        "{format_bytes(stats.mmap_alloc_bytes)}/{format_bytes(stats.munmap_free_bytes)}/{format_net_bytes_signed(stats.mmap_alloc_bytes, stats.munmap_free_bytes)}"
+                    } else {
+                        span { class: "text-gray-400", "—" }
                     }
                 }
             }
@@ -395,151 +410,176 @@ pub fn ProcessTimeline(
 
                     // Build tree line prefixes
                     let tree_pos_clone = tree_pos.clone();
+                    let row_is_selected = is_selected;
+                    let flame_event_type_options_for_row = flame_event_type_options.clone();
+                    let selected_flame_event_type_for_row = selected_flame_event_type.clone();
+                    let flamegraph_for_row = flamegraph.clone();
+                    let flamegraph_loading_for_row = flamegraph_loading;
 
                     rsx! {
                         div {
                             key: "{proc.pid}",
-                            class: "flex items-center gap-2 h-7 group",
+                            class: "space-y-1",
 
-                            div {
-                                class: "w-56 shrink-0 flex items-center",
-                                style: "font-variant-numeric: tabular-nums;",
-                                title: "{process_name} (PID {proc.pid})",
+                            div { class: "flex items-center gap-2 h-7 group",
+                                div {
+                                    class: "w-56 shrink-0 flex items-center",
+                                    style: "font-variant-numeric: tabular-nums;",
+                                    title: "{process_name} (PID {proc.pid})",
 
-                                // Tree structure lines
-                                div { class: "flex items-center h-full shrink-0",
-                                    // Draw ancestor columns (│ or space)
-                                    {tree_pos_clone.ancestor_is_last.iter().enumerate().map(|(i, is_last)| {
-                                        rsx! {
+                                    // Tree structure lines
+                                    div { class: "flex items-center h-full shrink-0",
+                                        // Draw ancestor columns (│ or space)
+                                        {tree_pos_clone.ancestor_is_last.iter().enumerate().map(|(i, is_last)| {
+                                            rsx! {
+                                                span {
+                                                    key: "{i}",
+                                                    class: "inline-block w-4 text-center text-gray-300 select-none",
+                                                    style: "font-family: monospace;",
+                                                    if *is_last { " " } else { "│" }
+                                                }
+                                            }
+                                        })}
+
+                                        // Draw branch connector for this node (├ or └)
+                                        if depth > 0 {
                                             span {
-                                                key: "{i}",
                                                 class: "inline-block w-4 text-center text-gray-300 select-none",
                                                 style: "font-family: monospace;",
-                                                if *is_last { " " } else { "│" }
+                                                if tree_pos_clone.is_last_child { "└" } else { "├" }
+                                            }
+                                        }
+                                    }
+
+                                    // Expand/collapse button or spacer
+                                    if has_children {
+                                        button {
+                                            class: "inline-flex items-center justify-center w-5 h-5 text-xs font-bold text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded shrink-0",
+                                            title: if is_collapsed { "Expand children" } else { "Collapse children" },
+                                            onclick: move |_| {
+                                                let mut collapsed = collapsed_nodes();
+                                                if collapsed.contains(&pid) {
+                                                    collapsed.remove(&pid);
+                                                } else {
+                                                    collapsed.insert(pid);
+                                                }
+                                                collapsed_nodes.set(collapsed);
+                                            },
+                                            if is_collapsed { "▶" } else { "▼" }
+                                        }
+                                    } else {
+                                        span { class: "inline-block w-5 shrink-0" }
+                                    }
+
+                                    // Process info
+                                    div {
+                                        class: process_label_class,
+                                        onclick: move |_| on_select_pid.call(pid),
+                                        div { class: "flex items-center gap-1",
+                                            if is_selected {
+                                                span { class: "inline-block w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0" }
+                                            }
+                                            span { class: "text-xs text-gray-700 truncate",
+                                                "{process_name}"
+                                            }
+                                            if is_collapsed && collapsed_count > 0 {
+                                                span { class: "text-[10px] text-gray-400 bg-gray-100 px-1 rounded shrink-0",
+                                                    "+{collapsed_count}"
+                                                }
+                                            }
+                                        }
+                                        div { class: "text-[10px] font-mono text-gray-400 whitespace-nowrap",
+                                            "PID {proc.pid}"
+                                        }
+                                    }
+                                }
+
+                                div { class: "flex-1 relative h-5 bg-gray-100 rounded overflow-hidden",
+                                    if in_view {
+                                        div {
+                                            class: "absolute top-0 bottom-0 {bar_color} rounded",
+                                            style: "left: {left_pct}%; width: {width_pct}%;",
+                                        }
+                                    }
+
+                                    {pid_events.iter().map(|event| {
+                                        let event_pct = ((event.ts_ns - view_start_ns) as f64 / view_duration * 100.0)
+                                            .clamp(0.0, 100.0);
+                                        let event_color = get_event_marker_color(&event.event_type);
+
+                                        rsx! {
+                                            div {
+                                                key: "{event.ts_ns}",
+                                                class: "absolute top-0 bottom-0 w-px {event_color}",
+                                                style: "left: {event_pct}%;",
+                                                title: "{event.event_type} @ {format_duration(event.ts_ns - full_start_ns)}",
                                             }
                                         }
                                     })}
 
-                                    // Draw branch connector for this node (├ or └)
-                                    if depth > 0 {
-                                        span {
-                                            class: "inline-block w-4 text-center text-gray-300 select-none",
-                                            style: "font-family: monospace;",
-                                            if tree_pos_clone.is_last_child { "└" } else { "├" }
-                                        }
-                                    }
-                                }
-
-                                // Expand/collapse button or spacer
-                                if has_children {
-                                    button {
-                                        class: "inline-flex items-center justify-center w-5 h-5 text-xs font-bold text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded shrink-0",
-                                        title: if is_collapsed { "Expand children" } else { "Collapse children" },
-                                        onclick: move |_| {
-                                            let mut collapsed = collapsed_nodes();
-                                            if collapsed.contains(&pid) {
-                                                collapsed.remove(&pid);
-                                            } else {
-                                                collapsed.insert(pid);
-                                            }
-                                            collapsed_nodes.set(collapsed);
-                                        },
-                                        if is_collapsed { "▶" } else { "▼" }
-                                    }
-                                } else {
-                                    span { class: "inline-block w-5 shrink-0" }
-                                }
-
-                                // Process info
-                                div {
-                                    class: process_label_class,
-                                    onclick: move |_| on_select_pid.call(pid),
-                                    div { class: "flex items-center gap-1",
-                                        if is_selected {
-                                            span { class: "inline-block w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0" }
-                                        }
-                                        span { class: "text-xs text-gray-700 truncate",
-                                            "{process_name}"
-                                        }
-                                        if is_collapsed && collapsed_count > 0 {
-                                            span { class: "text-[10px] text-gray-400 bg-gray-100 px-1 rounded shrink-0",
-                                                "+{collapsed_count}"
-                                            }
-                                        }
-                                    }
-                                    div { class: "text-[10px] font-mono text-gray-400 whitespace-nowrap",
-                                        "PID {proc.pid}"
-                                    }
-                                }
-                            }
-
-                            div { class: "flex-1 relative h-5 bg-gray-100 rounded overflow-hidden",
-                                if in_view {
-                                    div {
-                                        class: "absolute top-0 bottom-0 {bar_color} rounded",
-                                        style: "left: {left_pct}%; width: {width_pct}%;",
-                                    }
-                                }
-
-                                {pid_events.iter().map(|event| {
-                                    let event_pct = ((event.ts_ns - view_start_ns) as f64 / view_duration * 100.0)
-                                        .clamp(0.0, 100.0);
-                                    let event_color = get_event_marker_color(&event.event_type);
-
-                                    rsx! {
+                                    if proc.was_forked && proc.start_ns >= view_start_ns && proc.start_ns <= view_end_ns {
                                         div {
-                                            key: "{event.ts_ns}",
-                                            class: "absolute top-0 bottom-0 w-px {event_color}",
-                                            style: "left: {event_pct}%;",
-                                            title: "{event.event_type} @ {format_duration(event.ts_ns - full_start_ns)}",
+                                            class: "absolute top-0 bottom-0 w-1 bg-green-600",
+                                            style: "left: {left_pct}%;",
+                                            title: "Fork from PID {proc.parent_pid.unwrap_or(0)}",
                                         }
                                     }
-                                })}
 
-                                if proc.was_forked && proc.start_ns >= view_start_ns && proc.start_ns <= view_end_ns {
-                                    div {
-                                        class: "absolute top-0 bottom-0 w-1 bg-green-600",
-                                        style: "left: {left_pct}%;",
-                                        title: "Fork from PID {proc.parent_pid.unwrap_or(0)}",
-                                    }
-                                }
-
-                                if proc.did_exit {
-                                    if let Some(end) = proc.end_ns {
-                                        if end >= view_start_ns && end <= view_end_ns {
-                                            {
-                                                let exit_pct = ((end - view_start_ns) as f64 / view_duration * 100.0).max(0.0);
-                                                let exit_color = if proc.exit_code == Some(0) { "bg-green-600" } else { "bg-red-600" };
-                                                rsx! {
-                                                    div {
-                                                        class: "absolute top-0 bottom-0 w-1 {exit_color}",
-                                                        style: "left: {exit_pct}%;",
-                                                        title: "Exit code: {proc.exit_code.unwrap_or(0)}",
+                                    if proc.did_exit {
+                                        if let Some(end) = proc.end_ns {
+                                            if end >= view_start_ns && end <= view_end_ns {
+                                                {
+                                                    let exit_pct = ((end - view_start_ns) as f64 / view_duration * 100.0).max(0.0);
+                                                    let exit_color = if proc.exit_code == Some(0) { "bg-green-600" } else { "bg-red-600" };
+                                                    rsx! {
+                                                        div {
+                                                            class: "absolute top-0 bottom-0 w-1 {exit_color}",
+                                                            style: "left: {exit_pct}%;",
+                                                            title: "Exit code: {proc.exit_code.unwrap_or(0)}",
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
                                     }
+
+                                    div {
+                                        class: "absolute inset-0 cursor-pointer",
+                                        onclick: move |_| on_select_pid.call(pid),
+                                        ondoubleclick: move |_| on_focus_process.call((pid, process_start_ns, focus_end_ns)),
+                                    }
                                 }
 
-                                div {
-                                    class: "absolute inset-0 cursor-pointer",
-                                    onclick: move |_| on_select_pid.call(pid),
-                                    ondoubleclick: move |_| on_focus_process.call((pid, process_start_ns, focus_end_ns)),
+                                div { class: "w-20 text-xs text-gray-400 shrink-0 truncate",
+                                    if !in_view {
+                                        "—"
+                                    } else if proc.did_exit {
+                                        if proc.exit_code == Some(0) {
+                                            "✓ {format_duration_short(visible_duration_ns)}"
+                                        } else {
+                                            "✗ {format_duration_short(visible_duration_ns)}"
+                                        }
+                                    } else {
+                                        "{format_duration_short(visible_duration_ns)}"
+                                    }
                                 }
                             }
 
-                            div { class: "w-20 text-xs text-gray-400 shrink-0 truncate",
-                                if !in_view {
-                                    "—"
-                                } else if proc.did_exit {
-                                    if proc.exit_code == Some(0) {
-                                        "✓ {format_duration_short(visible_duration_ns)}"
-                                    } else {
-                                        "✗ {format_duration_short(visible_duration_ns)}"
+                            if row_is_selected {
+                                div { class: "ml-56 pl-2",
+                                    EventFlamegraphCard {
+                                        selected_event_type: selected_flame_event_type_for_row,
+                                        event_type_options: flame_event_type_options_for_row,
+                                        selected_pid: Some(proc.pid),
+                                        full_start_ns,
+                                        view_start_ns,
+                                        view_end_ns,
+                                        on_select_event_type: move |event_type| {
+                                            on_select_flame_event_type.call(event_type);
+                                        },
+                                        flamegraph: flamegraph_for_row,
+                                        loading: flamegraph_loading_for_row,
                                     }
-                                } else {
-                                    "{format_duration_short(visible_duration_ns)}"
                                 }
                             }
                         }

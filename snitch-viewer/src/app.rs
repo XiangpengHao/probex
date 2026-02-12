@@ -9,7 +9,7 @@ mod view_model;
 
 use std::collections::HashSet;
 
-use components::{EventFlamegraphCard, EventsTable, Pager, ProcessTimeline, ViewerHeader};
+use components::{EventsTable, Pager, ProcessTimeline, ViewerHeader};
 use dioxus::prelude::*;
 use view_model::build_pid_event_summary;
 
@@ -46,6 +46,7 @@ fn TraceViewer() -> Element {
     let mut selected_pid_event_counts = use_signal(|| Option::<EventTypeCounts>::None);
     let mut syscall_latency_stats = use_signal(|| None);
     let mut event_flamegraph = use_signal(|| Option::<EventFlamegraphResponse>::None);
+    let mut flamegraph_loading = use_signal(|| false);
     let mut process_lifetimes = use_signal(|| Option::<ProcessLifetimesResponse>::None);
     let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
 
@@ -58,7 +59,7 @@ fn TraceViewer() -> Element {
 
     let mut enabled_event_types = use_signal(HashSet::<String>::new);
     let mut selected_pid = use_signal(|| Option::<u32>::None);
-    let mut selected_flame_event_type = use_signal(|| Option::<String>::None);
+    let mut selected_flame_event_type = use_signal(|| Some("cpu_sample".to_string()));
     let mut current_page = use_signal(|| 0usize);
 
     use_resource(move || async move {
@@ -116,12 +117,15 @@ fn TraceViewer() -> Element {
             return;
         }
 
-        if let Some(event_type) = selected_event_type {
-            match get_event_flamegraph(start, end, pid, event_type, MAX_FLAME_STACKS).await {
+        if let (Some(pid), Some(event_type)) = (pid, selected_event_type) {
+            flamegraph_loading.set(true);
+            match get_event_flamegraph(start, end, Some(pid), event_type, MAX_FLAME_STACKS).await {
                 Ok(data) => event_flamegraph.set(Some(data)),
                 Err(e) => log::error!("Event flamegraph error: {}", e),
             }
+            flamegraph_loading.set(false);
         } else {
+            flamegraph_loading.set(false);
             event_flamegraph.set(None);
         }
     });
@@ -217,10 +221,35 @@ fn TraceViewer() -> Element {
 
     let selected_pid_counts = selected_pid_event_counts();
     let pid_summary = build_pid_event_summary(selected_pid_counts.as_ref());
+    let selected_pid_value = selected_pid();
+    let selected_flame_event_type_value = selected_flame_event_type();
 
     let full_start = summary_data.as_ref().map(|s| s.min_ts_ns).unwrap_or(0);
     let full_end = summary_data.as_ref().map(|s| s.max_ts_ns).unwrap_or(0);
     let full_duration = full_end.saturating_sub(full_start);
+
+    let mut flame_event_type_options: Vec<String> =
+        if selected_pid_value.is_some() && !pid_summary.breakdown.is_empty() {
+            pid_summary
+                .breakdown
+                .iter()
+                .map(|(event_type, _)| event_type.clone())
+                .collect()
+        } else {
+            summary_data
+                .as_ref()
+                .map(|summary| summary.event_types.clone())
+                .unwrap_or_default()
+        };
+    if let Some(selected_event_type) = &selected_flame_event_type_value
+        && !flame_event_type_options
+            .iter()
+            .any(|event_type| event_type == selected_event_type)
+    {
+        flame_event_type_options.push(selected_event_type.clone());
+    }
+    flame_event_type_options.sort();
+    flame_event_type_options.dedup();
 
     rsx! {
         ViewerHeader { summary: summary_data.clone() }
@@ -235,7 +264,7 @@ fn TraceViewer() -> Element {
                     processes: lifetimes.processes,
                     process_events: process_events(),
                     enabled_event_types: enabled_event_types(),
-                    selected_pid: selected_pid(),
+                    selected_pid: selected_pid_value,
                     full_start_ns: summary.min_ts_ns,
                     full_end_ns: summary.max_ts_ns,
                     view_start_ns: view_start_ns(),
@@ -246,9 +275,18 @@ fn TraceViewer() -> Element {
                     pid_summary: pid_summary.clone(),
                     latency_stats: syscall_latency_stats(),
                     total_event_count: total_count,
+                    selected_flame_event_type: selected_flame_event_type_value.clone(),
+                    flame_event_type_options,
+                    flamegraph: event_flamegraph(),
+                    flamegraph_loading: flamegraph_loading(),
                     // Event handlers
                     on_select_pid: move |pid: u32| {
-                        selected_pid.set(Some(pid));
+                        let next_pid = if selected_pid() == Some(pid) {
+                            None
+                        } else {
+                            Some(pid)
+                        };
+                        selected_pid.set(next_pid);
                         do_search(true);
                     },
                     on_select_pid_option: move |pid: Option<u32>| {
@@ -290,45 +328,9 @@ fn TraceViewer() -> Element {
                         enabled_event_types.set(types);
                         do_search(true);
                     },
-                }
-            }
-
-            {
-                let mut event_type_options: Vec<String> = if selected_pid().is_some() && !pid_summary.breakdown.is_empty() {
-                    pid_summary
-                        .breakdown
-                        .iter()
-                        .map(|(event_type, _)| event_type.clone())
-                        .collect()
-                } else {
-                    summary_data
-                        .as_ref()
-                        .map(|summary| summary.event_types.clone())
-                        .unwrap_or_default()
-                };
-                if let Some(selected_event_type) = selected_flame_event_type()
-                    && !event_type_options
-                        .iter()
-                        .any(|event_type| event_type == &selected_event_type)
-                {
-                    event_type_options.push(selected_event_type);
-                }
-                event_type_options.sort();
-                event_type_options.dedup();
-
-                rsx! {
-            EventFlamegraphCard {
-                selected_event_type: selected_flame_event_type(),
-                event_type_options,
-                selected_pid: selected_pid(),
-                full_start_ns: full_start,
-                view_start_ns: view_start_ns(),
-                view_end_ns: view_end_ns(),
-                on_select_event_type: move |event_type: Option<String>| {
-                    selected_flame_event_type.set(event_type);
-                },
-                flamegraph: event_flamegraph(),
-            }
+                    on_select_flame_event_type: move |event_type: Option<String>| {
+                        selected_flame_event_type.set(event_type);
+                    },
                 }
             }
 
