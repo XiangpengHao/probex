@@ -156,8 +156,8 @@ pub struct EventFlamegraphResponse {
 mod backend {
     use super::*;
     use datafusion::arrow::array::{
-        Array, Float64Array, Int32Array, Int64Array, StringViewArray, UInt8Array, UInt32Array,
-        UInt64Array,
+        Array, Float32Array, Float64Array, Int32Array, Int64Array, StringViewArray, UInt8Array,
+        UInt32Array, UInt64Array,
     };
     use datafusion::prelude::*;
     use inferno::flamegraph;
@@ -555,7 +555,7 @@ mod backend {
         // Query to get counts grouped by bucket and event type
         let sql = format!(
             "SELECT
-                FLOOR((ts_ns - {}) / {}) as bucket_idx,
+                CAST(FLOOR((ts_ns - {}) / {}) AS BIGINT) as bucket_idx,
                 event_type,
                 COUNT(*) as cnt
             FROM events
@@ -596,13 +596,31 @@ mod backend {
                             .or_else(|| {
                                 column
                                     .as_any()
+                                    .downcast_ref::<Int32Array>()
+                                    .map(|arr| arr.value(row) as i64)
+                            })
+                            .or_else(|| {
+                                column
+                                    .as_any()
                                     .downcast_ref::<UInt64Array>()
                                     .map(|arr| arr.value(row) as i64)
                             })
                             .or_else(|| {
                                 column
                                     .as_any()
+                                    .downcast_ref::<UInt32Array>()
+                                    .map(|arr| arr.value(row) as i64)
+                            })
+                            .or_else(|| {
+                                column
+                                    .as_any()
                                     .downcast_ref::<Float64Array>()
+                                    .map(|arr| arr.value(row).floor() as i64)
+                            })
+                            .or_else(|| {
+                                column
+                                    .as_any()
+                                    .downcast_ref::<Float32Array>()
                                     .map(|arr| arr.value(row).floor() as i64)
                             })
                     })

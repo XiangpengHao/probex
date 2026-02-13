@@ -667,24 +667,9 @@ fn TimelineOverview(
     let handle_half_px = 10.0;
     // Visual handle width in pixels
     let handle_width_px = 10.0;
-
-    let max_count = histogram
+    let histogram_area_path = histogram
         .as_ref()
-        .map(|h| {
-            h.buckets
-                .iter()
-                .map(|b| {
-                    b.counts_by_type
-                        .iter()
-                        .filter(|(event_type, _)| enabled_types.contains(*event_type))
-                        .map(|(_, count)| *count)
-                        .sum::<usize>()
-                })
-                .max()
-                .unwrap_or(1)
-        })
-        .unwrap_or(1)
-        .max(1);
+        .and_then(|h| build_overview_histogram_area_path(h, &enabled_types));
     let is_dragging = drag().is_some();
     let drag_kind = drag().map(|d| d.kind);
     let drag_overlay_cursor = if drag_kind == Some(DragKind::Pan) {
@@ -855,30 +840,17 @@ fn TimelineOverview(
                 }
             },
 
-            // Histogram background
-            if let Some(h) = histogram {
-                div { class: "absolute inset-0 flex items-end pointer-events-none",
-                    {h.buckets.iter().map(|bucket| {
-                        let count: usize = bucket
-                            .counts_by_type
-                            .iter()
-                            .filter(|(event_type, _)| enabled_types.contains(*event_type))
-                            .map(|(_, count)| *count)
-                            .sum();
-                        let height_pct = if count == 0 {
-                            0.0
-                        } else {
-                            (count as f64 / max_count as f64 * 100.0).max(1.0)
-                        };
-
-                        rsx! {
-                            div {
-                                key: "{bucket.bucket_start_ns}",
-                                class: "flex-1 bg-gray-300",
-                                style: "height: {height_pct}%;",
-                            }
-                        }
-                    })}
+            // Histogram background as one path instead of many flex bars.
+            if let Some(area_path) = histogram_area_path {
+                svg {
+                    class: "absolute inset-0 w-full h-full pointer-events-none",
+                    view_box: "0 0 100 100",
+                    preserve_aspect_ratio: "none",
+                    path {
+                        d: "{area_path}",
+                        fill: "rgba(107, 114, 128, 0.55)",
+                        stroke: "none",
+                    }
                 }
             }
 
@@ -1047,6 +1019,50 @@ fn ProcessActivityCanvas(
             }
         }
     }
+}
+
+fn build_overview_histogram_area_path(
+    histogram: &HistogramResponse,
+    enabled_types: &HashSet<String>,
+) -> Option<String> {
+    if histogram.buckets.is_empty() {
+        return None;
+    }
+
+    let counts = histogram
+        .buckets
+        .iter()
+        .map(|bucket| {
+            bucket
+                .counts_by_type
+                .iter()
+                .filter(|(event_type, _)| enabled_types.contains(*event_type))
+                .map(|(_, count)| *count as f64)
+                .sum::<f64>()
+        })
+        .collect::<Vec<_>>();
+
+    let max_count = counts.iter().copied().fold(0.0f64, f64::max);
+    if max_count <= 0.0 {
+        return None;
+    }
+
+    let bucket_count = counts.len() as f64;
+    let mut area_path = String::from("M0 100");
+
+    for (idx, count) in counts.iter().enumerate() {
+        let x_left = idx as f64 / bucket_count * 100.0;
+        let x_right = (idx as f64 + 1.0) / bucket_count * 100.0;
+        let mut height_pct = (count / max_count * 100.0).clamp(0.0, 100.0);
+        if *count > 0.0 {
+            height_pct = height_pct.max(1.0);
+        }
+        let y = 100.0 - height_pct;
+        area_path.push_str(&format!("L{:.3} {:.3}L{:.3} {:.3}", x_left, y, x_right, y));
+    }
+
+    area_path.push_str("L100 100Z");
+    Some(area_path)
 }
 
 fn build_usage_paths(usage_points: &[f64]) -> (Option<String>, Option<String>) {
