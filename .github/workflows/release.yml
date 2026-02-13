@@ -12,7 +12,7 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+      CARGO_TARGET_DIR: /tmp/cargo-target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -48,10 +48,17 @@ jobs:
       - name: Build frontend bundle
         run: |
           dx bundle --release --platform web -p snitch-viewer
+          rm -rf snitch/assets/viewer
+          mkdir -p snitch/assets/viewer
+          cp -a target/dx/snitch-viewer/release/web/public/. snitch/assets/viewer/
 
       - name: Build snitch release binary (embedded frontend)
         run: |
           cargo build --release -p snitch
+
+      - name: Verify snitch package includes embedded frontend assets
+        run: |
+          cargo package -p snitch --allow-dirty --no-verify --list | grep '^assets/viewer/index.html$'
 
       - name: Package artifacts
         id: package

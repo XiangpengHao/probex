@@ -11,6 +11,8 @@ default-members = ["snitch", "snitch-common", "snitch-viewer"]
 [workspace.package]
 license = "MIT OR Apache-2.0"
 edition = "2024"
+repository = "https://github.com/XiangpengHao/snitch"
+homepage = "https://github.com/XiangpengHao/snitch"
 
 [workspace.dependencies]
 aya = { version = "0.13.1", default-features = false }

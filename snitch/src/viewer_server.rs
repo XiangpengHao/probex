@@ -16,7 +16,7 @@ use crate::viewer_backend;
 const INDEX_HTML: &str = "index.html";
 
 #[derive(Embed)]
-#[folder = "../target/dx/snitch-viewer/release/web/public/"]
+#[folder = "assets/viewer/"]
 struct ViewerAssets;
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +99,8 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
+
+    spawn_browser_open(primary_url.clone());
 
     axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(async {
@@ -269,4 +271,21 @@ fn detect_hostname() -> Option<String> {
     }
 
     None
+}
+
+fn spawn_browser_open(url: String) {
+    tokio::spawn(async move {
+        // Allow the listener to start accepting before opening the browser.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Err(error) = open_url_in_default_browser(&url) {
+            log::debug!("Unable to open browser at {url}: {error}");
+        }
+    });
+}
+
+fn open_url_in_default_browser(url: &str) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
 }
