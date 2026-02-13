@@ -47,21 +47,21 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy -p snitch -p snitch-common -p snitch-viewer --all-targets
+        run: cargo clippy -p probex -p probex-common -p probex-viewer --all-targets
 
       - name: Run cargo check
         run: |
-          cargo check -p snitch -p snitch-common
-          cargo check -p snitch-viewer --target wasm32-unknown-unknown
+          cargo check -p probex -p probex-common
+          cargo check -p probex-viewer --target wasm32-unknown-unknown
 
       - name: Verify frontend -> backend build pipeline
         run: |
-          dx bundle --release --platform web -p snitch-viewer
-          rm -rf snitch/assets/viewer
-          mkdir -p snitch/assets/viewer
-          cp -a target/dx/snitch-viewer/release/web/public/. snitch/assets/viewer/
-          cargo build --release -p snitch
+          dx bundle --release --platform web -p probex-viewer
+          rm -rf probex/assets/viewer
+          mkdir -p probex/assets/viewer
+          cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
+          cargo build --release -p probex
 
-      - name: Verify snitch package includes embedded frontend assets
+      - name: Verify probex package includes embedded frontend assets
         run: |
-          cargo package -p snitch --allow-dirty --no-verify --list | grep '^assets/viewer/index.html$'
+          cargo package -p probex --allow-dirty --no-verify --list | grep '^assets/viewer/index.html$'

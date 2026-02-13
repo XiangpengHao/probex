@@ -1,4 +1,4 @@
-//! Viewer backend functionality used by `snitch`.
+//! Viewer backend functionality used by `probex`.
 //!
 //! Uses DataFusion to query parquet trace files.
 
@@ -118,7 +118,7 @@ mod backend {
     static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
     static TRACE_FILE_METADATA: OnceLock<TraceFileMetadata> = OnceLock::new();
 
-    const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "snitch.sample_freq_hz";
+    const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
 
     #[derive(Clone, Copy, Debug, Default)]
     struct TraceFileMetadata {
@@ -166,7 +166,7 @@ mod backend {
             return Err(IoError::new(
                 ErrorKind::InvalidData,
                 format!(
-                    "Trace {} is missing required proc_maps_snapshot column. Regenerate with current snitch.",
+                    "Trace {} is missing required proc_maps_snapshot column. Regenerate with current probex.",
                     parquet_file.display()
                 ),
             )
@@ -1248,7 +1248,7 @@ mod backend {
         }
 
         let mut opts = flamegraph::Options::default();
-        opts.title = format!("snitch · {event_type}");
+        opts.title = format!("probex · {event_type}");
         opts.count_name = "samples".to_string();
         opts.colors = flamegraph::Palette::Basic(flamegraph::color::BasicPalette::Aqua);
         opts.bgcolors = Some(flamegraph::color::BackgroundColor::Blue);

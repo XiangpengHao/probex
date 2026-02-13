@@ -79,8 +79,8 @@
           LLVM_PREFIX = llvm-combined;
         };
 
-        snitch-runner = pkgs.writeShellApplication {
-          name = "snitch";
+        probex-runner = pkgs.writeShellApplication {
+          name = "probex";
           runtimeInputs = with pkgs; [
             binaryen
             bpftools
@@ -101,12 +101,12 @@
             set -euo pipefail
 
             if [ "$#" -eq 0 ]; then
-              echo "Usage: nix run .#snitch -- [--view trace.parquet] | <program> [args...]"
+              echo "Usage: nix run .#probex -- [--view trace.parquet] | <program> [args...]"
               exit 2
             fi
 
-            if [ ! -f Cargo.toml ] || [ ! -d snitch ] || [ ! -d snitch-viewer ]; then
-              echo "Run this command from the snitch workspace root."
+            if [ ! -f Cargo.toml ] || [ ! -d probex ] || [ ! -d probex-viewer ]; then
+              echo "Run this command from the probex workspace root."
               exit 2
             fi
 
@@ -114,8 +114,8 @@
             cp -f "${daisyui-bundle}" vendor/daisyui.mjs
             cp -f "${daisyui-theme-bundle}" vendor/daisyui-theme.mjs
 
-            echo "Building snitch (frontend auto-bundled by build.rs)..."
-            cargo build --release -p snitch
+            echo "Building probex (frontend auto-bundled by build.rs)..."
+            cargo build --release -p probex
 
             if [ "''${EUID:-$(id -u)}" -ne 0 ]; then
               sudo_cmd=""
@@ -133,23 +133,23 @@
                 exit 1
               fi
 
-              echo "Re-running snitch with $sudo_cmd for eBPF privileges..."
-              exec "$sudo_cmd" -E target/release/snitch "$@"
+              echo "Re-running probex with $sudo_cmd for eBPF privileges..."
+              exec "$sudo_cmd" -E target/release/probex "$@"
             fi
 
-            exec target/release/snitch "$@"
+            exec target/release/probex "$@"
           '';
         };
       in
       rec {
         packages = {
-          snitch = snitch-runner;
-          default = snitch-runner;
+          probex = probex-runner;
+          default = probex-runner;
         };
 
         apps = {
-          snitch = flake-utils.lib.mkApp { drv = snitch-runner; };
-          default = apps.snitch;
+          probex = flake-utils.lib.mkApp { drv = probex-runner; };
+          default = apps.probex;
         };
 
         devShells.default =

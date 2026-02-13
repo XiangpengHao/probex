@@ -1,6 +1,6 @@
-//! Snitch Trace Viewer
+//! Probex Trace Viewer
 //!
-//! A web-based visualization tool for snitch trace files.
+//! A web-based visualization tool for probex trace files.
 //! This crate is frontend-only (WASM).
 
 mod api;

@@ -1419,7 +1419,7 @@ fn build_cpu_usage_points(
     view_duration_ns: u64,
 ) -> Vec<f64> {
     // Older traces may not have sampling frequency in parquet metadata.
-    // Fall back to snitch's historical default so usage overlay still renders.
+    // Fall back to probex's historical default so usage overlay still renders.
     let sample_frequency_hz = sample_frequency_hz.unwrap_or(999);
     if bucket_count == 0 || bucket_counts.is_empty() {
         return Vec::new();

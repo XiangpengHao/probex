@@ -206,7 +206,7 @@ fn index_html_response() -> Response {
         Some(response) => response,
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "viewer assets are not embedded. Build frontend first with `dx bundle --release --platform web -p snitch-viewer`, then rebuild snitch.",
+            "viewer assets are not embedded. Build frontend first with `dx bundle --release --platform web -p probex-viewer`, then rebuild probex.",
         )
             .into_response(),
     }

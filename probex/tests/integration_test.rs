@@ -1,20 +1,20 @@
-//! Integration tests for snitch
+//! Integration tests for probex
 //!
 //! Note: These tests require root privileges and eBPF support.
-//! Run with: sudo -E cargo test --package snitch --test integration_test
+//! Run with: sudo -E cargo test --package probex --test integration_test
 
 use std::{
     process::{Command, Stdio},
     time::Duration,
 };
 
-/// Test that the snitch binary exists and shows help
+/// Test that the probex binary exists and shows help
 #[test]
 fn test_help_output() {
-    let output = Command::new(env!("CARGO_BIN_EXE_snitch"))
+    let output = Command::new(env!("CARGO_BIN_EXE_probex"))
         .arg("--help")
         .output()
-        .expect("failed to execute snitch");
+        .expect("failed to execute probex");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("eBPF process tracing tool"));
@@ -22,12 +22,12 @@ fn test_help_output() {
     assert!(stdout.contains("COMMAND"));
 }
 
-/// Test that snitch requires a command argument
+/// Test that probex requires a command argument
 #[test]
 fn test_requires_command() {
-    let output = Command::new(env!("CARGO_BIN_EXE_snitch"))
+    let output = Command::new(env!("CARGO_BIN_EXE_probex"))
         .output()
-        .expect("failed to execute snitch");
+        .expect("failed to execute probex");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -41,16 +41,16 @@ fn test_requires_command() {
 /// Test version flag
 #[test]
 fn test_version_output() {
-    let output = Command::new(env!("CARGO_BIN_EXE_snitch"))
+    let output = Command::new(env!("CARGO_BIN_EXE_probex"))
         .arg("--version")
         .output()
-        .expect("failed to execute snitch");
+        .expect("failed to execute probex");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("snitch"));
+    assert!(stdout.contains("probex"));
 }
 
-/// Integration test that runs snitch with a simple command
+/// Integration test that runs probex with a simple command
 /// Requires root privileges to run
 #[test]
 #[ignore = "requires root privileges and eBPF support"]
@@ -60,17 +60,17 @@ fn test_trace_sleep() {
     use arrow::array::Array;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let temp_file = "/tmp/snitch_test_sleep.parquet";
+    let temp_file = "/tmp/probex_test_sleep.parquet";
 
     // Clean up any existing file
     let _ = std::fs::remove_file(temp_file);
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_snitch"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_probex"))
         .args(["-o", temp_file, "--", "sleep", "0.1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn snitch");
+        .expect("failed to spawn probex");
 
     // Wait for the process to complete with timeout
     let timeout = Duration::from_secs(5);
@@ -79,17 +79,17 @@ fn test_trace_sleep() {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                assert!(status.success(), "snitch exited with error");
+                assert!(status.success(), "probex exited with error");
                 break;
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
-                    child.kill().expect("failed to kill snitch");
-                    panic!("snitch timed out");
+                    child.kill().expect("failed to kill probex");
+                    panic!("probex timed out");
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) => panic!("error waiting for snitch: {}", e),
+            Err(e) => panic!("error waiting for probex: {}", e),
         }
     }
 
@@ -139,17 +139,17 @@ fn test_output_to_file() {
 
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-    let temp_file = "/tmp/snitch_test_output.parquet";
+    let temp_file = "/tmp/probex_test_output.parquet";
 
     // Clean up any existing file
     let _ = fs::remove_file(temp_file);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_snitch"))
+    let status = Command::new(env!("CARGO_BIN_EXE_probex"))
         .args(["-o", temp_file, "--", "true"])
         .status()
-        .expect("failed to run snitch");
+        .expect("failed to run probex");
 
-    assert!(status.success(), "snitch exited with error");
+    assert!(status.success(), "probex exited with error");
 
     // Verify file was created and contains valid Parquet data
     let file = File::open(temp_file).expect("failed to open parquet file");
@@ -200,12 +200,12 @@ fn test_default_output_file() {
     // Clean up any existing file
     let _ = fs::remove_file(default_file);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_snitch"))
+    let status = Command::new(env!("CARGO_BIN_EXE_probex"))
         .args(["--", "true"])
         .status()
-        .expect("failed to run snitch");
+        .expect("failed to run probex");
 
-    assert!(status.success(), "snitch exited with error");
+    assert!(status.success(), "probex exited with error");
 
     // Verify default file was created
     assert!(

@@ -1,15 +1,15 @@
 [package]
-name = "snitch-ebpf"
+name = "probex-ebpf"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/snitch-ebpf"
-description = "eBPF programs used by the snitch profiler"
+documentation = "https://docs.rs/probex-ebpf"
+description = "eBPF programs used by the probex profiler"
 
 [dependencies]
-snitch-common = { path = "../snitch-common", version = "0.1.0" }
+probex-common = { path = "../probex-common", version = "0.1.0" }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
@@ -18,5 +18,5 @@ aya-log-ebpf = { workspace = true }
 which = { workspace = true }
 
 [[bin]]
-name = "snitch"
+name = "probex"
 path = "src/main.rs"

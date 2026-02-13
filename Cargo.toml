@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "snitch",
-    "snitch-common",
-    "snitch-ebpf",
-    "snitch-viewer",
+    "probex",
+    "probex-common",
+    "probex-ebpf",
+    "probex-viewer",
 ]
-default-members = ["snitch", "snitch-common", "snitch-viewer"]
+default-members = ["probex", "probex-common", "probex-viewer"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
 edition = "2024"
-repository = "https://github.com/XiangpengHao/snitch"
-homepage = "https://github.com/XiangpengHao/snitch"
+repository = "https://github.com/XiangpengHao/probex"
+homepage = "https://github.com/XiangpengHao/probex"
 
 [workspace.dependencies]
 aya = { version = "0.13.1", default-features = false }
@@ -39,6 +39,6 @@ which = { version = "6.0.0", default-features = false }
 dioxus = { version = "0.7", default-features = false }
 datafusion = { version = "52", default-features = false, features = ["parquet", "sql"] }
 
-[profile.release.package.snitch-ebpf]
+[profile.release.package.probex-ebpf]
 debug = 2
 codegen-units = 1

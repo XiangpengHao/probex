@@ -1,10 +1,10 @@
-//! # Snitch - eBPF Process Tracing Tool
+//! # Probex - eBPF Process Tracing Tool
 //!
 //! ## Flow Overview
 //!
 //! ```text
 //! 1. STARTUP
-//!    snitch -- sleep 1
+//!    probex -- sleep 1
 //!         │
 //!         ▼
 //!    ┌─────────────────────────────────────┐
@@ -47,7 +47,7 @@
 //!         ▼
 //! 4. EVENT LOOP
 //!    ┌──────────────────────────────────────────────────────────┐
-//!    │  KERNEL (eBPF)              │   USERSPACE (snitch)       │
+//!    │  KERNEL (eBPF)              │   USERSPACE (probex)       │
 //!    │                             │                            │
 //!    │  Tracepoint fires ──────────┼──► Ring buffer poll        │
 //!    │       │                     │         │                  │
@@ -141,7 +141,7 @@ use parquet::{
     basic::Compression,
     file::{metadata::KeyValue, properties::WriterProperties},
 };
-use snitch_common::{
+use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
     CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType,
@@ -155,10 +155,10 @@ mod viewer_server;
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
-const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "snitch.sample_freq_hz";
+const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
 
 #[derive(Parser, Debug)]
-#[command(name = "snitch")]
+#[command(name = "probex")]
 #[command(about = "eBPF process tracing tool")]
 #[command(version)]
 struct Args {
@@ -1369,7 +1369,7 @@ async fn main() -> Result<()> {
     // Load eBPF program
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
-        "/snitch"
+        "/probex"
     )))?;
 
     // Initialize eBPF logger (optional)

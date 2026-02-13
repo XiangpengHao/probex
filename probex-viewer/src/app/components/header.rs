@@ -13,7 +13,7 @@ pub fn ViewerHeader(summary: Option<TraceSummary>) -> Element {
     rsx! {
         header { class: "bg-white border-b border-gray-200 px-3 sm:px-4 lg:px-6 py-2",
             div { class: "w-full flex items-center justify-between",
-                h1 { class: "text-lg font-semibold text-gray-900", "Snitch Trace Viewer" }
+                h1 { class: "text-lg font-semibold text-gray-900", "Probex Trace Viewer" }
                 if let Some(s) = summary {
                     div { class: "flex gap-4 text-xs",
                         StatBadge { label: "Events", value: format!("{}", s.total_events) }

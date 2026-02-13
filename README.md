@@ -1,12 +1,12 @@
-# snitch
+# probex
 
-`snitch` is a low-friction Linux profiler.
+`probex` is a low-friction Linux profiler.
 It runs a command, collects everything you need, and visualizes it.
 
 ## Usage
 
 ```
-nix run github:XiangpengHao/snitch -- sleep 1
+nix run github:XiangpengHao/probex -- sleep 1
 ```
 
 Other package managers coming soon, contributions welcome!
@@ -17,7 +17,7 @@ Other package managers coming soon, contributions welcome!
 
 #### Frame pointers
 
-`snitch` works best with frame pointers enabled.
+`probex` works best with frame pointers enabled.
 Without them, stack traces may be shallow or incomplete.
 [Why you should enable them](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html).
 
@@ -41,45 +41,45 @@ You need Linux with eBPF tracepoint support and sufficient privileges (typically
 
 ### 2. Trace a command
 
-First build the snitch-viewer app:
+First build the probex-viewer app:
 ```shell
-dx bundle --release --fullstack -p snitch-viewer
+dx bundle --release --fullstack -p probex-viewer
 ```
 
-Then run snitch to collect events.
+Then run probex to collect events.
 ```shell
-sudo -E cargo run --release -p snitch -- -- sleep 1
+sudo -E cargo run --release -p probex -- -- sleep 1
 ```
 
 Nix one-command flow (builds missing artifacts, traces, then opens viewer):
 ```shell
-nix run .#snitch -- sleep 1
+nix run .#probex -- sleep 1
 ```
 
 Default behavior:
 
 1. Writes `trace.parquet`
-2. If events were captured, launches `snitch-viewer` on port `8080`
-3. If `snitch-viewer` is missing (or not bundled correctly), tracing still succeeds and `snitch` logs a warning instead of launching the viewer
+2. If events were captured, launches `probex-viewer` on port `8080`
+3. If `probex-viewer` is missing (or not bundled correctly), tracing still succeeds and `probex` logs a warning instead of launching the viewer
 
 ### 3. Common CLI examples
 
 Custom output path:
 
 ```shell
-sudo -E cargo run --release -p snitch -- -o /tmp/my-trace.parquet -- sleep 2
+sudo -E cargo run --release -p probex -- -o /tmp/my-trace.parquet -- sleep 2
 ```
 
 Do not auto-launch viewer:
 
 ```shell
-sudo -E cargo run --release -p snitch -- --no-viewer -- sleep 2
+sudo -E cargo run --release -p probex -- --no-viewer -- sleep 2
 ```
 
 Enable perf-style CPU sampling at 99 Hz:
 
 ```shell
-sudo -E cargo run --release -p snitch -- --sample-freq 99 -- sleep 5
+sudo -E cargo run --release -p probex -- --sample-freq 99 -- sleep 5
 ```
 
 For deep user-space call stacks, build traced binaries with frame pointers
@@ -89,7 +89,7 @@ stack traces may appear shallow or noisy.
 Change viewer port used by auto-launch:
 
 ```shell
-sudo -E cargo run --release -p snitch -- --port 9000 -- sleep 2
+sudo -E cargo run --release -p probex -- --port 9000 -- sleep 2
 ```
 
 ## Viewer Guide
@@ -97,35 +97,35 @@ sudo -E cargo run --release -p snitch -- --port 9000 -- sleep 2
 For local fullstack development in this repo, use the Dioxus dev server:
 
 ```shell
-dx serve -p snitch-viewer
+dx serve -p probex-viewer
 ```
 
-The server reads `SNITCH_FILE` (default: `trace.parquet`), so set `SNITCH_FILE=/path/to/trace.parquet` when needed.
+The server reads `PROBEX_FILE` (default: `trace.parquet`), so set `PROBEX_FILE=/path/to/trace.parquet` when needed.
 
 Then open `http://localhost:8080`.
 
 For production/distribution of the fullstack app, build a Dioxus bundle:
 
 ```shell
-dx bundle --release --platform server --fullstack -p snitch-viewer
+dx bundle --release --platform server --fullstack -p probex-viewer
 ```
 
 The bundled server binary is typically produced under:
 
 ```shell
-target/dx/snitch-viewer/release/web/snitch-viewer
+target/dx/probex-viewer/release/web/probex-viewer
 ```
 
 You can also control output location:
 
 ```shell
-dx bundle --release --platform server --fullstack -p snitch-viewer --out-dir ./dist
+dx bundle --release --platform server --fullstack -p probex-viewer --out-dir ./dist
 ```
 
 Then run the bundled executable and pass runtime args:
 
 ```shell
-./dist/web/snitch-viewer --file trace.parquet --port 8080 --address 0.0.0.0
+./dist/web/probex-viewer --file trace.parquet --port 8080 --address 0.0.0.0
 ```
 
 Viewer features:
@@ -153,12 +153,12 @@ cargo check
 Integration tests that require root + eBPF support:
 
 ```shell
-sudo -E cargo test --package snitch --test integration_test
+sudo -E cargo test --package probex --test integration_test
 ```
 
 ## License
 
-With the exception of eBPF code, snitch is distributed under the terms
+With the exception of eBPF code, probex is distributed under the terms
 of either the [MIT license] or the [Apache License] (version 2.0), at your
 option.
 

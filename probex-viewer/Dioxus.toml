@@ -1,9 +1,9 @@
 [application]
-name = "snitch-viewer"
+name = "probex-viewer"
 default_platform = "fullstack"
 
 [web.app]
-title = "Snitch Trace Viewer"
+title = "Probex Trace Viewer"
 
 [web.watcher]
 reload_html = true

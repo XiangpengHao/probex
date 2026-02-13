@@ -47,18 +47,18 @@ jobs:
 
       - name: Build frontend bundle
         run: |
-          dx bundle --release --platform web -p snitch-viewer
-          rm -rf snitch/assets/viewer
-          mkdir -p snitch/assets/viewer
-          cp -a target/dx/snitch-viewer/release/web/public/. snitch/assets/viewer/
+          dx bundle --release --platform web -p probex-viewer
+          rm -rf probex/assets/viewer
+          mkdir -p probex/assets/viewer
+          cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
 
-      - name: Build snitch release binary (embedded frontend)
+      - name: Build probex release binary (embedded frontend)
         run: |
-          cargo build --release -p snitch
+          cargo build --release -p probex
 
-      - name: Verify snitch package includes embedded frontend assets
+      - name: Verify probex package includes embedded frontend assets
         run: |
-          cargo package -p snitch --allow-dirty --no-verify --list | grep '^assets/viewer/index.html$'
+          cargo package -p probex --allow-dirty --no-verify --list | grep '^assets/viewer/index.html$'
 
       - name: Package artifacts
         id: package
@@ -66,9 +66,9 @@ jobs:
           set -euo pipefail
           short_sha="${GITHUB_SHA::7}"
           tag="main-${GITHUB_RUN_NUMBER}-${short_sha}"
-          archive="snitch-linux-x86_64-${tag}.tar.gz"
+          archive="probex-linux-x86_64-${tag}.tar.gz"
           mkdir -p dist
-          cp "$CARGO_TARGET_DIR/release/snitch" dist/
+          cp "$CARGO_TARGET_DIR/release/probex" dist/
           cp README.md dist/
           tar -C dist -czf "$archive" .
           sha256sum "$archive" > "${archive}.sha256"

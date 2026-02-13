@@ -4019,6 +4019,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "probex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "axum",
+ "aya",
+ "aya-build",
+ "aya-log",
+ "cargo_metadata",
+ "clap",
+ "datafusion",
+ "env_logger",
+ "inferno",
+ "libc",
+ "log",
+ "nix",
+ "parquet",
+ "probex-common",
+ "probex-ebpf",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wholesym",
+]
+
+[[package]]
+name = "probex-common"
+version = "0.1.0"
+dependencies = [
+ "aya",
+ "serde",
+]
+
+[[package]]
+name = "probex-ebpf"
+version = "0.1.0"
+dependencies = [
+ "aya-ebpf",
+ "aya-log-ebpf",
+ "probex-common",
+ "which",
+]
+
+[[package]]
+name = "probex-viewer"
+version = "0.1.0"
+dependencies = [
+ "dioxus",
+ "gloo-net",
+ "log",
+ "serde",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4784,62 +4840,6 @@ name = "snap"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
-
-[[package]]
-name = "snitch"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow",
- "axum",
- "aya",
- "aya-build",
- "aya-log",
- "cargo_metadata",
- "clap",
- "datafusion",
- "env_logger",
- "inferno",
- "libc",
- "log",
- "nix",
- "parquet",
- "rust-embed",
- "serde",
- "serde_json",
- "snitch-common",
- "snitch-ebpf",
- "tokio",
- "wholesym",
-]
-
-[[package]]
-name = "snitch-common"
-version = "0.1.0"
-dependencies = [
- "aya",
- "serde",
-]
-
-[[package]]
-name = "snitch-ebpf"
-version = "0.1.0"
-dependencies = [
- "aya-ebpf",
- "aya-log-ebpf",
- "snitch-common",
- "which",
-]
-
-[[package]]
-name = "snitch-viewer"
-version = "0.1.0"
-dependencies = [
- "dioxus",
- "gloo-net",
- "log",
- "serde",
-]
 
 [[package]]
 name = "socket2"

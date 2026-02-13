@@ -10,8 +10,8 @@ fn main() -> anyhow::Result<()> {
         .context("MetadataCommand::exec")?;
     let ebpf_package = packages
         .into_iter()
-        .find(|cargo_metadata::Package { name, .. }| name.as_str() == "snitch-ebpf")
-        .ok_or_else(|| anyhow!("snitch-ebpf package not found"))?;
+        .find(|cargo_metadata::Package { name, .. }| name.as_str() == "probex-ebpf")
+        .ok_or_else(|| anyhow!("probex-ebpf package not found"))?;
     let cargo_metadata::Package {
         name,
         manifest_path,
@@ -31,31 +31,31 @@ fn main() -> anyhow::Result<()> {
 fn ensure_frontend_bundle() -> anyhow::Result<()> {
     println!("cargo:rerun-if-changed=assets/viewer");
     for path in [
-        "../snitch-viewer/Cargo.toml",
-        "../snitch-viewer/Dioxus.toml",
-        "../snitch-viewer/tailwind.css",
-        "../snitch-viewer/src",
-        "../snitch-viewer/assets",
+        "../probex-viewer/Cargo.toml",
+        "../probex-viewer/Dioxus.toml",
+        "../probex-viewer/tailwind.css",
+        "../probex-viewer/src",
+        "../probex-viewer/assets",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
-    println!("cargo:rerun-if-env-changed=SNITCH_SKIP_FRONTEND_BUNDLE");
-    println!("cargo:rerun-if-env-changed=SNITCH_FORCE_FRONTEND_BUNDLE");
+    println!("cargo:rerun-if-env-changed=PROBEX_SKIP_FRONTEND_BUNDLE");
+    println!("cargo:rerun-if-env-changed=PROBEX_FORCE_FRONTEND_BUNDLE");
     println!("cargo:rerun-if-env-changed=DX_BIN");
 
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR")
-            .context("CARGO_MANIFEST_DIR is missing for snitch build script")?,
+            .context("CARGO_MANIFEST_DIR is missing for probex build script")?,
     );
     let embedded_assets_dir = manifest_dir.join("assets").join("viewer");
     let embedded_index = embedded_assets_dir.join("index.html");
-    let force_bundle = std::env::var("SNITCH_FORCE_FRONTEND_BUNDLE").as_deref() == Ok("1");
+    let force_bundle = std::env::var("PROBEX_FORCE_FRONTEND_BUNDLE").as_deref() == Ok("1");
 
     if !force_bundle && embedded_index.is_file() {
         return Ok(());
     }
 
-    if std::env::var("SNITCH_SKIP_FRONTEND_BUNDLE").as_deref() == Ok("1") {
+    if std::env::var("PROBEX_SKIP_FRONTEND_BUNDLE").as_deref() == Ok("1") {
         if embedded_index.is_file() {
             return Ok(());
         }
@@ -67,12 +67,12 @@ fn ensure_frontend_bundle() -> anyhow::Result<()> {
 
     let workspace_root = manifest_dir
         .parent()
-        .ok_or_else(|| anyhow!("snitch crate has no workspace root parent"))?;
-    let viewer_manifest = workspace_root.join("snitch-viewer").join("Cargo.toml");
+        .ok_or_else(|| anyhow!("probex crate has no workspace root parent"))?;
+    let viewer_manifest = workspace_root.join("probex-viewer").join("Cargo.toml");
     let bundled_public_dir = workspace_root
         .join("target")
         .join("dx")
-        .join("snitch-viewer")
+        .join("probex-viewer")
         .join("release")
         .join("web")
         .join("public");
@@ -80,7 +80,7 @@ fn ensure_frontend_bundle() -> anyhow::Result<()> {
 
     if !viewer_manifest.is_file() {
         return Err(anyhow!(
-            "embedded viewer assets missing at {} and snitch-viewer source was not found at {}",
+            "embedded viewer assets missing at {} and probex-viewer source was not found at {}",
             embedded_index.display(),
             viewer_manifest.display()
         ));
@@ -95,12 +95,12 @@ fn ensure_frontend_bundle() -> anyhow::Result<()> {
             "--platform",
             "web",
             "-p",
-            "snitch-viewer",
+            "probex-viewer",
         ])
         .status()
         .with_context(|| {
             format!(
-                "failed to run {:?} bundle --release --platform web -p snitch-viewer",
+                "failed to run {:?} bundle --release --platform web -p probex-viewer",
                 dx_bin
             )
         })?;
@@ -109,7 +109,7 @@ fn ensure_frontend_bundle() -> anyhow::Result<()> {
         return Err(anyhow!(
             "frontend bundle command failed with status {status}. \
              Install dioxus-cli + wasm toolchain, or run \
-             `dx bundle --release --platform web -p snitch-viewer` manually."
+             `dx bundle --release --platform web -p probex-viewer` manually."
         ));
     }
 

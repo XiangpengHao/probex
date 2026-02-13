@@ -1,15 +1,15 @@
 [package]
-name = "snitch-viewer"
+name = "probex-viewer"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/snitch-viewer"
-description = "Web-based visualization for snitch trace files"
+documentation = "https://docs.rs/probex-viewer"
+description = "Web-based visualization for probex trace files"
 
 [[bin]]
-name = "snitch-viewer"
+name = "probex-viewer"
 path = "src/main.rs"
 
 [dependencies]

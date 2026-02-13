@@ -1,16 +1,16 @@
 [package]
-name = "snitch"
+name = "probex"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/snitch"
+documentation = "https://docs.rs/probex"
 description = "Low-friction Linux eBPF profiler with integrated web viewer"
 include = ["Cargo.toml", "build.rs", "src/**", "assets/viewer/**", "tests/**"]
 
 [dependencies]
-snitch-common = { path = "../snitch-common", version = "0.1.0", features = ["user"] }
+probex-common = { path = "../probex-common", version = "0.1.0", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
@@ -55,8 +55,8 @@ cargo_metadata = { workspace = true }
 # Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
-snitch-ebpf = { path = "../snitch-ebpf", version = "0.1.0" }
+probex-ebpf = { path = "../probex-ebpf", version = "0.1.0" }
 
 [[bin]]
-name = "snitch"
+name = "probex"
 path = "src/main.rs"

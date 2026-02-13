@@ -1,12 +1,12 @@
 [package]
-name = "snitch-common"
+name = "probex-common"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/snitch-common"
-description = "Shared event types for snitch user and eBPF components"
+documentation = "https://docs.rs/probex-common"
+description = "Shared event types for probex user and eBPF components"
 
 [features]
 default = []

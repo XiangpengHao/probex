@@ -1,4 +1,4 @@
-//! UI entry point for snitch-viewer.
+//! UI entry point for probex-viewer.
 //!
 //! Keeps reactive state + server querying in one place and delegates rendering
 //! to focused components.

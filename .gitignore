@@ -11,4 +11,4 @@ target/
 vendor/
 trace.parquet
 trace.maps.parquet
-snitch/assets/viewer/
+probex/assets/viewer/
