@@ -113,11 +113,11 @@ use std::{
 use anyhow::{Context as _, Result, anyhow};
 use arrow::{
     array::{
-        ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt8Builder, UInt32Builder,
-        UInt64Builder,
+        Array, ArrayRef, Int32Builder, Int64Builder, ListBuilder, StringArray, StringBuilder,
+        StructBuilder, UInt8Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
     },
-    datatypes::{DataType, Field, Schema},
-    record_batch::RecordBatch,
+    datatypes::{DataType, Field, Fields, Schema},
+    record_batch::{RecordBatch, RecordBatchReader},
 };
 use aya::{
     maps::{HashMap, MapData, PerCpuArray, RingBuf, StackTraceMap},
@@ -137,7 +137,7 @@ use nix::{
     unistd::{ForkResult, Pid, fork},
 };
 use parquet::{
-    arrow::ArrowWriter,
+    arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder},
     basic::Compression,
     file::{metadata::KeyValue, properties::WriterProperties},
 };
@@ -214,6 +214,30 @@ struct Event {
     fd: Option<i64>,
     count: Option<u64>,
     ret: Option<i64>,
+    // Optional inline process map snapshot for this event's tgid.
+    proc_maps_snapshot: Option<Vec<ProcMapInlineSegment>>,
+}
+
+#[derive(Clone, Debug)]
+struct ProcMapInlineSegment {
+    start_addr: u64,
+    end_addr: u64,
+    file_offset: u64,
+    path: String,
+}
+
+fn proc_maps_snapshot_data_type() -> DataType {
+    let segment_fields = Fields::from(vec![
+        Field::new("start_addr", DataType::UInt64, false),
+        Field::new("end_addr", DataType::UInt64, false),
+        Field::new("file_offset", DataType::UInt64, false),
+        Field::new("path", DataType::Utf8, false),
+    ]);
+    DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(segment_fields),
+        true,
+    )))
 }
 
 /// Creates the Arrow schema for the unified event table
@@ -246,6 +270,7 @@ fn create_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
+        Field::new("proc_maps_snapshot", proc_maps_snapshot_data_type(), true),
     ])
 }
 
@@ -325,6 +350,22 @@ impl ParquetBatchWriter {
         let mut fd_builder = Int64Builder::with_capacity(batch_len);
         let mut count_builder = UInt64Builder::with_capacity(batch_len);
         let mut ret_builder = Int64Builder::with_capacity(batch_len);
+        let proc_map_item_fields = vec![
+            Field::new("start_addr", DataType::UInt64, false),
+            Field::new("end_addr", DataType::UInt64, false),
+            Field::new("file_offset", DataType::UInt64, false),
+            Field::new("path", DataType::Utf8, false),
+        ];
+        let proc_map_item_builder = StructBuilder::new(
+            proc_map_item_fields,
+            vec![
+                Box::new(UInt64Builder::new()),
+                Box::new(UInt64Builder::new()),
+                Box::new(UInt64Builder::new()),
+                Box::new(StringBuilder::new()),
+            ],
+        );
+        let mut proc_maps_snapshot_builder = ListBuilder::new(proc_map_item_builder);
 
         for event in self.batch.drain(..) {
             event_type_builder.append_value(event.event_type);
@@ -349,6 +390,34 @@ impl ParquetBatchWriter {
             fd_builder.append_option(event.fd);
             count_builder.append_option(event.count);
             ret_builder.append_option(event.ret);
+            if let Some(segments) = event.proc_maps_snapshot {
+                for segment in segments {
+                    proc_maps_snapshot_builder
+                        .values()
+                        .field_builder::<UInt64Builder>(0)
+                        .expect("proc_maps_snapshot.start_addr builder type should match")
+                        .append_value(segment.start_addr);
+                    proc_maps_snapshot_builder
+                        .values()
+                        .field_builder::<UInt64Builder>(1)
+                        .expect("proc_maps_snapshot.end_addr builder type should match")
+                        .append_value(segment.end_addr);
+                    proc_maps_snapshot_builder
+                        .values()
+                        .field_builder::<UInt64Builder>(2)
+                        .expect("proc_maps_snapshot.file_offset builder type should match")
+                        .append_value(segment.file_offset);
+                    proc_maps_snapshot_builder
+                        .values()
+                        .field_builder::<StringBuilder>(3)
+                        .expect("proc_maps_snapshot.path builder type should match")
+                        .append_value(segment.path);
+                    proc_maps_snapshot_builder.values().append(true);
+                }
+                proc_maps_snapshot_builder.append(true);
+            } else {
+                proc_maps_snapshot_builder.append(false);
+            }
         }
 
         let columns: Vec<ArrayRef> = vec![
@@ -374,6 +443,7 @@ impl ParquetBatchWriter {
             Arc::new(fd_builder.finish()),
             Arc::new(count_builder.finish()),
             Arc::new(ret_builder.finish()),
+            Arc::new(proc_maps_snapshot_builder.finish()),
         ];
 
         let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
@@ -726,6 +796,9 @@ struct MaterializedStack {
     stack_trace: Option<String>,
 }
 
+type StackCacheKey = (Option<i32>, Option<i32>, Option<&'static str>);
+type StackTraceCache = std::collections::HashMap<StackCacheKey, MaterializedStack>;
+
 #[derive(Clone, Debug)]
 struct ProcMapSnapshotRecord {
     tgid: u32,
@@ -919,6 +992,260 @@ fn maybe_capture_proc_maps_snapshot(
     Ok(())
 }
 
+type ProcMapsSnapshotIndex =
+    std::collections::HashMap<u32, std::collections::BTreeMap<u64, Arc<Vec<ProcMapInlineSegment>>>>;
+
+fn row_requires_inline_proc_maps(stack_kind: Option<&str>, stack_frames: Option<&str>) -> bool {
+    matches!(stack_kind, Some("user") | Some("both"))
+        && stack_frames.is_some_and(|frames| !frames.is_empty())
+}
+
+fn load_proc_maps_snapshot_index(maps_output_path: &str) -> Result<ProcMapsSnapshotIndex> {
+    let file = File::open(maps_output_path)
+        .with_context(|| format!("failed to open proc maps file {}", maps_output_path))?;
+    let reader_builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("failed to create reader for {}", maps_output_path))?;
+    let mut reader = reader_builder
+        .with_batch_size(MAP_BATCH_SIZE)
+        .build()
+        .with_context(|| format!("failed to build reader for {}", maps_output_path))?;
+
+    let mut grouped: std::collections::HashMap<u32, std::collections::BTreeMap<u64, Vec<_>>> =
+        std::collections::HashMap::new();
+    for batch in &mut reader {
+        let batch = batch.with_context(|| "failed to read proc maps batch")?;
+
+        let tgid_array = batch
+            .column_by_name("tgid")
+            .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
+            .ok_or_else(|| anyhow!("proc maps column tgid has unexpected type"))?;
+        let captured_ts_array = batch
+            .column_by_name("captured_ts_ns")
+            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("proc maps column captured_ts_ns has unexpected type"))?;
+        let start_array = batch
+            .column_by_name("start_addr")
+            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("proc maps column start_addr has unexpected type"))?;
+        let end_array = batch
+            .column_by_name("end_addr")
+            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("proc maps column end_addr has unexpected type"))?;
+        let file_offset_array = batch
+            .column_by_name("file_offset")
+            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| anyhow!("proc maps column file_offset has unexpected type"))?;
+        let path_array = batch
+            .column_by_name("path")
+            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| anyhow!("proc maps column path has unexpected type"))?;
+
+        for row_idx in 0..batch.num_rows() {
+            let segment = ProcMapInlineSegment {
+                start_addr: start_array.value(row_idx),
+                end_addr: end_array.value(row_idx),
+                file_offset: file_offset_array.value(row_idx),
+                path: path_array.value(row_idx).to_string(),
+            };
+            grouped
+                .entry(tgid_array.value(row_idx))
+                .or_default()
+                .entry(captured_ts_array.value(row_idx))
+                .or_default()
+                .push(segment);
+        }
+    }
+
+    Ok(grouped
+        .into_iter()
+        .map(|(tgid, snapshots)| {
+            let snapshots = snapshots
+                .into_iter()
+                .map(|(captured_ts_ns, segments)| (captured_ts_ns, Arc::new(segments)))
+                .collect();
+            (tgid, snapshots)
+        })
+        .collect())
+}
+
+fn find_inline_segments_for_event(
+    snapshot_index: &ProcMapsSnapshotIndex,
+    tgid: u32,
+    ts_ns: u64,
+) -> Option<&[ProcMapInlineSegment]> {
+    let snapshots = snapshot_index.get(&tgid)?;
+    let (_captured_ts_ns, segments) = snapshots.range(..=ts_ns).next_back()?;
+    Some(segments.as_slice())
+}
+
+fn embed_proc_maps_snapshots_into_events_parquet(
+    events_output_path: &str,
+    snapshot_index: &ProcMapsSnapshotIndex,
+    sample_freq_hz: u64,
+) -> Result<usize> {
+    let file = File::open(events_output_path)
+        .with_context(|| format!("failed to open events file {}", events_output_path))?;
+    let reader_builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("failed to create reader for {}", events_output_path))?;
+    let mut reader = reader_builder
+        .with_batch_size(BATCH_SIZE)
+        .build()
+        .with_context(|| format!("failed to build reader for {}", events_output_path))?;
+
+    let schema = reader.schema();
+    let proc_maps_snapshot_idx = schema
+        .index_of("proc_maps_snapshot")
+        .with_context(|| "events schema missing proc_maps_snapshot column")?;
+    let tgid_idx = schema
+        .index_of("tgid")
+        .with_context(|| "events schema missing tgid column")?;
+    let ts_ns_idx = schema
+        .index_of("ts_ns")
+        .with_context(|| "events schema missing ts_ns column")?;
+    let stack_kind_idx = schema
+        .index_of("stack_kind")
+        .with_context(|| "events schema missing stack_kind column")?;
+    let stack_frames_idx = schema
+        .index_of("stack_frames")
+        .with_context(|| "events schema missing stack_frames column")?;
+
+    let tmp_output_path = format!("{events_output_path}.postprocess.tmp");
+    let output_file = File::create(&tmp_output_path)
+        .with_context(|| format!("failed to create temp output {}", tmp_output_path))?;
+    let key_value_metadata = vec![KeyValue::new(
+        PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY.to_string(),
+        sample_freq_hz.to_string(),
+    )];
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_key_value_metadata(Some(key_value_metadata))
+        .build();
+    let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))
+        .with_context(|| "failed to create post-process parquet writer")?;
+
+    let mut rows_with_snapshot = 0usize;
+    for batch in &mut reader {
+        let batch = batch.with_context(|| "failed to read events batch")?;
+
+        let tgid_array = batch
+            .column(tgid_idx)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| anyhow!("events column tgid has unexpected type"))?;
+        let ts_ns_array = batch
+            .column(ts_ns_idx)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| anyhow!("events column ts_ns has unexpected type"))?;
+        let stack_kind_array = batch
+            .column(stack_kind_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("events column stack_kind has unexpected type"))?;
+        let stack_frames_array = batch
+            .column(stack_frames_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow!("events column stack_frames has unexpected type"))?;
+
+        let proc_map_item_fields = vec![
+            Field::new("start_addr", DataType::UInt64, false),
+            Field::new("end_addr", DataType::UInt64, false),
+            Field::new("file_offset", DataType::UInt64, false),
+            Field::new("path", DataType::Utf8, false),
+        ];
+        let proc_map_item_builder = StructBuilder::new(
+            proc_map_item_fields,
+            vec![
+                Box::new(UInt64Builder::new()),
+                Box::new(UInt64Builder::new()),
+                Box::new(UInt64Builder::new()),
+                Box::new(StringBuilder::new()),
+            ],
+        );
+        let mut proc_maps_snapshot_builder = ListBuilder::new(proc_map_item_builder);
+
+        for row_idx in 0..batch.num_rows() {
+            let stack_kind = if stack_kind_array.is_null(row_idx) {
+                None
+            } else {
+                Some(stack_kind_array.value(row_idx))
+            };
+            let stack_frames = if stack_frames_array.is_null(row_idx) {
+                None
+            } else {
+                Some(stack_frames_array.value(row_idx))
+            };
+            if !row_requires_inline_proc_maps(stack_kind, stack_frames) {
+                proc_maps_snapshot_builder.append(false);
+                continue;
+            }
+
+            let tgid = tgid_array.value(row_idx);
+            if tgid == 0 {
+                proc_maps_snapshot_builder.append(false);
+                continue;
+            }
+
+            let ts_ns = ts_ns_array.value(row_idx);
+            let Some(segments) = find_inline_segments_for_event(snapshot_index, tgid, ts_ns) else {
+                proc_maps_snapshot_builder.append(false);
+                continue;
+            };
+            if segments.is_empty() {
+                proc_maps_snapshot_builder.append(false);
+                continue;
+            }
+
+            rows_with_snapshot += 1;
+            for segment in segments {
+                proc_maps_snapshot_builder
+                    .values()
+                    .field_builder::<UInt64Builder>(0)
+                    .expect("proc_maps_snapshot.start_addr builder type should match")
+                    .append_value(segment.start_addr);
+                proc_maps_snapshot_builder
+                    .values()
+                    .field_builder::<UInt64Builder>(1)
+                    .expect("proc_maps_snapshot.end_addr builder type should match")
+                    .append_value(segment.end_addr);
+                proc_maps_snapshot_builder
+                    .values()
+                    .field_builder::<UInt64Builder>(2)
+                    .expect("proc_maps_snapshot.file_offset builder type should match")
+                    .append_value(segment.file_offset);
+                proc_maps_snapshot_builder
+                    .values()
+                    .field_builder::<StringBuilder>(3)
+                    .expect("proc_maps_snapshot.path builder type should match")
+                    .append_value(segment.path.as_str());
+                proc_maps_snapshot_builder.values().append(true);
+            }
+            proc_maps_snapshot_builder.append(true);
+        }
+
+        let mut columns = batch.columns().to_vec();
+        columns[proc_maps_snapshot_idx] = Arc::new(proc_maps_snapshot_builder.finish());
+        let rewritten_batch = RecordBatch::try_new(schema.clone(), columns)
+            .with_context(|| "failed to construct rewritten events batch")?;
+        writer
+            .write(&rewritten_batch)
+            .with_context(|| "failed to write rewritten events batch")?;
+    }
+
+    writer
+        .close()
+        .with_context(|| "failed to close rewritten events writer")?;
+    std::fs::rename(&tmp_output_path, events_output_path).with_context(|| {
+        format!(
+            "failed to replace {} with post-processed output {}",
+            events_output_path, tmp_output_path
+        )
+    })?;
+
+    Ok(rows_with_snapshot)
+}
+
 fn format_stack_frames_hex(frames: &[u64]) -> Option<String> {
     if frames.is_empty() {
         return None;
@@ -935,7 +1262,7 @@ fn format_stack_frames_hex(frames: &[u64]) -> Option<String> {
 fn is_plausible_user_instruction_ip(ip: u64) -> bool {
     // User-space instruction pointers should never be tiny sentinel values
     // and should stay in the user half of virtual address space.
-    ip >= 0x1000 && ip < (1u64 << 63) && ip != u64::MAX
+    (0x1000..(1u64 << 63)).contains(&ip)
 }
 
 fn read_stack_frames(
@@ -1028,10 +1355,7 @@ fn enrich_stack_data(
     event: &mut Event,
     stack_traces: &StackTraceMap<MapData>,
     kernel_syms: Option<&BTreeMap<u64, String>>,
-    stack_cache: &mut std::collections::HashMap<
-        (Option<i32>, Option<i32>, Option<&'static str>),
-        MaterializedStack,
-    >,
+    stack_cache: &mut StackTraceCache,
 ) {
     if event.stack_id.is_none() && event.kernel_stack_id.is_none() {
         return;
@@ -1339,10 +1663,7 @@ async fn main() -> Result<()> {
     let mut child_wait_done = false;
     let mut pid_name_cache: std::collections::HashMap<u32, Option<String>> =
         std::collections::HashMap::new();
-    let mut stack_trace_cache: std::collections::HashMap<
-        (Option<i32>, Option<i32>, Option<&'static str>),
-        MaterializedStack,
-    > = std::collections::HashMap::new();
+    let mut stack_trace_cache: StackTraceCache = std::collections::HashMap::new();
     let mut proc_map_snapshot_cache: std::collections::HashMap<u32, Vec<ProcMapEntry>> =
         std::collections::HashMap::new();
     let mut seen_tgids: HashSet<u32> = HashSet::new();
@@ -1476,8 +1797,68 @@ async fn main() -> Result<()> {
     // Finish writing and close the Parquet file
     let total_events = writer.finish()?;
     let total_maps = maps_writer.finish()?;
+    let mut embedded_snapshot_rows = 0usize;
+    let mut removed_maps_file = false;
+
+    if total_events > 0 && total_maps > 0 {
+        match load_proc_maps_snapshot_index(&maps_output_path).and_then(|snapshot_index| {
+            embed_proc_maps_snapshots_into_events_parquet(
+                &args.output,
+                &snapshot_index,
+                args.sample_freq,
+            )
+        }) {
+            Ok(rows_with_snapshot) => {
+                embedded_snapshot_rows = rows_with_snapshot;
+                info!(
+                    "Post-processing complete: embedded proc map snapshots into {} event rows",
+                    rows_with_snapshot
+                );
+                match std::fs::remove_file(&maps_output_path) {
+                    Ok(()) => {
+                        removed_maps_file = true;
+                        info!(
+                            "Removed intermediate proc maps file after embedding: {}",
+                            maps_output_path
+                        );
+                    }
+                    Err(error) => warn!(
+                        "Embedded snapshots but failed to remove intermediate file {}: {}",
+                        maps_output_path, error
+                    ),
+                }
+            }
+            Err(error) => warn!(
+                "Failed to post-process inline proc map snapshots; keeping {}: {}",
+                maps_output_path, error
+            ),
+        }
+    } else if total_maps == 0 {
+        match std::fs::remove_file(&maps_output_path) {
+            Ok(()) => {
+                removed_maps_file = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                removed_maps_file = true;
+            }
+            Err(error) => warn!(
+                "No proc map rows captured, but failed to remove empty {}: {}",
+                maps_output_path, error
+            ),
+        }
+    }
+
     info!("Done. Wrote {} events to {}", total_events, args.output);
-    info!("Wrote {} proc map rows to {}", total_maps, maps_output_path);
+    if total_maps > 0 {
+        if removed_maps_file {
+            info!(
+                "Captured {} proc map rows and embedded {} snapshots into {}",
+                total_maps, embedded_snapshot_rows, args.output
+            );
+        } else {
+            info!("Wrote {} proc map rows to {}", total_maps, maps_output_path);
+        }
+    }
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if total_events > 0

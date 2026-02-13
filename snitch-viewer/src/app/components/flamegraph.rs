@@ -58,6 +58,16 @@ pub fn EventFlamegraphCard(
     let pid_scope = selected_pid
         .map(|pid| format!("PID {pid}"))
         .unwrap_or_else(|| "All PIDs".to_string());
+    let sample_label = if total > 0 {
+        format!("{total} samples")
+    } else {
+        "0 samples".to_string()
+    };
+    let selected_event_label = if event_type.is_empty() {
+        "none".to_string()
+    } else {
+        event_type.clone()
+    };
 
     rsx! {
         div { class: "bg-white border border-gray-200 rounded px-2 py-1.5 space-y-1.5",
@@ -79,24 +89,20 @@ pub fn EventFlamegraphCard(
                         option { key: "{event_name}", value: "{event_name}", "{event_name}" }
                     })}
                 }
-                if total > 0 {
-                    span { class: "ml-auto text-xs text-gray-500", "{total} samples" }
-                } else {
-                    span { class: "ml-auto text-xs text-gray-400", "0 samples" }
+                div { class: "ml-auto text-[11px] text-gray-500 flex flex-wrap items-center gap-x-1.5",
+                    span { "{sample_label}" }
+                    span { "·" }
+                    span { "Scope: {pid_scope} · T+{format_duration_short(start_offset)}..T+{format_duration_short(end_offset)} (width {format_duration_short(range_width)})" }
+                    span { "·" }
+                    span {
+                        "Event: "
+                        span { class: "font-mono text-gray-700", "{selected_event_label}" }
+                    }
                 }
-            }
-
-            div { class: "text-[11px] text-gray-500",
-                "Scope: {pid_scope} · T+{format_duration_short(start_offset)}..T+{format_duration_short(end_offset)} (width {format_duration_short(range_width)})"
             }
 
             if event_type.is_empty() {
                 div { class: "text-xs text-gray-400", "Select an event type to build a flamegraph for the current scope" }
-            } else {
-                div { class: "text-xs text-gray-600",
-                    "Event: "
-                    span { class: "font-mono text-gray-800", "{event_type}" }
-                }
             }
 
             if !event_type.is_empty() && loading {

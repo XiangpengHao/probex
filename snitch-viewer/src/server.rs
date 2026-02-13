@@ -156,8 +156,8 @@ pub struct EventFlamegraphResponse {
 mod backend {
     use super::*;
     use datafusion::arrow::array::{
-        Array, Float32Array, Float64Array, Int32Array, Int64Array, StringViewArray, UInt8Array,
-        UInt32Array, UInt64Array,
+        Array, Float32Array, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
+        StringViewArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use datafusion::prelude::*;
     use inferno::flamegraph;
@@ -229,7 +229,7 @@ mod backend {
             }
         } else {
             log::warn!(
-                "proc maps parquet not found at {}; userspace stack symbolization may be limited",
+                "proc maps parquet not found at {}; using inline event snapshots when available, otherwise userspace symbolization may be limited",
                 maps_file.display()
             );
         }
@@ -635,8 +635,7 @@ mod backend {
 
                 total_in_range += cnt;
 
-                let clamped_idx =
-                    (bucket_idx.max(0) as usize).min(bucket_count.saturating_sub(1));
+                let clamped_idx = (bucket_idx.max(0) as usize).min(bucket_count.saturating_sub(1));
                 let bucket = buckets
                     .get_mut(clamped_idx)
                     .expect("histogram bucket index should be in range");
@@ -1151,6 +1150,66 @@ mod backend {
         stack_kind: Option<String>,
         stack_frames: Option<String>,
         stack_trace: Option<String>,
+        proc_maps_snapshot: Option<Vec<ProcMapSegment>>,
+    }
+
+    fn extract_option_proc_maps_snapshot(
+        batch: &datafusion::arrow::record_batch::RecordBatch,
+        row: usize,
+    ) -> Option<Vec<ProcMapSegment>> {
+        let column = batch.column_by_name("proc_maps_snapshot")?;
+        let list_array = column.as_any().downcast_ref::<ListArray>()?;
+        if list_array.is_null(row) {
+            return None;
+        }
+
+        let list_values = list_array.value(row);
+        let struct_array = list_values.as_any().downcast_ref::<StructArray>()?;
+        let start_array = struct_array
+            .column_by_name("start_addr")?
+            .as_any()
+            .downcast_ref::<UInt64Array>()?;
+        let end_array = struct_array
+            .column_by_name("end_addr")?
+            .as_any()
+            .downcast_ref::<UInt64Array>()?;
+        let offset_array = struct_array
+            .column_by_name("file_offset")?
+            .as_any()
+            .downcast_ref::<UInt64Array>()?;
+        let path_column = struct_array.column_by_name("path")?;
+
+        let mut segments = Vec::with_capacity(struct_array.len());
+        for idx in 0..struct_array.len() {
+            if start_array.is_null(idx) || end_array.is_null(idx) || offset_array.is_null(idx) {
+                continue;
+            }
+
+            let path = if let Some(path_array) =
+                path_column.as_any().downcast_ref::<StringViewArray>()
+            {
+                if path_array.is_null(idx) {
+                    continue;
+                }
+                path_array.value(idx).to_string()
+            } else if let Some(path_array) = path_column.as_any().downcast_ref::<StringArray>() {
+                if path_array.is_null(idx) {
+                    continue;
+                }
+                path_array.value(idx).to_string()
+            } else {
+                continue;
+            };
+
+            segments.push(ProcMapSegment {
+                start_addr: start_array.value(idx),
+                end_addr: end_array.value(idx),
+                file_offset: offset_array.value(idx),
+                path,
+            });
+        }
+
+        Some(segments)
     }
 
     struct OfflineUserSymbolizer {
@@ -1292,9 +1351,8 @@ mod backend {
         }
     }
 
-    fn find_segment_for_ip(snapshot: &ProcMapSnapshot, ip: u64) -> Option<&ProcMapSegment> {
-        snapshot
-            .segments
+    fn find_segment_for_ip(segments: &[ProcMapSegment], ip: u64) -> Option<&ProcMapSegment> {
+        segments
             .iter()
             .find(|segment| ip >= segment.start_addr && ip < segment.end_addr)
     }
@@ -1304,23 +1362,34 @@ mod backend {
         ts_ns: u64,
         frames: &[u64],
         map_snapshots: &std::collections::HashMap<u32, Vec<ProcMapSnapshot>>,
+        inline_snapshot: Option<&[ProcMapSegment]>,
         symbolizer: &mut OfflineUserSymbolizer,
     ) -> Vec<String> {
         let mut labels = Vec::with_capacity(frames.len() + 1);
         labels.push("[user]".to_string());
 
-        let Some(snapshots) = map_snapshots.get(&tgid) else {
+        let segments = if let Some(inline_snapshot) = inline_snapshot {
+            inline_snapshot
+        } else {
+            let Some(snapshots) = map_snapshots.get(&tgid) else {
+                labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
+                return labels;
+            };
+            let Some(snapshot) = find_snapshot_for_ts(snapshots, ts_ns) else {
+                labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
+                return labels;
+            };
+            &snapshot.segments
+        };
+
+        if segments.is_empty() {
             labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
             return labels;
-        };
-        let Some(snapshot) = find_snapshot_for_ts(snapshots, ts_ns) else {
-            labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
-            return labels;
-        };
+        }
 
         let mapped_segments: Vec<Option<&ProcMapSegment>> = frames
             .iter()
-            .map(|ip| find_segment_for_ip(snapshot, *ip))
+            .map(|ip| find_segment_for_ip(segments, *ip))
             .collect();
 
         let mut frame_symbol_keys: Vec<Option<(String, u64)>> = Vec::with_capacity(frames.len());
@@ -1511,6 +1580,12 @@ mod backend {
         }
 
         let sql = format!(
+            "SELECT tgid, ts_ns, stack_kind, stack_frames, stack_trace, proc_maps_snapshot
+             FROM events
+             WHERE {}",
+            conditions.join(" AND ")
+        );
+        let sql_without_inline_maps = format!(
             "SELECT tgid, ts_ns, stack_kind, stack_frames, stack_trace
              FROM events
              WHERE {}",
@@ -1520,26 +1595,29 @@ mod backend {
         // Older traces may not contain stack columns.
         let df = match ctx.sql(&sql).await {
             Ok(df) => df,
-            Err(_) => {
-                let legacy_sql = format!(
-                    "SELECT pid as tgid, ts_ns, CAST(NULL AS Utf8) as stack_kind, CAST(NULL AS Utf8) as stack_frames, stack_trace
-                     FROM events
-                     WHERE {}
-                       AND stack_trace IS NOT NULL
-                       AND stack_trace <> ''",
-                    conditions.join(" AND ")
-                );
-                match ctx.sql(&legacy_sql).await {
-                    Ok(df) => df,
-                    Err(_) => {
-                        return Ok(EventFlamegraphResponse {
-                            event_type,
-                            total_samples: 0,
-                            svg: None,
-                        });
+            Err(_) => match ctx.sql(&sql_without_inline_maps).await {
+                Ok(df) => df,
+                Err(_) => {
+                    let legacy_sql = format!(
+                        "SELECT pid as tgid, ts_ns, CAST(NULL AS Utf8) as stack_kind, CAST(NULL AS Utf8) as stack_frames, stack_trace
+                         FROM events
+                         WHERE {}
+                           AND stack_trace IS NOT NULL
+                           AND stack_trace <> ''",
+                        conditions.join(" AND ")
+                    );
+                    match ctx.sql(&legacy_sql).await {
+                        Ok(df) => df,
+                        Err(_) => {
+                            return Ok(EventFlamegraphResponse {
+                                event_type,
+                                total_samples: 0,
+                                svg: None,
+                            });
+                        }
                     }
                 }
-            }
+            },
         };
         let batches = df.collect().await?;
 
@@ -1564,12 +1642,14 @@ mod backend {
                 let stack_kind = extract_option_string(batch, "stack_kind", row);
                 let stack_frames = extract_option_string(batch, "stack_frames", row);
                 let stack_trace = extract_option_string(batch, "stack_trace", row);
+                let proc_maps_snapshot = extract_option_proc_maps_snapshot(batch, row);
                 let sampled_row = SampledStackRow {
                     tgid,
                     ts_ns,
                     stack_kind,
                     stack_frames,
                     stack_trace,
+                    proc_maps_snapshot,
                 };
 
                 rows_seen += 1;
@@ -1591,6 +1671,7 @@ mod backend {
             .filter(|row| {
                 matches!(row.stack_kind.as_deref(), Some("user") | Some("both"))
                     && row.stack_frames.is_some()
+                    && row.proc_maps_snapshot.is_none()
             })
             .map(|row| row.tgid)
             .collect();
@@ -1612,6 +1693,7 @@ mod backend {
                         row.ts_ns,
                         &frames,
                         &map_snapshots,
+                        row.proc_maps_snapshot.as_deref(),
                         &mut user_symbolizer,
                     )
                     .await
@@ -1623,6 +1705,7 @@ mod backend {
                         row.ts_ns,
                         &frames,
                         &map_snapshots,
+                        row.proc_maps_snapshot.as_deref(),
                         &mut user_symbolizer,
                     )
                     .await;

@@ -1,0 +1,83 @@
+name: Release Build
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install nightly rust-src for eBPF build script
+        run: rustup toolchain install nightly --component rust-src
+
+      - name: Install bpf-linker
+        run: cargo install --locked bpf-linker
+
+      - name: Install dx and wasm tooling
+        run: |
+          cargo install --locked dioxus-cli --version 0.7.3
+          cargo install --locked wasm-bindgen-cli
+
+      - name: Install wasm-opt (binaryen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> ${{ env.CARGO_TARGET_DIR }}
+
+      - name: Build snitch release binary
+        run: |
+          cargo build --release -p snitch
+
+      - name: Build bundled snitch-viewer (fullstack)
+        run: |
+          dx bundle --release --platform server --fullstack -p snitch-viewer
+
+      - name: Package artifacts
+        id: package
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          tag="main-${GITHUB_RUN_NUMBER}-${short_sha}"
+          archive="snitch-linux-x86_64-${tag}.tar.gz"
+          mkdir -p dist
+          cp "$CARGO_TARGET_DIR/release/snitch" dist/
+          mkdir -p dist/snitch-viewer
+          cp "target/dx/snitch-viewer/release/web/snitch-viewer" dist/snitch-viewer/
+          cp -r "target/dx/snitch-viewer/release/web/public" dist/snitch-viewer/
+          cp README.md dist/
+          tar -C dist -czf "$archive" .
+          sha256sum "$archive" > "${archive}.sha256"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=${archive}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: ${{ steps.package.outputs.tag }}
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          generate_release_notes: true

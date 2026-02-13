@@ -172,8 +172,6 @@ fn TraceViewer() -> Element {
     let selected_pid_value = selected_pid();
     let selected_flame_event_type_value = selected_flame_event_type();
 
-    let full_start = summary_data.as_ref().map(|s| s.min_ts_ns).unwrap_or(0);
-    let full_end = summary_data.as_ref().map(|s| s.max_ts_ns).unwrap_or(0);
     let flame_event_type_options = build_flame_event_type_options(
         summary_data.as_ref(),
         selected_pid_value,
@@ -216,29 +214,32 @@ fn TraceViewer() -> Element {
                         view_end_ns: range.end_ns,
                     },
                     actions: ProcessTimelineActions {
-                        on_select_pid: move |pid: u32| {
+                        on_select_pid: EventHandler::new(move |pid: u32| {
                             let next_pid = if selected_pid() == Some(pid) {
                                 None
                             } else {
                                 Some(pid)
                             };
                             selected_pid.set(next_pid);
-                        },
-                        on_select_pid_option: move |pid: Option<u32>| {
+                        }),
+                        on_select_pid_option: EventHandler::new(move |pid: Option<u32>| {
                             selected_pid.set(pid);
-                        },
-                        on_focus_process: move |(pid, start, end): (u32, u64, u64)| {
-                            selected_pid.set(Some(pid));
+                        }),
+                        on_focus_process: EventHandler::new(
+                            move |(pid, start, end): (u32, u64, u64)| {
+                                selected_pid.set(Some(pid));
+                                if let Some(next_range) = next_view_range(view_range(), start, end)
+                                {
+                                    view_range.set(Some(next_range));
+                                }
+                            },
+                        ),
+                        on_change_range: EventHandler::new(move |(start, end): (u64, u64)| {
                             if let Some(next_range) = next_view_range(view_range(), start, end) {
                                 view_range.set(Some(next_range));
                             }
-                        },
-                        on_change_range: move |(start, end): (u64, u64)| {
-                            if let Some(next_range) = next_view_range(view_range(), start, end) {
-                                view_range.set(Some(next_range));
-                            }
-                        },
-                        on_toggle_event_type: move |event_type: String| {
+                        }),
+                        on_toggle_event_type: EventHandler::new(move |event_type: String| {
                             let mut types = enabled_event_types();
                             if types.contains(&event_type) {
                                 types.remove(&event_type);
@@ -246,10 +247,12 @@ fn TraceViewer() -> Element {
                                 types.insert(event_type);
                             }
                             enabled_event_types.set(types);
-                        },
-                        on_select_flame_event_type: move |event_type: Option<String>| {
-                            selected_flame_event_type.set(event_type);
-                        },
+                        }),
+                        on_select_flame_event_type: EventHandler::new(
+                            move |event_type: Option<String>| {
+                                selected_flame_event_type.set(event_type);
+                            },
+                        ),
                     },
                 }
             }

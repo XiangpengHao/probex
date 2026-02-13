@@ -604,8 +604,8 @@ pub fn ProcessTimeline(
                                             if let Some(preview) = build_process_bar_drag_preview(
                                                 drag_state,
                                                 evt.page_coordinates().x,
-                                                view_start_ns,
-                                                view_end_ns,
+                                                range.view_start_ns,
+                                                range.view_end_ns,
                                             ) && process_bar_drag_preview() != Some(preview)
                                             {
                                                 process_bar_drag_preview.set(Some(preview));

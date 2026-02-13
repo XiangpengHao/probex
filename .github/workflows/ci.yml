@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust-checks:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchains
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install nightly rust-src for eBPF build script
+        run: rustup toolchain install nightly --component rust-src
+
+      - name: Install bpf-linker
+        run: cargo install --locked bpf-linker
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> ${{ env.CARGO_TARGET_DIR }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy -p snitch -p snitch-common -p snitch-viewer --all-targets
+
+      - name: Run cargo check
+        run: cargo check -p snitch -p snitch-common -p snitch-viewer

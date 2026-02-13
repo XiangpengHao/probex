@@ -169,7 +169,7 @@ pub const SYSCALL_EXIT_EVENT_SIZE: usize = core::mem::size_of::<SyscallExitEvent
 pub const CPU_SAMPLE_EVENT_SIZE: usize = core::mem::size_of::<CpuSampleEvent>();
 
 // Ring buffer size (8MB)
-pub const RING_BUF_SIZE: u32 = 8 * 1024 * 1024;
+pub const RING_BUF_SIZE: u32 = 64 * 1024 * 1024;
 
 // Maximum number of tracked PIDs
 pub const MAX_TRACKED_PIDS: u32 = 8192;
