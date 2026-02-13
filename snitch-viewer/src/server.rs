@@ -207,31 +207,24 @@ mod backend {
         let path_str = parquet_file.to_string_lossy();
         ctx.register_parquet("events", path_str.as_ref(), ParquetReadOptions::default())
             .await?;
+        let has_inline_proc_maps = ctx
+            .table("events")
+            .await
+            .map(|df| {
+                df.schema()
+                    .has_column_with_unqualified_name("proc_maps_snapshot")
+            })
+            .unwrap_or(false);
 
-        let maps_file = parquet_file.with_extension("maps.parquet");
-        if maps_file.exists() {
-            let maps_path = maps_file.to_string_lossy();
-            if let Err(err) = ctx
-                .register_parquet(
-                    "proc_maps",
-                    maps_path.as_ref(),
-                    ParquetReadOptions::default(),
-                )
-                .await
-            {
-                log::warn!(
-                    "failed to load proc maps parquet {}: {}",
-                    maps_file.display(),
-                    err
-                );
-            } else {
-                log::info!("Loaded proc maps from {}", maps_file.display());
-            }
-        } else {
-            log::warn!(
-                "proc maps parquet not found at {}; using inline event snapshots when available, otherwise userspace symbolization may be limited",
-                maps_file.display()
-            );
+        if !has_inline_proc_maps {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Trace {} is missing required proc_maps_snapshot column. Regenerate with current snitch.",
+                    parquet_file.display()
+                ),
+            )
+            .into());
         }
 
         // Verify we can read the table
@@ -1138,15 +1131,7 @@ mod backend {
     }
 
     #[derive(Clone, Debug)]
-    struct ProcMapSnapshot {
-        captured_ts_ns: u64,
-        segments: Vec<ProcMapSegment>,
-    }
-
-    #[derive(Clone, Debug)]
     struct SampledStackRow {
-        tgid: u32,
-        ts_ns: u64,
         stack_kind: Option<String>,
         stack_frames: Option<String>,
         stack_trace: Option<String>,
@@ -1339,18 +1324,6 @@ mod backend {
             .collect()
     }
 
-    fn find_snapshot_for_ts(snapshots: &[ProcMapSnapshot], ts_ns: u64) -> Option<&ProcMapSnapshot> {
-        if snapshots.is_empty() {
-            return None;
-        }
-        let idx = snapshots.partition_point(|snapshot| snapshot.captured_ts_ns <= ts_ns);
-        if idx == 0 {
-            Some(&snapshots[0])
-        } else {
-            Some(&snapshots[idx - 1])
-        }
-    }
-
     fn find_segment_for_ip(segments: &[ProcMapSegment], ip: u64) -> Option<&ProcMapSegment> {
         segments
             .iter()
@@ -1358,28 +1331,16 @@ mod backend {
     }
 
     async fn symbolize_user_frames(
-        tgid: u32,
-        ts_ns: u64,
         frames: &[u64],
-        map_snapshots: &std::collections::HashMap<u32, Vec<ProcMapSnapshot>>,
         inline_snapshot: Option<&[ProcMapSegment]>,
         symbolizer: &mut OfflineUserSymbolizer,
     ) -> Vec<String> {
         let mut labels = Vec::with_capacity(frames.len() + 1);
         labels.push("[user]".to_string());
 
-        let segments = if let Some(inline_snapshot) = inline_snapshot {
-            inline_snapshot
-        } else {
-            let Some(snapshots) = map_snapshots.get(&tgid) else {
-                labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
-                return labels;
-            };
-            let Some(snapshot) = find_snapshot_for_ts(snapshots, ts_ns) else {
-                labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
-                return labels;
-            };
-            &snapshot.segments
+        let Some(segments) = inline_snapshot else {
+            labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
+            return labels;
         };
 
         if segments.is_empty() {
@@ -1487,71 +1448,6 @@ mod backend {
         Ok(String::from_utf8(svg)?)
     }
 
-    async fn load_proc_map_snapshots(
-        ctx: &SessionContext,
-        tgids: &HashSet<u32>,
-    ) -> Result<
-        std::collections::HashMap<u32, Vec<ProcMapSnapshot>>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        if tgids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-
-        let tgid_list: Vec<String> = tgids.iter().map(|tgid| tgid.to_string()).collect();
-        let sql = format!(
-            "SELECT tgid, captured_ts_ns, start_addr, end_addr, file_offset, path
-             FROM proc_maps
-             WHERE tgid IN ({})
-             ORDER BY tgid, captured_ts_ns, start_addr",
-            tgid_list.join(",")
-        );
-
-        let df = match ctx.sql(&sql).await {
-            Ok(df) => df,
-            Err(_) => return Ok(std::collections::HashMap::new()),
-        };
-        let batches = df.collect().await?;
-
-        let mut grouped: std::collections::HashMap<u32, BTreeMap<u64, Vec<ProcMapSegment>>> =
-            std::collections::HashMap::new();
-
-        for batch in &batches {
-            for row in 0..batch.num_rows() {
-                let tgid = extract_u32(batch, "tgid", row);
-                let captured_ts_ns = extract_u64(batch, "captured_ts_ns", row);
-                let segment = ProcMapSegment {
-                    start_addr: extract_u64(batch, "start_addr", row),
-                    end_addr: extract_u64(batch, "end_addr", row),
-                    file_offset: extract_u64(batch, "file_offset", row),
-                    path: extract_string(batch, "path", row),
-                };
-
-                grouped
-                    .entry(tgid)
-                    .or_default()
-                    .entry(captured_ts_ns)
-                    .or_default()
-                    .push(segment);
-            }
-        }
-
-        let mut snapshots_by_tgid: std::collections::HashMap<u32, Vec<ProcMapSnapshot>> =
-            std::collections::HashMap::new();
-        for (tgid, snapshots) in grouped {
-            let ordered = snapshots
-                .into_iter()
-                .map(|(captured_ts_ns, segments)| ProcMapSnapshot {
-                    captured_ts_ns,
-                    segments,
-                })
-                .collect();
-            snapshots_by_tgid.insert(tgid, ordered);
-        }
-
-        Ok(snapshots_by_tgid)
-    }
-
     pub async fn query_event_flamegraph(
         start_ns: u64,
         end_ns: u64,
@@ -1580,45 +1476,12 @@ mod backend {
         }
 
         let sql = format!(
-            "SELECT tgid, ts_ns, stack_kind, stack_frames, stack_trace, proc_maps_snapshot
+            "SELECT stack_kind, stack_frames, stack_trace, proc_maps_snapshot
              FROM events
              WHERE {}",
             conditions.join(" AND ")
         );
-        let sql_without_inline_maps = format!(
-            "SELECT tgid, ts_ns, stack_kind, stack_frames, stack_trace
-             FROM events
-             WHERE {}",
-            conditions.join(" AND ")
-        );
-
-        // Older traces may not contain stack columns.
-        let df = match ctx.sql(&sql).await {
-            Ok(df) => df,
-            Err(_) => match ctx.sql(&sql_without_inline_maps).await {
-                Ok(df) => df,
-                Err(_) => {
-                    let legacy_sql = format!(
-                        "SELECT pid as tgid, ts_ns, CAST(NULL AS Utf8) as stack_kind, CAST(NULL AS Utf8) as stack_frames, stack_trace
-                         FROM events
-                         WHERE {}
-                           AND stack_trace IS NOT NULL
-                           AND stack_trace <> ''",
-                        conditions.join(" AND ")
-                    );
-                    match ctx.sql(&legacy_sql).await {
-                        Ok(df) => df,
-                        Err(_) => {
-                            return Ok(EventFlamegraphResponse {
-                                event_type,
-                                total_samples: 0,
-                                svg: None,
-                            });
-                        }
-                    }
-                }
-            },
-        };
+        let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
 
         let mut sampled_rows: Vec<SampledStackRow> = Vec::new();
@@ -1637,15 +1500,11 @@ mod backend {
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let tgid = extract_u32(batch, "tgid", row);
-                let ts_ns = extract_u64(batch, "ts_ns", row);
                 let stack_kind = extract_option_string(batch, "stack_kind", row);
                 let stack_frames = extract_option_string(batch, "stack_frames", row);
                 let stack_trace = extract_option_string(batch, "stack_trace", row);
                 let proc_maps_snapshot = extract_option_proc_maps_snapshot(batch, row);
                 let sampled_row = SampledStackRow {
-                    tgid,
-                    ts_ns,
                     stack_kind,
                     stack_frames,
                     stack_trace,
@@ -1666,17 +1525,6 @@ mod backend {
             }
         }
 
-        let user_tgids: HashSet<u32> = sampled_rows
-            .iter()
-            .filter(|row| {
-                matches!(row.stack_kind.as_deref(), Some("user") | Some("both"))
-                    && row.stack_frames.is_some()
-                    && row.proc_maps_snapshot.is_none()
-            })
-            .map(|row| row.tgid)
-            .collect();
-
-        let map_snapshots = load_proc_map_snapshots(ctx, &user_tgids).await?;
         let mut user_symbolizer = OfflineUserSymbolizer::new();
 
         let mut folded_counts: std::collections::HashMap<String, usize> =
@@ -1689,10 +1537,7 @@ mod backend {
                 (Some("user"), Some(frames_hex)) if !frames_hex.is_empty() => {
                     let frames = parse_stack_frames(frames_hex);
                     symbolize_user_frames(
-                        row.tgid,
-                        row.ts_ns,
                         &frames,
-                        &map_snapshots,
                         row.proc_maps_snapshot.as_deref(),
                         &mut user_symbolizer,
                     )
@@ -1701,10 +1546,7 @@ mod backend {
                 (Some("both"), Some(frames_hex)) if !frames_hex.is_empty() => {
                     let frames = parse_stack_frames(frames_hex);
                     let mut labels = symbolize_user_frames(
-                        row.tgid,
-                        row.ts_ns,
                         &frames,
-                        &map_snapshots,
                         row.proc_maps_snapshot.as_deref(),
                         &mut user_symbolizer,
                     )

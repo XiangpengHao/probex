@@ -21,7 +21,6 @@ parquet = { workspace = true }
 which = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
-    "rt",
     "rt-multi-thread",
     "net",
     "signal",

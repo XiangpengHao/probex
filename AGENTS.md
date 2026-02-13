@@ -18,3 +18,4 @@
 - Split modules by cognitive boundary; keep types with their implementations.
 - Do not add new dependency.
 - Prefer compact, information-dense summaries over tall cards; colocate related controls/stats and remove redundant panels.
+- We never care about compatibility. Focus on new code/feature/format only.

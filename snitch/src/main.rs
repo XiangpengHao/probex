@@ -123,7 +123,7 @@ use aya::{
     maps::{HashMap, MapData, PerCpuArray, RingBuf, StackTraceMap},
     programs::{
         TracePoint,
-        perf_event::{PerfEvent, PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent},
+        perf_event::{PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy, perf_sw_ids},
     },
     util::kernel_symbols,
 };
@@ -152,7 +152,6 @@ use tokio::{io::unix::AsyncFd, signal};
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
-const MAP_BATCH_SIZE: usize = 8_192;
 const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "snitch.sample_freq_hz";
 
 #[derive(Parser, Debug)]
@@ -799,119 +798,39 @@ struct MaterializedStack {
 type StackCacheKey = (Option<i32>, Option<i32>, Option<&'static str>);
 type StackTraceCache = std::collections::HashMap<StackCacheKey, MaterializedStack>;
 
-#[derive(Clone, Debug)]
-struct ProcMapSnapshotRecord {
-    tgid: u32,
-    captured_ts_ns: u64,
-    start_addr: u64,
-    end_addr: u64,
-    file_offset: u64,
-    path: String,
+type ProcMapsSnapshotIndex =
+    std::collections::HashMap<u32, std::collections::BTreeMap<u64, Arc<Vec<ProcMapInlineSegment>>>>;
+
+#[derive(Default)]
+struct ProcMapsSnapshotCollector {
+    snapshots: ProcMapsSnapshotIndex,
+    total_rows: usize,
 }
 
-fn create_maps_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("tgid", DataType::UInt32, false),
-        Field::new("captured_ts_ns", DataType::UInt64, false),
-        Field::new("start_addr", DataType::UInt64, false),
-        Field::new("end_addr", DataType::UInt64, false),
-        Field::new("file_offset", DataType::UInt64, false),
-        Field::new("path", DataType::Utf8, false),
-    ])
-}
-
-struct ProcMapsParquetWriter {
-    writer: ArrowWriter<File>,
-    schema: Arc<Schema>,
-    batch: Vec<ProcMapSnapshotRecord>,
-    total_written: usize,
-}
-
-impl ProcMapsParquetWriter {
-    fn new(path: &str) -> Result<Self> {
-        let schema = Arc::new(create_maps_schema());
-        let file =
-            File::create(path).with_context(|| format!("failed to create output file {}", path))?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
-        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
-            .with_context(|| "failed to create proc maps parquet writer")?;
-
-        Ok(Self {
-            writer,
-            schema,
-            batch: Vec::with_capacity(MAP_BATCH_SIZE),
-            total_written: 0,
-        })
+impl ProcMapsSnapshotCollector {
+    fn capture(&mut self, tgid: u32, captured_ts_ns: u64, maps: &[ProcMapEntry]) {
+        let segments = maps
+            .iter()
+            .map(|entry| ProcMapInlineSegment {
+                start_addr: entry.start,
+                end_addr: entry.end,
+                file_offset: entry.offset,
+                path: entry.path.to_string_lossy().to_string(),
+            })
+            .collect::<Vec<_>>();
+        self.total_rows += segments.len();
+        self.snapshots
+            .entry(tgid)
+            .or_default()
+            .insert(captured_ts_ns, Arc::new(segments));
     }
 
-    fn push(&mut self, record: ProcMapSnapshotRecord) -> Result<()> {
-        self.batch.push(record);
-        if self.batch.len() >= MAP_BATCH_SIZE {
-            self.flush_batch()?;
-        }
-        Ok(())
+    fn total_rows(&self) -> usize {
+        self.total_rows
     }
 
-    fn flush_batch(&mut self) -> Result<()> {
-        if self.batch.is_empty() {
-            return Ok(());
-        }
-
-        let batch_len = self.batch.len();
-        let mut tgid_builder = UInt32Builder::with_capacity(batch_len);
-        let mut captured_ts_builder = UInt64Builder::with_capacity(batch_len);
-        let mut start_builder = UInt64Builder::with_capacity(batch_len);
-        let mut end_builder = UInt64Builder::with_capacity(batch_len);
-        let mut offset_builder = UInt64Builder::with_capacity(batch_len);
-        let mut path_builder = StringBuilder::with_capacity(batch_len, batch_len * 48);
-
-        for record in self.batch.drain(..) {
-            tgid_builder.append_value(record.tgid);
-            captured_ts_builder.append_value(record.captured_ts_ns);
-            start_builder.append_value(record.start_addr);
-            end_builder.append_value(record.end_addr);
-            offset_builder.append_value(record.file_offset);
-            path_builder.append_value(record.path);
-        }
-
-        let columns: Vec<ArrayRef> = vec![
-            Arc::new(tgid_builder.finish()),
-            Arc::new(captured_ts_builder.finish()),
-            Arc::new(start_builder.finish()),
-            Arc::new(end_builder.finish()),
-            Arc::new(offset_builder.finish()),
-            Arc::new(path_builder.finish()),
-        ];
-
-        let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
-            .with_context(|| "failed to create proc maps record batch")?;
-        self.writer
-            .write(&record_batch)
-            .with_context(|| "failed to write proc maps record batch")?;
-
-        self.total_written += batch_len;
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<usize> {
-        self.flush_batch()?;
-        self.writer
-            .close()
-            .with_context(|| "failed to close proc maps writer")?;
-        Ok(self.total_written)
-    }
-}
-
-fn derive_maps_output_path(events_output_path: &str) -> String {
-    let path = Path::new(events_output_path);
-    if path.extension().is_some() {
-        path.with_extension("maps.parquet")
-            .to_string_lossy()
-            .to_string()
-    } else {
-        format!("{events_output_path}.maps.parquet")
+    fn snapshot_index(&self) -> &ProcMapsSnapshotIndex {
+        &self.snapshots
     }
 }
 
@@ -963,109 +882,28 @@ fn maybe_capture_proc_maps_snapshot(
     captured_ts_ns: u64,
     force_snapshot: bool,
     snapshot_cache: &mut std::collections::HashMap<u32, Vec<ProcMapEntry>>,
-    maps_writer: &mut ProcMapsParquetWriter,
-) -> Result<()> {
+    snapshot_collector: &mut ProcMapsSnapshotCollector,
+) {
     if tgid == 0 {
-        return Ok(());
+        return;
     }
     let maps = read_proc_maps(tgid);
     if maps.is_empty() {
-        return Ok(());
+        return;
     }
 
     let changed = snapshot_cache.get(&tgid) != Some(&maps);
     if !force_snapshot && !changed {
-        return Ok(());
+        return;
     }
 
-    for entry in &maps {
-        maps_writer.push(ProcMapSnapshotRecord {
-            tgid,
-            captured_ts_ns,
-            start_addr: entry.start,
-            end_addr: entry.end,
-            file_offset: entry.offset,
-            path: entry.path.to_string_lossy().to_string(),
-        })?;
-    }
+    snapshot_collector.capture(tgid, captured_ts_ns, &maps);
     snapshot_cache.insert(tgid, maps);
-    Ok(())
 }
-
-type ProcMapsSnapshotIndex =
-    std::collections::HashMap<u32, std::collections::BTreeMap<u64, Arc<Vec<ProcMapInlineSegment>>>>;
 
 fn row_requires_inline_proc_maps(stack_kind: Option<&str>, stack_frames: Option<&str>) -> bool {
     matches!(stack_kind, Some("user") | Some("both"))
         && stack_frames.is_some_and(|frames| !frames.is_empty())
-}
-
-fn load_proc_maps_snapshot_index(maps_output_path: &str) -> Result<ProcMapsSnapshotIndex> {
-    let file = File::open(maps_output_path)
-        .with_context(|| format!("failed to open proc maps file {}", maps_output_path))?;
-    let reader_builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .with_context(|| format!("failed to create reader for {}", maps_output_path))?;
-    let mut reader = reader_builder
-        .with_batch_size(MAP_BATCH_SIZE)
-        .build()
-        .with_context(|| format!("failed to build reader for {}", maps_output_path))?;
-
-    let mut grouped: std::collections::HashMap<u32, std::collections::BTreeMap<u64, Vec<_>>> =
-        std::collections::HashMap::new();
-    for batch in &mut reader {
-        let batch = batch.with_context(|| "failed to read proc maps batch")?;
-
-        let tgid_array = batch
-            .column_by_name("tgid")
-            .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
-            .ok_or_else(|| anyhow!("proc maps column tgid has unexpected type"))?;
-        let captured_ts_array = batch
-            .column_by_name("captured_ts_ns")
-            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| anyhow!("proc maps column captured_ts_ns has unexpected type"))?;
-        let start_array = batch
-            .column_by_name("start_addr")
-            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| anyhow!("proc maps column start_addr has unexpected type"))?;
-        let end_array = batch
-            .column_by_name("end_addr")
-            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| anyhow!("proc maps column end_addr has unexpected type"))?;
-        let file_offset_array = batch
-            .column_by_name("file_offset")
-            .and_then(|array| array.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| anyhow!("proc maps column file_offset has unexpected type"))?;
-        let path_array = batch
-            .column_by_name("path")
-            .and_then(|array| array.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| anyhow!("proc maps column path has unexpected type"))?;
-
-        for row_idx in 0..batch.num_rows() {
-            let segment = ProcMapInlineSegment {
-                start_addr: start_array.value(row_idx),
-                end_addr: end_array.value(row_idx),
-                file_offset: file_offset_array.value(row_idx),
-                path: path_array.value(row_idx).to_string(),
-            };
-            grouped
-                .entry(tgid_array.value(row_idx))
-                .or_default()
-                .entry(captured_ts_array.value(row_idx))
-                .or_default()
-                .push(segment);
-        }
-    }
-
-    Ok(grouped
-        .into_iter()
-        .map(|(tgid, snapshots)| {
-            let snapshots = snapshots
-                .into_iter()
-                .map(|(captured_ts_ns, segments)| (captured_ts_ns, Arc::new(segments)))
-                .collect();
-            (tgid, snapshots)
-        })
-        .collect())
 }
 
 fn find_inline_segments_for_event(
@@ -1417,11 +1255,9 @@ fn attach_cpu_sampler(ebpf: &mut aya::Ebpf, target_pid: u32, frequency_hz: u64) 
     program.load()?;
 
     program.attach(
-        PerfEventConfig::Software(SoftwareEvent::CpuClock),
-        PerfEventScope::OneProcess {
-            pid: target_pid,
-            cpu: None,
-        },
+        PerfTypeId::Software,
+        perf_sw_ids::PERF_COUNT_SW_CPU_CLOCK as u64,
+        PerfEventScope::OneProcessAnyCpu { pid: target_pid },
         SamplePolicy::Frequency(frequency_hz),
         true,
     )?;
@@ -1516,20 +1352,8 @@ async fn main() -> Result<()> {
     )))?;
 
     // Initialize eBPF logger (optional)
-    match aya_log::EbpfLogger::init(&mut ebpf) {
-        Err(e) => {
-            warn!("failed to initialize eBPF logger: {e}");
-        }
-        Ok(logger) => {
-            let mut logger = AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-            tokio::task::spawn(async move {
-                loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
-                }
-            });
-        }
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+        warn!("failed to initialize eBPF logger: {e}");
     }
 
     // Spawn child process with SIGSTOP
@@ -1635,9 +1459,7 @@ async fn main() -> Result<()> {
     // Create Parquet batch writer
     let mut writer = ParquetBatchWriter::new(&args.output, args.sample_freq)?;
     info!("Writing events to {}", args.output);
-    let maps_output_path = derive_maps_output_path(&args.output);
-    let mut maps_writer = ProcMapsParquetWriter::new(&maps_output_path)?;
-    info!("Writing proc map snapshots to {}", maps_output_path);
+    let mut snapshot_collector = ProcMapsSnapshotCollector::default();
 
     // Stack trace map for resolving stack ids into raw frame addresses.
     let stack_traces: StackTraceMap<_> = StackTraceMap::try_from(
@@ -1686,8 +1508,8 @@ async fn main() -> Result<()> {
                     event.ts_ns,
                     should_refresh,
                     &mut proc_map_snapshot_cache,
-                    &mut maps_writer,
-                )?;
+                    &mut snapshot_collector,
+                );
             }
         }
 
@@ -1699,8 +1521,8 @@ async fn main() -> Result<()> {
                 event.ts_ns,
                 true,
                 &mut proc_map_snapshot_cache,
-                &mut maps_writer,
-            )?;
+                &mut snapshot_collector,
+            );
             seen_tgids.insert(child_pid);
         }
 
@@ -1796,68 +1618,35 @@ async fn main() -> Result<()> {
 
     // Finish writing and close the Parquet file
     let total_events = writer.finish()?;
-    let total_maps = maps_writer.finish()?;
+    let total_maps = snapshot_collector.total_rows();
     let mut embedded_snapshot_rows = 0usize;
-    let mut removed_maps_file = false;
 
     if total_events > 0 && total_maps > 0 {
-        match load_proc_maps_snapshot_index(&maps_output_path).and_then(|snapshot_index| {
-            embed_proc_maps_snapshots_into_events_parquet(
-                &args.output,
-                &snapshot_index,
-                args.sample_freq,
-            )
-        }) {
+        match embed_proc_maps_snapshots_into_events_parquet(
+            &args.output,
+            snapshot_collector.snapshot_index(),
+            args.sample_freq,
+        ) {
             Ok(rows_with_snapshot) => {
                 embedded_snapshot_rows = rows_with_snapshot;
                 info!(
                     "Post-processing complete: embedded proc map snapshots into {} event rows",
                     rows_with_snapshot
                 );
-                match std::fs::remove_file(&maps_output_path) {
-                    Ok(()) => {
-                        removed_maps_file = true;
-                        info!(
-                            "Removed intermediate proc maps file after embedding: {}",
-                            maps_output_path
-                        );
-                    }
-                    Err(error) => warn!(
-                        "Embedded snapshots but failed to remove intermediate file {}: {}",
-                        maps_output_path, error
-                    ),
-                }
             }
             Err(error) => warn!(
-                "Failed to post-process inline proc map snapshots; keeping {}: {}",
-                maps_output_path, error
-            ),
-        }
-    } else if total_maps == 0 {
-        match std::fs::remove_file(&maps_output_path) {
-            Ok(()) => {
-                removed_maps_file = true;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                removed_maps_file = true;
-            }
-            Err(error) => warn!(
-                "No proc map rows captured, but failed to remove empty {}: {}",
-                maps_output_path, error
+                "Failed to post-process inline proc map snapshots: {}",
+                error
             ),
         }
     }
 
     info!("Done. Wrote {} events to {}", total_events, args.output);
     if total_maps > 0 {
-        if removed_maps_file {
-            info!(
-                "Captured {} proc map rows and embedded {} snapshots into {}",
-                total_maps, embedded_snapshot_rows, args.output
-            );
-        } else {
-            info!("Wrote {} proc map rows to {}", total_maps, maps_output_path);
-        }
+        info!(
+            "Captured {} proc map rows and embedded {} snapshots into {}",
+            total_maps, embedded_snapshot_rows, args.output
+        );
     }
 
     // Launch the viewer if we have events and --no-viewer wasn't specified

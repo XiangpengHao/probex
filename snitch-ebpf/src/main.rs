@@ -3,7 +3,7 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::{BPF_F_USER_STACK, BPF_RB_FORCE_WAKEUP},
+    bindings::{BPF_F_USER_STACK, BPF_RB_FORCE_WAKEUP, bpf_perf_event_data},
     helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_probe_read_user},
     macros::{map, perf_event, tracepoint},
     maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
@@ -118,7 +118,7 @@ fn capture_user_frames_fp(
     ctx: &PerfEventContext,
     frames: &mut [u64; MAX_CPU_SAMPLE_FRAMES],
 ) -> u16 {
-    let regs = unsafe { &(*ctx.ctx).regs };
+    let regs = unsafe { &(*(ctx.as_ptr() as *const bpf_perf_event_data)).regs };
 
     let mut depth = 0usize;
     let first_ip = regs.rip as u64;
