@@ -41,6 +41,9 @@ pub fn ProcessTimeline(
     on_select_flame_event_type: EventHandler<Option<String>>,
 ) -> Element {
     let mut collapsed_nodes = use_signal(HashSet::<u32>::new);
+    let process_bar_drag_state = use_signal(|| Option::<ProcessBarDragState>::None);
+    let process_bar_drag_preview = use_signal(|| Option::<ProcessBarDragPreview>::None);
+    let process_bar_width_px = use_signal(|| 0.0f64);
 
     let full_duration_ns = full_end_ns.saturating_sub(full_start_ns);
     let full_duration = full_duration_ns as f64;
@@ -140,6 +143,7 @@ pub fn ProcessTimeline(
     let has_read_stats = stats.read.count > 0;
     let has_write_stats = stats.write.count > 0;
     let has_mem_stats = stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0;
+    let active_process_bar_drag_preview = process_bar_drag_preview();
 
     rsx! {
         div { class: "bg-white border border-gray-200 rounded-lg p-2.5",
@@ -550,11 +554,92 @@ pub fn ProcessTimeline(
                                     }
                                 }
 
-                                div { class: "flex-1 relative h-5 bg-gray-100 rounded overflow-hidden",
+                                div {
+                                    class: "flex-1 relative h-5 bg-gray-100 rounded overflow-hidden",
+                                    onmounted: {
+                                        let mut process_bar_width_px = process_bar_width_px;
+                                        move |evt| async move {
+                                            if let Ok(rect) = evt.data().get_client_rect().await
+                                                && rect.width() > 0.0
+                                            {
+                                                process_bar_width_px.set(rect.width());
+                                            }
+                                        }
+                                    },
+                                    onmousedown: {
+                                        let mut process_bar_drag_state = process_bar_drag_state;
+                                        let mut process_bar_drag_preview = process_bar_drag_preview;
+                                        let process_bar_width_px = process_bar_width_px;
+                                        move |evt: MouseEvent| {
+                                            evt.prevent_default();
+                                            let bar_width = process_bar_width_px();
+                                            if bar_width <= 0.0 {
+                                                return;
+                                            }
+
+                                            let page_x = evt.page_coordinates().x;
+                                            let bar_left_page_x = page_x - evt.element_coordinates().x;
+
+                                            process_bar_drag_state.set(Some(ProcessBarDragState {
+                                                pid,
+                                                bar_left_page_x,
+                                                bar_width_px: bar_width,
+                                                anchor_page_x: page_x,
+                                            }));
+                                            process_bar_drag_preview.set(None);
+                                        }
+                                    },
+                                    onmousemove: {
+                                        let process_bar_drag_state = process_bar_drag_state;
+                                        let mut process_bar_drag_preview = process_bar_drag_preview;
+                                        move |evt: MouseEvent| {
+                                            let Some(drag_state) = process_bar_drag_state() else {
+                                                return;
+                                            };
+                                            if drag_state.pid != pid {
+                                                return;
+                                            }
+                                            let moved_px =
+                                                (evt.page_coordinates().x - drag_state.anchor_page_x)
+                                                    .abs();
+                                            if moved_px < PROCESS_BAR_SELECTION_THRESHOLD_PX {
+                                                return;
+                                            }
+                                            if let Some(preview) = build_process_bar_drag_preview(
+                                                drag_state,
+                                                evt.page_coordinates().x,
+                                                view_start_ns,
+                                                view_end_ns,
+                                            ) && process_bar_drag_preview() != Some(preview)
+                                            {
+                                                process_bar_drag_preview.set(Some(preview));
+                                            }
+                                        }
+                                    },
+                                    onmouseleave: {
+                                        let mut process_bar_drag_state = process_bar_drag_state;
+                                        let process_bar_drag_preview = process_bar_drag_preview;
+                                        move |_| {
+                                            if process_bar_drag_preview().is_none()
+                                                && process_bar_drag_state().map(|s| s.pid) == Some(pid)
+                                            {
+                                                process_bar_drag_state.set(None);
+                                            }
+                                        }
+                                    },
                                     if in_view {
                                         div {
                                             class: "absolute top-0 bottom-0 {bar_color} rounded",
                                             style: "left: {left_pct}%; width: {width_pct}%;",
+                                        }
+                                    }
+
+                                    if let Some(selection) = active_process_bar_drag_preview
+                                        .filter(|preview| preview.pid == pid)
+                                    {
+                                        div {
+                                            class: "absolute top-0 bottom-0 bg-blue-400/20 border border-blue-500/70 rounded-sm pointer-events-none z-[6]",
+                                            style: "left: {selection.start_pct}%; width: {(selection.end_pct - selection.start_pct).max(0.2)}%;",
                                         }
                                     }
 
@@ -568,8 +653,24 @@ pub fn ProcessTimeline(
 
                                     div {
                                         class: "absolute inset-0 cursor-pointer",
-                                        onclick: move |_| on_select_pid.call(pid),
-                                        ondoubleclick: move |_| on_focus_process.call((pid, process_start_ns, focus_end_ns)),
+                                        onclick: {
+                                            let mut process_bar_drag_state = process_bar_drag_state;
+                                            let mut process_bar_drag_preview = process_bar_drag_preview;
+                                            move |_| {
+                                                process_bar_drag_state.set(None);
+                                                process_bar_drag_preview.set(None);
+                                                on_select_pid.call(pid);
+                                            }
+                                        },
+                                        ondoubleclick: {
+                                            let mut process_bar_drag_state = process_bar_drag_state;
+                                            let mut process_bar_drag_preview = process_bar_drag_preview;
+                                            move |_| {
+                                                process_bar_drag_state.set(None);
+                                                process_bar_drag_preview.set(None);
+                                                on_focus_process.call((pid, process_start_ns, focus_end_ns));
+                                            }
+                                        },
                                     }
                                 }
 
@@ -609,6 +710,43 @@ pub fn ProcessTimeline(
                     }
                 })}
             }
+
+            // Continue selection while cursor leaves the process bar.
+            if active_process_bar_drag_preview.is_some() {
+                div {
+                    class: "fixed inset-0 z-50 cursor-ew-resize",
+                    onmousemove: {
+                        let process_bar_drag_state = process_bar_drag_state;
+                        let mut process_bar_drag_preview = process_bar_drag_preview;
+                        move |evt: MouseEvent| {
+                            let Some(drag_state) = process_bar_drag_state() else {
+                                return;
+                            };
+                            if let Some(preview) = build_process_bar_drag_preview(
+                                drag_state,
+                                evt.page_coordinates().x,
+                                view_start_ns,
+                                view_end_ns,
+                            ) && process_bar_drag_preview() != Some(preview)
+                            {
+                                process_bar_drag_preview.set(Some(preview));
+                            }
+                        }
+                    },
+                    onmouseup: {
+                        let mut process_bar_drag_state = process_bar_drag_state;
+                        let mut process_bar_drag_preview = process_bar_drag_preview;
+                        move |_| {
+                            if let Some(preview) = process_bar_drag_preview() {
+                                on_select_pid_option.call(Some(preview.pid));
+                                on_change_range.call((preview.start_ns, preview.end_ns, true));
+                            }
+                            process_bar_drag_state.set(None);
+                            process_bar_drag_preview.set(None);
+                        }
+                    },
+                }
+            }
         }
     }
 }
@@ -633,6 +771,25 @@ struct DragState {
     initial_start_offset: u64,
     /// View end offset (ns from full_start) at drag start.
     initial_end_offset: u64,
+}
+
+const PROCESS_BAR_SELECTION_THRESHOLD_PX: f64 = 3.0;
+
+#[derive(Clone, Copy)]
+struct ProcessBarDragState {
+    pid: u32,
+    bar_left_page_x: f64,
+    bar_width_px: f64,
+    anchor_page_x: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ProcessBarDragPreview {
+    pid: u32,
+    start_pct: f64,
+    end_pct: f64,
+    start_ns: u64,
+    end_ns: u64,
 }
 
 #[component]
@@ -1063,6 +1220,43 @@ fn build_overview_histogram_area_path(
 
     area_path.push_str("L100 100Z");
     Some(area_path)
+}
+
+fn build_process_bar_drag_preview(
+    drag_state: ProcessBarDragState,
+    current_page_x: f64,
+    view_start_ns: u64,
+    view_end_ns: u64,
+) -> Option<ProcessBarDragPreview> {
+    if drag_state.bar_width_px <= 0.0 || view_end_ns <= view_start_ns {
+        return None;
+    }
+
+    let view_duration_ns = view_end_ns - view_start_ns;
+    let anchor_frac =
+        ((drag_state.anchor_page_x - drag_state.bar_left_page_x) / drag_state.bar_width_px)
+            .clamp(0.0, 1.0);
+    let current_frac = ((current_page_x - drag_state.bar_left_page_x) / drag_state.bar_width_px)
+        .clamp(0.0, 1.0);
+
+    let start_frac = anchor_frac.min(current_frac);
+    let end_frac = anchor_frac.max(current_frac);
+    let start_ns = view_start_ns + ((view_duration_ns as f64) * start_frac).round() as u64;
+    let mut end_ns = view_start_ns + ((view_duration_ns as f64) * end_frac).round() as u64;
+    if end_ns <= start_ns {
+        end_ns = (start_ns + 1).min(view_end_ns);
+    }
+    if end_ns <= start_ns {
+        return None;
+    }
+
+    Some(ProcessBarDragPreview {
+        pid: drag_state.pid,
+        start_pct: start_frac * 100.0,
+        end_pct: end_frac * 100.0,
+        start_ns,
+        end_ns,
+    })
 }
 
 fn build_usage_paths(usage_points: &[f64]) -> (Option<String>, Option<String>) {
