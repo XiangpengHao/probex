@@ -18,7 +18,7 @@ use view_model::{
     ViewRange, build_flame_event_type_options, build_pid_event_summary, next_view_range,
 };
 
-use crate::server::{
+use crate::api::{
     EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
     ProcessLifetimesResponse, TraceSummary, get_event_flamegraph, get_event_type_counts,
     get_histogram, get_pid_event_type_counts, get_process_events, get_process_lifetimes,

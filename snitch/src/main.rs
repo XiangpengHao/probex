@@ -106,7 +106,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     ffi::CString,
     fs::File,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -149,6 +149,9 @@ use snitch_common::{
     STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
+
+mod viewer_backend;
+mod viewer_server;
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
@@ -1652,156 +1655,10 @@ async fn main() -> Result<()> {
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if total_events > 0
         && !args.no_viewer
-        && let Err(error) = launch_viewer(&args.output, args.port)
+        && let Err(error) = viewer_server::launch(&args.output, args.port).await
     {
         warn!("Skipping viewer launch: {error}");
     }
 
     Ok(())
-}
-
-/// Launch the snitch-viewer subprocess
-fn launch_viewer(parquet_file: &str, port: u16) -> Result<()> {
-    // Get absolute path to the parquet file
-    let parquet_path = Path::new(parquet_file)
-        .canonicalize()
-        .with_context(|| format!("failed to resolve path: {}", parquet_file))?;
-
-    // Resolve viewer binary from known locations or PATH.
-    let viewer_path = resolve_viewer_binary()?;
-    let viewer_dir = viewer_path
-        .parent()
-        .ok_or_else(|| anyhow!("failed to resolve viewer directory"))?;
-
-    info!("Viewer path: {}", viewer_path.display());
-    info!(
-        "Launching viewer at http://0.0.0.0:{} for {}",
-        port,
-        parquet_path.display()
-    );
-
-    // Spawn the viewer process
-    let mut cmd = std::process::Command::new(&viewer_path);
-    cmd.arg("--file")
-        .arg(&parquet_path)
-        .arg("--port")
-        .arg(port.to_string())
-        .current_dir(viewer_dir)
-        // `cargo run` sets CARGO_MANIFEST_DIR. If forwarded, Dioxus treats the app as unbundled
-        // and emits absolute source paths for assets (breaking browser loading).
-        .env_remove("CARGO_MANIFEST_DIR");
-
-    // Run in foreground so user can Ctrl-C to stop
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run snitch-viewer: {:?}", viewer_path))?;
-
-    if !status.success() {
-        warn!("snitch-viewer exited with status: {}", status);
-    }
-
-    Ok(())
-}
-
-fn resolve_viewer_binary() -> Result<PathBuf> {
-    if let Some(path) = find_existing_viewer_binary() {
-        return Ok(path);
-    }
-
-    Err(anyhow!(
-        "snitch-viewer not found (or missing fullstack web assets) in PATH/known locations; trace \
-was saved, but viewer was not launched. Build it with: dx bundle --platform server --fullstack \
---release -p snitch-viewer"
-    ))
-}
-
-fn find_existing_viewer_binary() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-
-    // Prefer Dioxus bundle outputs in the current workspace.
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(
-            cwd.join("target")
-                .join("dx")
-                .join("snitch-viewer")
-                .join("release")
-                .join("web")
-                .join("snitch-viewer"),
-        );
-        candidates.push(
-            cwd.join("target")
-                .join("dx")
-                .join("snitch-viewer")
-                .join("debug")
-                .join("web")
-                .join("snitch-viewer"),
-        );
-    }
-
-    // Then check colocated binaries for packaged distributions.
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(exe_dir.join("snitch-viewer"));
-        candidates.push(exe_dir.join("web").join("snitch-viewer"));
-        candidates.push(
-            exe_dir
-                .join("snitch-viewer")
-                .join("web")
-                .join("snitch-viewer"),
-        );
-    }
-
-    for path in candidates {
-        if path.is_file() && viewer_binary_is_runnable(&path) {
-            return Some(path);
-        }
-    }
-
-    which::which("snitch-viewer")
-        .ok()
-        .filter(|path| viewer_binary_is_runnable(path))
-}
-
-fn viewer_binary_is_runnable(path: &Path) -> bool {
-    let Some(viewer_dir) = path.parent() else {
-        return false;
-    };
-
-    let public_dir = viewer_dir.join("public");
-    if !public_dir.is_dir() || !public_dir.join("index.html").is_file() {
-        return false;
-    }
-
-    let mut has_js = false;
-    let mut has_wasm = false;
-    let mut stack = vec![public_dir];
-
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
-                match ext {
-                    "js" => has_js = true,
-                    "wasm" => has_wasm = true,
-                    _ => {}
-                }
-            }
-
-            if has_js && has_wasm {
-                return true;
-            }
-        }
-    }
-
-    false
 }

@@ -1,43 +1,9 @@
-//! Server-side functionality for snitch-viewer.
+//! Viewer backend functionality used by `snitch`.
 //!
-//! Uses DataFusion to query parquet trace files and exposes server functions
-//! for the Dioxus frontend.
+//! Uses DataFusion to query parquet trace files.
 
-use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Trace event structure matching the parquet schema from snitch.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TraceEvent {
-    pub event_type: String,
-    pub ts_ns: u64,
-    pub pid: u32,
-    pub tgid: u32,
-    pub process_name: Option<String>,
-    pub stack_id: Option<i32>,
-    pub kernel_stack_id: Option<i32>,
-    pub stack_kind: Option<String>,
-    pub stack_frames: Option<String>,
-    pub stack_trace: Option<String>,
-    pub cpu: u8,
-    // SchedSwitch fields
-    pub prev_pid: Option<u32>,
-    pub next_pid: Option<u32>,
-    pub prev_state: Option<i64>,
-    // ProcessFork fields
-    pub parent_pid: Option<u32>,
-    pub child_pid: Option<u32>,
-    // ProcessExit fields
-    pub exit_code: Option<i32>,
-    // PageFault fields
-    pub address: Option<u64>,
-    pub error_code: Option<u64>,
-    // Syscall fields
-    pub fd: Option<i64>,
-    pub count: Option<u64>,
-    pub ret: Option<i64>,
-}
 
 /// Histogram bucket for density visualization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,18 +46,6 @@ pub struct SyscallLatencyStats {
     pub munmap_free_bytes: u64,
 }
 
-/// Filters for querying events.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EventFilters {
-    pub event_type: Option<String>,
-    pub event_types: Vec<String>,
-    pub pid: Option<u32>,
-    pub start_ns: Option<u64>,
-    pub end_ns: Option<u64>,
-    pub limit: usize,
-    pub offset: usize,
-}
-
 /// Summary statistics about the trace.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TraceSummary {
@@ -101,13 +55,6 @@ pub struct TraceSummary {
     pub min_ts_ns: u64,
     pub max_ts_ns: u64,
     pub cpu_sample_frequency_hz: Option<u64>,
-}
-
-/// Response containing events and metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventsResponse {
-    pub events: Vec<TraceEvent>,
-    pub total_count: usize,
 }
 
 /// Process lifetime information for timeline visualization.
@@ -152,12 +99,11 @@ pub struct EventFlamegraphResponse {
     pub svg: Option<String>,
 }
 
-#[cfg(feature = "server")]
 mod backend {
     use super::*;
     use datafusion::arrow::array::{
         Array, Float32Array, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
-        StringViewArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
+        StringViewArray, StructArray, UInt32Array, UInt64Array,
     };
     use datafusion::prelude::*;
     use inferno::flamegraph;
@@ -346,18 +292,6 @@ mod backend {
             .unwrap_or(0)
     }
 
-    fn extract_u8(
-        batch: &datafusion::arrow::record_batch::RecordBatch,
-        col: &str,
-        row: usize,
-    ) -> u8 {
-        batch
-            .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<UInt8Array>())
-            .map(|arr| if arr.is_null(row) { 0 } else { arr.value(row) })
-            .unwrap_or(0)
-    }
-
     fn extract_option_u64(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
@@ -392,23 +326,6 @@ mod backend {
             })
     }
 
-    fn extract_option_i64(
-        batch: &datafusion::arrow::record_batch::RecordBatch,
-        col: &str,
-        row: usize,
-    ) -> Option<i64> {
-        batch
-            .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            })
-    }
-
     fn extract_option_i32(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
@@ -424,114 +341,6 @@ mod backend {
                     Some(arr.value(row))
                 }
             })
-    }
-
-    fn build_where_clause(filters: &EventFilters) -> String {
-        let mut conditions = Vec::new();
-
-        // Single event type filter (legacy)
-        if let Some(ref event_type) = filters.event_type
-            && !event_type.is_empty()
-        {
-            conditions.push(format!("event_type = '{}'", event_type.replace('\'', "''")));
-        }
-
-        // Multiple event types filter
-        if !filters.event_types.is_empty() {
-            let types: Vec<String> = filters
-                .event_types
-                .iter()
-                .map(|t| format!("'{}'", t.replace('\'', "''")))
-                .collect();
-            conditions.push(format!("event_type IN ({})", types.join(", ")));
-        }
-
-        // PID filter
-        if let Some(pid) = filters.pid {
-            conditions.push(format!("pid = {}", pid));
-        }
-
-        // Time range filter
-        if let Some(start) = filters.start_ns {
-            conditions.push(format!("ts_ns >= {}", start));
-        }
-        if let Some(end) = filters.end_ns {
-            conditions.push(format!("ts_ns <= {}", end));
-        }
-
-        if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        }
-    }
-
-    pub async fn query_events(
-        filters: EventFilters,
-    ) -> Result<EventsResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let ctx = get_ctx()?;
-
-        let where_clause = build_where_clause(&filters);
-
-        // Get total count
-        let count_sql = format!("SELECT COUNT(*) as cnt FROM events {}", where_clause);
-        let count_df = ctx.sql(&count_sql).await?;
-        let count_batches = count_df.collect().await?;
-        let total_count = count_batches
-            .first()
-            .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
-            .map(|arr| arr.value(0) as usize)
-            .unwrap_or(0);
-
-        // Query events with pagination
-        let limit = if filters.limit == 0 {
-            100
-        } else {
-            filters.limit
-        };
-        let sql = format!(
-            "SELECT * FROM events {} ORDER BY ts_ns ASC LIMIT {} OFFSET {}",
-            where_clause, limit, filters.offset
-        );
-
-        let df = ctx.sql(&sql).await?;
-        let batches = df.collect().await?;
-
-        let mut events = Vec::new();
-        for batch in &batches {
-            for row in 0..batch.num_rows() {
-                let event = TraceEvent {
-                    event_type: extract_string(batch, "event_type", row),
-                    ts_ns: extract_u64(batch, "ts_ns", row),
-                    pid: extract_u32(batch, "pid", row),
-                    tgid: extract_u32(batch, "tgid", row),
-                    process_name: extract_option_string(batch, "process_name", row),
-                    stack_id: extract_option_i32(batch, "stack_id", row),
-                    kernel_stack_id: extract_option_i32(batch, "kernel_stack_id", row),
-                    stack_kind: extract_option_string(batch, "stack_kind", row),
-                    stack_frames: extract_option_string(batch, "stack_frames", row),
-                    stack_trace: extract_option_string(batch, "stack_trace", row),
-                    cpu: extract_u8(batch, "cpu", row),
-                    prev_pid: extract_option_u32(batch, "prev_pid", row),
-                    next_pid: extract_option_u32(batch, "next_pid", row),
-                    prev_state: extract_option_i64(batch, "prev_state", row),
-                    parent_pid: extract_option_u32(batch, "parent_pid", row),
-                    child_pid: extract_option_u32(batch, "child_pid", row),
-                    exit_code: extract_option_i32(batch, "exit_code", row),
-                    address: extract_option_u64(batch, "address", row),
-                    error_code: extract_option_u64(batch, "error_code", row),
-                    fd: extract_option_i64(batch, "fd", row),
-                    count: extract_option_u64(batch, "count", row),
-                    ret: extract_option_i64(batch, "ret", row),
-                };
-                events.push(event);
-            }
-        }
-
-        Ok(EventsResponse {
-            events,
-            total_count,
-        })
     }
 
     pub async fn query_histogram(
@@ -1608,97 +1417,66 @@ mod backend {
     }
 }
 
-#[cfg(feature = "server")]
 pub async fn initialize(
     parquet_file: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     backend::initialize(parquet_file).await
 }
 
-#[server]
-pub async fn get_events(filters: EventFilters) -> Result<EventsResponse, ServerFnError> {
-    backend::query_events(filters)
-        .await
-        .map_err(|e| ServerFnError::new(format!("Query failed: {}", e)))
+pub async fn query_summary() -> Result<TraceSummary, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_summary().await
 }
 
-#[server]
-pub async fn get_summary() -> Result<TraceSummary, ServerFnError> {
-    backend::query_summary()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Summary query failed: {}", e)))
-}
-
-#[server]
-pub async fn get_histogram(
+pub async fn query_histogram(
     start_ns: u64,
     end_ns: u64,
     num_buckets: usize,
-) -> Result<HistogramResponse, ServerFnError> {
-    backend::query_histogram(start_ns, end_ns, num_buckets)
-        .await
-        .map_err(|e| ServerFnError::new(format!("Histogram query failed: {}", e)))
+) -> Result<HistogramResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_histogram(start_ns, end_ns, num_buckets).await
 }
 
-#[server]
-pub async fn get_event_type_counts(
+pub async fn query_event_type_counts(
     start_ns: Option<u64>,
     end_ns: Option<u64>,
-) -> Result<EventTypeCounts, ServerFnError> {
-    backend::query_event_type_counts(start_ns, end_ns)
-        .await
-        .map_err(|e| ServerFnError::new(format!("Event type counts query failed: {}", e)))
+) -> Result<EventTypeCounts, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_event_type_counts(start_ns, end_ns).await
 }
 
-#[server]
-pub async fn get_pid_event_type_counts(
+pub async fn query_pid_event_type_counts(
     pid: u32,
     start_ns: Option<u64>,
     end_ns: Option<u64>,
-) -> Result<EventTypeCounts, ServerFnError> {
-    backend::query_pid_event_type_counts(pid, start_ns, end_ns)
-        .await
-        .map_err(|e| ServerFnError::new(format!("PID event counts query failed: {}", e)))
+) -> Result<EventTypeCounts, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_pid_event_type_counts(pid, start_ns, end_ns).await
 }
 
-#[server]
-pub async fn get_syscall_latency_stats(
+pub async fn query_syscall_latency_stats(
     start_ns: u64,
     end_ns: u64,
     pid: Option<u32>,
-) -> Result<SyscallLatencyStats, ServerFnError> {
-    backend::query_syscall_latency_stats(start_ns, end_ns, pid)
-        .await
-        .map_err(|e| ServerFnError::new(format!("Syscall latency stats query failed: {}", e)))
+) -> Result<SyscallLatencyStats, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_syscall_latency_stats(start_ns, end_ns, pid).await
 }
 
-#[server]
-pub async fn get_process_lifetimes() -> Result<ProcessLifetimesResponse, ServerFnError> {
-    backend::query_process_lifetimes()
-        .await
-        .map_err(|e| ServerFnError::new(format!("Process lifetimes query failed: {}", e)))
+pub async fn query_process_lifetimes()
+-> Result<ProcessLifetimesResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_process_lifetimes().await
 }
 
-#[server]
-pub async fn get_process_events(
+pub async fn query_process_events(
     start_ns: u64,
     end_ns: u64,
     max_events_per_pid: usize,
-) -> Result<ProcessEventsResponse, ServerFnError> {
-    backend::query_process_events(start_ns, end_ns, max_events_per_pid)
-        .await
-        .map_err(|e| ServerFnError::new(format!("Process events query failed: {}", e)))
+) -> Result<ProcessEventsResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_process_events(start_ns, end_ns, max_events_per_pid).await
 }
 
-#[server]
-pub async fn get_event_flamegraph(
+pub async fn query_event_flamegraph(
     start_ns: u64,
     end_ns: u64,
     pid: Option<u32>,
     event_type: String,
     max_stacks: usize,
-) -> Result<EventFlamegraphResponse, ServerFnError> {
-    backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks)
-        .await
-        .map_err(|e| ServerFnError::new(format!("Event flamegraph query failed: {}", e)))
+) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks).await
 }

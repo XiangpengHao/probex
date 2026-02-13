@@ -5,15 +5,15 @@ use dioxus::prelude::*;
 use super::flamegraph::{
     EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
 };
+use crate::api::{
+    EventFlamegraphResponse, HistogramResponse, ProcessEventsResponse, ProcessLifetime,
+    SyscallLatencyStats, TraceSummary,
+};
 use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
     get_event_marker_color,
 };
 use crate::app::view_model::PidEventSummary;
-use crate::server::{
-    EventFlamegraphResponse, HistogramResponse, ProcessEventsResponse, ProcessLifetime,
-    SyscallLatencyStats, TraceSummary,
-};
 
 #[derive(Clone, PartialEq)]
 pub struct ProcessTimelineData {

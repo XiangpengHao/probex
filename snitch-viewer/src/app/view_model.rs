@@ -1,4 +1,4 @@
-use crate::server::{EventTypeCounts, TraceSummary};
+use crate::api::{EventTypeCounts, TraceSummary};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewRange {

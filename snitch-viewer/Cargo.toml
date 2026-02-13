@@ -11,9 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 dioxus = { workspace = true, features = [
-    "fullstack",
-    "asset",
+    "web",
     "launch",
+    "asset",
     "macro",
     "hooks",
     "signals",
@@ -21,18 +21,5 @@ dioxus = { workspace = true, features = [
     "document",
 ] }
 serde = { workspace = true, features = ["derive"] }
-clap = { workspace = true, features = ["derive", "help", "env"] }
 log.workspace = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
-datafusion.workspace = true
-parquet.workspace = true
-env_logger.workspace = true
-inferno = "0.12"
-wholesym = "0.8.1"
-
-[features]
-default = []
-server = ["dioxus/server"]
-web = ["dioxus/web"]
+gloo-net = "0.6"

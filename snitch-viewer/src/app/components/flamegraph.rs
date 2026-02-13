@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
+use crate::api::EventFlamegraphResponse;
 use crate::app::formatting::format_duration_short;
-use crate::server::EventFlamegraphResponse;
 
 #[derive(Clone, PartialEq)]
 pub struct FlamegraphCardSelection {

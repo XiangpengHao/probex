@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
+use crate::api::TraceSummary;
 use crate::app::formatting::format_duration;
-use crate::server::TraceSummary;
 
 #[component]
 pub fn ViewerHeader(summary: Option<TraceSummary>) -> Element {
