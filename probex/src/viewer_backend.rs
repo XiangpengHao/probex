@@ -959,7 +959,8 @@ mod backend {
         end_ns: u64,
         max_events_per_pid: usize,
     ) -> BackendResult<ProcessEventsResponse> {
-        const CPU_SAMPLE_BUCKETS: usize = 600;
+        const CPU_SAMPLE_BUCKETS_MAX: usize = 600;
+        const CPU_SAMPLE_TARGET_SAMPLES_PER_BUCKET: f64 = 3.0;
 
         if end_ns < start_ns {
             return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
@@ -989,8 +990,20 @@ mod backend {
         let mut cpu_sample_counts_by_pid: std::collections::HashMap<u32, Vec<u16>> =
             std::collections::HashMap::new();
 
+        let sample_frequency_hz = TRACE_FILE_METADATA
+            .get()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "trace metadata not initialized"))?
+            .cpu_sample_frequency_hz;
         let range_ns = end_ns.saturating_sub(start_ns).max(1);
-        let bucket_size_ns = range_ns.div_ceil(CPU_SAMPLE_BUCKETS as u64).max(1);
+        let expected_samples_total =
+            (sample_frequency_hz as f64) * (range_ns as f64 / 1_000_000_000.0);
+        let max_buckets_by_density =
+            ((expected_samples_total / CPU_SAMPLE_TARGET_SAMPLES_PER_BUCKET).floor() as usize)
+                .max(1);
+        let cpu_sample_bucket_count = max_buckets_by_density.min(CPU_SAMPLE_BUCKETS_MAX);
+        let bucket_size_ns = range_ns
+            .div_ceil(cpu_sample_bucket_count as u64)
+            .max(1);
 
         let mut rng_state = {
             use std::collections::hash_map::DefaultHasher;
@@ -1011,12 +1024,12 @@ mod backend {
 
                 if event_type == "cpu_sample" {
                     let mut bucket_idx = ts_ns.saturating_sub(start_ns) / bucket_size_ns;
-                    if bucket_idx >= CPU_SAMPLE_BUCKETS as u64 {
-                        bucket_idx = (CPU_SAMPLE_BUCKETS - 1) as u64;
+                    if bucket_idx >= cpu_sample_bucket_count as u64 {
+                        bucket_idx = (cpu_sample_bucket_count - 1) as u64;
                     }
                     let counts = cpu_sample_counts_by_pid
                         .entry(pid)
-                        .or_insert_with(|| vec![0u16; CPU_SAMPLE_BUCKETS]);
+                        .or_insert_with(|| vec![0u16; cpu_sample_bucket_count]);
                     let bucket = &mut counts[bucket_idx as usize];
                     *bucket = bucket.saturating_add(1);
                 }
@@ -1047,7 +1060,7 @@ mod backend {
         Ok(ProcessEventsResponse {
             events_by_pid,
             cpu_sample_counts_by_pid,
-            cpu_sample_bucket_count: CPU_SAMPLE_BUCKETS,
+            cpu_sample_bucket_count,
         })
     }
 

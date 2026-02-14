@@ -105,13 +105,9 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {bind_addr}"))?;
 
-    spawn_browser_open(primary_url.clone());
-
     axum::serve(listener, app.into_make_service())
         .with_graceful_shutdown(async {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                log::info!("Received Ctrl-C, shutting down viewer server");
-            }
+            let _ = tokio::signal::ctrl_c().await;
         })
         .await
         .with_context(|| "viewer server exited unexpectedly")?;
@@ -271,19 +267,3 @@ fn detect_hostname() -> Option<String> {
     None
 }
 
-fn spawn_browser_open(url: String) {
-    tokio::spawn(async move {
-        // Allow the listener to start accepting before opening the browser.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if let Err(error) = open_url_in_default_browser(&url) {
-            log::debug!("Unable to open browser at {url}: {error}");
-        }
-    });
-}
-
-fn open_url_in_default_browser(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-}

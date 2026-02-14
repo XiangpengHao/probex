@@ -131,13 +131,14 @@ fn bpf_target_arch() -> anyhow::Result<String> {
 
 fn ensure_frontend_bundle() -> anyhow::Result<()> {
     println!("cargo:rerun-if-changed=assets/viewer");
-    for path in [
+    let viewer_source_paths = [
         "../probex-viewer/Cargo.toml",
         "../probex-viewer/Dioxus.toml",
         "../probex-viewer/tailwind.css",
         "../probex-viewer/src",
         "../probex-viewer/assets",
-    ] {
+    ];
+    for path in &viewer_source_paths {
         println!("cargo:rerun-if-changed={path}");
     }
     println!("cargo:rerun-if-env-changed=PROBEX_SKIP_FRONTEND_BUNDLE");
@@ -153,7 +154,23 @@ fn ensure_frontend_bundle() -> anyhow::Result<()> {
     let force_bundle = std::env::var("PROBEX_FORCE_FRONTEND_BUNDLE").as_deref() == Ok("1");
 
     if !force_bundle && embedded_index.is_file() {
-        return Ok(());
+        // Check if any source file is newer than the embedded bundle
+        let embedded_mtime = fs::metadata(&embedded_index)
+            .and_then(|m| m.modified())
+            .ok();
+
+        if let Some(embedded_mtime) = embedded_mtime {
+            let needs_rebuild = viewer_source_paths.iter().any(|path| {
+                let full_path = manifest_dir.join(path);
+                newest_mtime(&full_path)
+                    .map(|src_mtime| src_mtime > embedded_mtime)
+                    .unwrap_or(false)
+            });
+
+            if !needs_rebuild {
+                return Ok(());
+            }
+        }
     }
 
     if std::env::var("PROBEX_SKIP_FRONTEND_BUNDLE").as_deref() == Ok("1") {
@@ -263,6 +280,29 @@ fn sync_frontend_assets(source_dir: &Path, target_dir: &Path) -> anyhow::Result<
         )
     })?;
     Ok(())
+}
+
+fn newest_mtime(path: &Path) -> Option<std::time::SystemTime> {
+    if path.is_file() {
+        return fs::metadata(path).and_then(|m| m.modified()).ok();
+    }
+
+    if path.is_dir() {
+        let mut newest: Option<std::time::SystemTime> = None;
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if let Some(mtime) = newest_mtime(&entry.path()) {
+                    newest = Some(match newest {
+                        Some(current) if current >= mtime => current,
+                        _ => mtime,
+                    });
+                }
+            }
+        }
+        return newest;
+    }
+
+    None
 }
 
 fn copy_dir_recursive(source_dir: &Path, target_dir: &Path) -> anyhow::Result<()> {

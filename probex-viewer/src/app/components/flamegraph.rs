@@ -103,9 +103,25 @@ pub fn EventFlamegraphCard(
 
             if event_type.is_empty() {
                 div { class: "text-xs text-gray-400", "Select an event type to build a flamegraph for the current scope" }
-            }
-
-            if !event_type.is_empty() && loading {
+            } else if !framed_svg_doc.is_empty() {
+                // Show existing flamegraph with loading overlay when updating
+                div { class: "relative w-full border border-gray-100 rounded bg-white overflow-hidden",
+                    iframe {
+                        class: "w-full block border-0 bg-white box-border",
+                        style: "{iframe_style}",
+                        srcdoc: "{framed_svg_doc}",
+                    }
+                    if loading {
+                        div { class: "absolute inset-0 bg-white/70 flex items-center justify-center",
+                            div { class: "flex items-center gap-2 text-xs text-gray-600 bg-white px-3 py-2 rounded shadow-sm border border-gray-200",
+                                span { class: "inline-block w-3 h-3 rounded-full border-2 border-gray-300 border-t-blue-500 animate-spin" }
+                                span { "Updating flamegraph..." }
+                            }
+                        }
+                    }
+                }
+            } else if loading {
+                // Initial load with no existing data
                 div { class: "w-full border border-gray-100 rounded bg-white p-3 space-y-2",
                     div { class: "flex items-center gap-2 text-xs text-gray-500",
                         span { class: "inline-block w-3 h-3 rounded-full border-2 border-gray-300 border-t-blue-500 animate-spin" }
@@ -113,20 +129,8 @@ pub fn EventFlamegraphCard(
                     }
                     div { class: "h-20 rounded bg-gray-100 animate-pulse" }
                 }
-            } else if !event_type.is_empty() && total == 0 {
+            } else if total == 0 {
                 div { class: "text-xs text-gray-400", "No stack samples in current scope" }
-            } else if !event_type.is_empty() {
-                if framed_svg_doc.is_empty() {
-                    div { class: "text-xs text-gray-400", "Flamegraph rendering returned empty SVG" }
-                } else {
-                    div { class: "w-full border border-gray-100 rounded bg-white overflow-hidden",
-                        iframe {
-                            class: "w-full block border-0 bg-white box-border",
-                            style: "{iframe_style}",
-                            srcdoc: "{framed_svg_doc}",
-                        }
-                    }
-                }
             }
         }
     }

@@ -130,7 +130,7 @@ use aya::{
     util::kernel_symbols,
 };
 use clap::{ArgGroup, Parser};
-use log::{debug, info, warn};
+use log::{debug, info};
 use nix::{
     sys::{
         signal::{Signal, kill},
@@ -144,11 +144,10 @@ use parquet::{
     file::{metadata::KeyValue, properties::WriterProperties},
 };
 use probex_common::{
-    CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
-    CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
-    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType,
-    MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH,
-    STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STATS_LEN,
+    CpuSampleEvent, EventHeader, EventType, MAX_CPU_SAMPLE_FRAMES, PageFaultEvent,
+    ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER,
+    SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
@@ -1495,7 +1494,7 @@ fn attach_tracepoint(
     program
         .attach(category, name)
         .with_context(|| format!("failed to attach {}:{}", category, name))?;
-    info!("Attached tracepoint {}:{}", category, name);
+    debug!("Attached tracepoint {}:{}", category, name);
     Ok(())
 }
 
@@ -1518,7 +1517,7 @@ fn attach_cpu_sampler(ebpf: &mut aya::Ebpf, target_pid: u32, frequency_hz: u64) 
         true,
     )?;
 
-    info!(
+    debug!(
         "Attached CPU sampler at {} Hz for pid {} (inherit=true)",
         frequency_hz, target_pid
     );
@@ -1567,7 +1566,7 @@ fn resolve_privilege_drop_target() -> Result<Option<PrivilegeDropTarget>> {
     match (sudo_uid, sudo_gid) {
         (Some(uid), Some(gid)) => Ok(Some(PrivilegeDropTarget { uid, gid })),
         (None, None) => {
-            warn!(
+            debug!(
                 "running as root without SUDO_UID/SUDO_GID; staying root for runtime and output files"
             );
             Ok(None)
@@ -1700,7 +1699,7 @@ async fn main() -> Result<()> {
 
     // Initialize eBPF logger (optional)
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
-        warn!("failed to initialize eBPF logger: {e}");
+        debug!("failed to initialize eBPF logger: {e}");
     }
 
     // Spawn child process with SIGSTOP
@@ -1804,7 +1803,7 @@ async fn main() -> Result<()> {
 
     if let Some(target) = privilege_drop_target {
         drop_process_privileges(target).context("failed to drop runtime privileges")?;
-        info!(
+        debug!(
             "Dropped privileges to uid={}, gid={} after eBPF setup",
             target.uid, target.gid
         );
@@ -1813,11 +1812,11 @@ async fn main() -> Result<()> {
     // Resume child process
     kill(child_pid, Signal::SIGCONT)
         .with_context(|| format!("failed to resume child process {}", child_pid))?;
-    info!("Resumed child process {}", child_pid);
+    debug!("Resumed child process {}", child_pid);
 
     // Create Parquet batch writer
     let mut writer = ParquetBatchWriter::new(&args.output, args.sample_freq)?;
-    info!("Writing events to {}", args.output);
+    debug!("Writing events to {}", args.output);
     let mut snapshot_collector = ProcMapsSnapshotCollector::default();
 
     // Stack trace map for resolving stack ids into raw frame addresses.
@@ -1831,7 +1830,7 @@ async fn main() -> Result<()> {
     )?;
     let kernel_syms = kernel_symbols().ok();
     if kernel_syms.is_none() {
-        warn!("kernel symbols unavailable; kernel stack frames will be shown as raw addresses");
+        debug!("kernel symbols unavailable; kernel stack frames will be shown as raw addresses");
     }
 
     // Get ring buffer
@@ -1889,7 +1888,6 @@ async fn main() -> Result<()> {
     };
 
     // Event loop
-    info!("Starting event loop...");
 
     loop {
         tokio::select! {
@@ -1898,8 +1896,8 @@ async fn main() -> Result<()> {
                 match result {
                     Ok(Ok(WaitStatus::Exited(_, _))) | Ok(Ok(WaitStatus::Signaled(_, _, _))) => {}
                     Ok(Ok(_)) => {}
-                    Ok(Err(err)) => warn!("failed to wait on child process {}: {err}", child_pid),
-                    Err(err) => warn!("wait task failed for child process {}: {err}", child_pid),
+                    Ok(Err(err)) => debug!("failed to wait on child process {}: {err}", child_pid),
+                    Err(err) => debug!("wait task failed for child process {}: {err}", child_pid),
                 }
 
                 // Drain any remaining events
@@ -1943,49 +1941,33 @@ async fn main() -> Result<()> {
 
     match read_cpu_sample_stats(&cpu_sample_stats) {
         Ok(stats) => {
-            let callback_total = stats[CPU_SAMPLE_STAT_CALLBACK_TOTAL];
-            let filtered = stats[CPU_SAMPLE_STAT_FILTERED_NOT_TRACED];
             let emitted = stats[CPU_SAMPLE_STAT_EMITTED];
             let dropped = stats[CPU_SAMPLE_STAT_RINGBUF_DROPPED];
-            let accepted = callback_total.saturating_sub(filtered);
-            let drop_pct = if accepted == 0 {
-                0.0
-            } else {
-                (dropped as f64) * 100.0 / (accepted as f64)
-            };
-            info!(
-                "CPU sampler stats: callbacks={}, filtered_not_traced={}, accepted={}, emitted={}, dropped_ringbuf={} ({:.2}%), user_stack={}, kernel_stack={}, no_stack={}",
-                callback_total,
-                filtered,
-                accepted,
-                emitted,
-                dropped,
-                drop_pct,
-                stats[CPU_SAMPLE_STAT_USER_STACK],
-                stats[CPU_SAMPLE_STAT_KERNEL_STACK],
-                stats[CPU_SAMPLE_STAT_NO_STACK],
-            );
             if dropped > 0 {
-                warn!(
-                    "Detected {} cpu_sample drops due to ringbuf reservation failure (traced samples only)",
-                    dropped
+                let drop_pct = (dropped as f64) * 100.0 / ((emitted + dropped) as f64);
+                info!(
+                    "Captured {} CPU samples ({} dropped, {:.1}% loss)",
+                    emitted, dropped, drop_pct
                 );
+            } else {
+                info!("Captured {} CPU samples", emitted);
             }
         }
-        Err(error) => warn!("Failed to read CPU sampler stats: {error}"),
+        Err(error) => debug!("Failed to read CPU sampler stats: {error}"),
     }
 
     // Finish writing and close the Parquet file
     let total_events = writer.finish()?;
     let total_maps = snapshot_collector.total_rows();
 
+    info!("Symbolizing stack traces (this may take a few seconds)...");
     let finalization_stats = symbolize_stack_traces_into_events_parquet(
         &args.output,
         snapshot_collector.snapshot_index(),
         args.sample_freq,
     )
     .await?;
-    info!(
+    debug!(
         "Post-processing complete: rows={}, symbolized_user_rows={}, symbolized_mixed_rows={}, mapped_fallback_frames={}, raw_fallback_frames={}",
         finalization_stats.rewritten_rows,
         finalization_stats.symbolized_user_rows,
@@ -1994,10 +1976,8 @@ async fn main() -> Result<()> {
         finalization_stats.raw_fallback_frames,
     );
 
-    info!("Done. Wrote {} events to {}", total_events, args.output);
-    if total_maps > 0 {
-        info!("Captured {} proc map rows while tracing", total_maps);
-    }
+    info!("Wrote {} events to {}", total_events, args.output);
+    debug!("Captured {} proc map rows while tracing", total_maps);
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if total_events > 0 && !args.no_viewer {
