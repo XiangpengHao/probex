@@ -34,6 +34,8 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "net",
     "signal",
+    "process",
+    "time",
 ] }
 datafusion = { workspace = true }
 inferno = "0.12"

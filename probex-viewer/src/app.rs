@@ -20,9 +20,10 @@ use view_model::{
 
 use crate::api::{
     EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetimesResponse, TraceSummary, get_event_flamegraph, get_event_type_counts,
-    get_histogram, get_pid_event_type_counts, get_process_events, get_process_lifetimes,
-    get_summary, get_syscall_latency_stats,
+    ProcessLifetimesResponse, StartTraceRequest, TraceRunStatus, TraceSummary,
+    get_event_flamegraph, get_event_type_counts, get_histogram, get_pid_event_type_counts,
+    get_process_events, get_process_lifetimes, get_summary, get_syscall_latency_stats,
+    get_trace_run_status, load_trace_file, start_trace_run, stop_trace_run,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -61,8 +62,51 @@ fn TraceViewer() -> Element {
     let mut enabled_event_types = use_signal(HashSet::<String>::new);
     let mut selected_pid = use_signal(|| Option::<u32>::None);
     let mut selected_flame_event_type = use_signal(|| Some("cpu_sample".to_string()));
+    let mut reload_nonce = use_signal(|| 0u64);
+
+    let mut trace_program = use_signal(String::new);
+    let mut trace_args = use_signal(String::new);
+    let mut trace_output = use_signal(|| "trace.parquet".to_string());
+    let mut trace_sample_freq = use_signal(|| "999".to_string());
+    let mut trace_run_status = use_signal(|| TraceRunStatus::Idle);
+    let mut trace_status_sequence = use_signal(|| 0u64);
+    let trace_last_loaded_run_id = use_signal(|| Option::<u64>::None);
+    let mut trace_error = use_signal(|| Option::<String>::None);
+    let mut trace_poller_active = use_signal(|| false);
 
     use_resource(move || async move {
+        match get_trace_run_status(None, Some(0)).await {
+            Ok(response) => {
+                trace_status_sequence.set(response.sequence);
+                trace_run_status.set(response.status.clone());
+                if matches!(response.status, TraceRunStatus::Running { .. })
+                    && !trace_poller_active()
+                {
+                    trace_poller_active.set(true);
+                    spawn_trace_status_poller(
+                        trace_status_sequence,
+                        trace_run_status,
+                        trace_last_loaded_run_id,
+                        trace_error,
+                        trace_poller_active,
+                        summary,
+                        histogram,
+                        selected_pid_event_counts,
+                        syscall_latency_stats,
+                        event_flamegraph,
+                        process_lifetimes,
+                        process_events,
+                        selected_pid,
+                        reload_nonce,
+                    );
+                }
+            }
+            Err(error) => trace_error.set(Some(format!("Failed to query trace status: {error}"))),
+        }
+    });
+
+    use_resource(move || async move {
+        let _refresh = reload_nonce();
         match get_summary().await {
             Ok(s) => {
                 let Some(range) = ViewRange::new(s.min_ts_ns, s.max_ts_ns) else {
@@ -85,6 +129,7 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
+        let _refresh = reload_nonce();
         match get_process_lifetimes().await {
             Ok(lifetimes) => process_lifetimes.set(Some(lifetimes)),
             Err(e) => log::error!("Process lifetimes error: {}", e),
@@ -92,6 +137,7 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
+        let _refresh = reload_nonce();
         if let Some(s) = summary() {
             match get_histogram(s.min_ts_ns, s.max_ts_ns, HISTOGRAM_BUCKETS).await {
                 Ok(data) => histogram.set(Some(data)),
@@ -101,6 +147,7 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
+        let _refresh = reload_nonce();
         let Some(range) = view_range() else {
             return;
         };
@@ -112,6 +159,7 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
+        let _refresh = reload_nonce();
         let Some(range) = view_range() else {
             return;
         };
@@ -140,6 +188,7 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
+        let _refresh = reload_nonce();
         let Some(range) = view_range() else {
             return;
         };
@@ -158,6 +207,7 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
+        let _refresh = reload_nonce();
         let Some(range) = view_range() else {
             return;
         };
@@ -182,6 +232,33 @@ fn TraceViewer() -> Element {
         &pid_summary,
         selected_flame_event_type_value.as_deref(),
     );
+    let trace_status_text = match trace_run_status() {
+        TraceRunStatus::Idle => "Idle".to_string(),
+        TraceRunStatus::Running { run_id, .. } => format!("Running (#{run_id})"),
+        TraceRunStatus::Finished {
+            run_id,
+            success,
+            exit_code,
+            ..
+        } => {
+            if success {
+                format!("Finished (#{run_id}, exit {exit_code})")
+            } else {
+                format!("Failed (#{run_id}, exit {exit_code})")
+            }
+        }
+    };
+    let is_trace_running = matches!(trace_run_status(), TraceRunStatus::Running { .. });
+    let start_button_class = if is_trace_running {
+        "px-2 py-1 rounded border border-gray-200 bg-gray-100 text-gray-400 text-xs cursor-not-allowed"
+    } else {
+        "px-2 py-1 rounded border border-blue-200 bg-blue-50 text-blue-700 text-xs cursor-pointer hover:bg-blue-100 hover:border-blue-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
+    };
+    let stop_button_class = if is_trace_running {
+        "px-2 py-1 rounded border border-red-200 bg-red-50 text-red-700 text-xs cursor-pointer hover:bg-red-100 hover:border-red-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300"
+    } else {
+        "px-2 py-1 rounded border border-gray-200 bg-gray-100 text-gray-400 text-xs cursor-not-allowed"
+    };
 
     rsx! {
         ViewerHeader {
@@ -191,6 +268,215 @@ fn TraceViewer() -> Element {
         div { class: "w-full px-3 sm:px-4 lg:px-6 py-3 space-y-2",
             if let Some(err) = error_msg() {
                 div { class: "bg-red-50 border border-red-200 text-red-700 px-3 py-2 rounded-lg text-xs", "{err}" }
+            }
+            div { class: "bg-white border border-gray-200 rounded-lg px-3 py-2 space-y-2",
+                div { class: "flex items-center justify-between gap-2 flex-wrap",
+                    h2 { class: "text-xs font-semibold text-gray-700", "Trace Command" }
+                    div { class: "flex items-center gap-1.5",
+                        if is_trace_running {
+                            span { class: "inline-block h-2.5 w-2.5 rounded-full border-2 border-blue-300 border-t-blue-600 animate-spin" }
+                        }
+                        span { class: if is_trace_running { "text-[11px] text-blue-700" } else { "text-[11px] text-gray-500" }, "{trace_status_text}" }
+                    }
+                }
+                div { class: "grid grid-cols-1 lg:grid-cols-4 gap-2",
+                    input {
+                        class: "px-2 py-1 border border-gray-200 rounded text-xs bg-white",
+                        r#type: "text",
+                        value: "{trace_program}",
+                        placeholder: "Program (e.g. sleep)",
+                        oninput: move |evt| trace_program.set(evt.value()),
+                    }
+                    input {
+                        class: "px-2 py-1 border border-gray-200 rounded text-xs bg-white",
+                        r#type: "text",
+                        value: "{trace_args}",
+                        placeholder: "Args (space-separated, e.g. 5)",
+                        oninput: move |evt| trace_args.set(evt.value()),
+                    }
+                    input {
+                        class: "px-2 py-1 border border-gray-200 rounded text-xs bg-white",
+                        r#type: "text",
+                        value: "{trace_output}",
+                        placeholder: "Output parquet (e.g. trace.parquet)",
+                        oninput: move |evt| trace_output.set(evt.value()),
+                    }
+                    input {
+                        class: "px-2 py-1 border border-gray-200 rounded text-xs bg-white",
+                        r#type: "number",
+                        min: "1",
+                        value: "{trace_sample_freq}",
+                        placeholder: "Sample Hz",
+                        oninput: move |evt| trace_sample_freq.set(evt.value()),
+                    }
+                }
+                div { class: "flex items-center gap-2 flex-wrap",
+                    button {
+                        class: "{start_button_class}",
+                        disabled: is_trace_running,
+                        onclick: move |_| {
+                            if is_trace_running {
+                                return;
+                            }
+                            let parsed_sample = match trace_sample_freq().trim().parse::<u64>() {
+                                Ok(v) if v > 0 => v,
+                                _ => {
+                                    trace_error.set(Some("Sample Hz must be a positive integer".to_string()));
+                                    return;
+                                }
+                            };
+                            let program = trace_program().trim().to_string();
+                            if program.is_empty() {
+                                trace_error.set(Some("Program must not be empty".to_string()));
+                                return;
+                            }
+                            let output_parquet = trace_output().trim().to_string();
+                            if output_parquet.is_empty() {
+                                trace_error.set(Some("Output parquet must not be empty".to_string()));
+                                return;
+                            }
+                            let args = trace_args()
+                                .split_whitespace()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>();
+                            trace_error.set(None);
+                            spawn(async move {
+                                match start_trace_run(StartTraceRequest {
+                                    program,
+                                    args,
+                                    output_parquet,
+                                    sample_freq_hz: parsed_sample,
+                                }).await {
+                                    Ok(response) => {
+                                        trace_status_sequence.set(response.sequence);
+                                        let status = response.status;
+                                        let should_poll = matches!(status, TraceRunStatus::Running { .. });
+                                        trace_run_status.set(status);
+                                        if should_poll && !trace_poller_active() {
+                                            trace_poller_active.set(true);
+                                            spawn_trace_status_poller(
+                                                trace_status_sequence,
+                                                trace_run_status,
+                                                trace_last_loaded_run_id,
+                                                trace_error,
+                                                trace_poller_active,
+                                                summary,
+                                                histogram,
+                                                selected_pid_event_counts,
+                                                syscall_latency_stats,
+                                                event_flamegraph,
+                                                process_lifetimes,
+                                                process_events,
+                                                selected_pid,
+                                                reload_nonce,
+                                            );
+                                        }
+                                    }
+                                    Err(error) => trace_error.set(Some(format!("Failed to start trace: {error}"))),
+                                }
+                            });
+                        },
+                        if is_trace_running { "Tracing..." } else { "Start Trace" }
+                    }
+                    button {
+                        class: "px-2 py-1 rounded border border-gray-200 bg-white text-gray-700 text-xs cursor-pointer hover:bg-gray-50 hover:border-gray-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300",
+                        onclick: move |_| {
+                            spawn(async move {
+                                match get_trace_run_status(None, Some(0)).await {
+                                    Ok(response) => {
+                                        trace_status_sequence.set(response.sequence);
+                                        let status = response.status;
+                                        let should_poll = matches!(status, TraceRunStatus::Running { .. });
+                                        trace_run_status.set(status);
+                                        if should_poll && !trace_poller_active() {
+                                            trace_poller_active.set(true);
+                                            spawn_trace_status_poller(
+                                                trace_status_sequence,
+                                                trace_run_status,
+                                                trace_last_loaded_run_id,
+                                                trace_error,
+                                                trace_poller_active,
+                                                summary,
+                                                histogram,
+                                                selected_pid_event_counts,
+                                                syscall_latency_stats,
+                                                event_flamegraph,
+                                                process_lifetimes,
+                                                process_events,
+                                                selected_pid,
+                                                reload_nonce,
+                                            );
+                                        }
+                                    }
+                                    Err(error) => trace_error.set(Some(format!("Failed to refresh trace status: {error}"))),
+                                }
+                            });
+                        },
+                        "Refresh Status"
+                    }
+                    button {
+                        class: "{stop_button_class}",
+                        disabled: !is_trace_running,
+                        onclick: move |_| {
+                            if !is_trace_running {
+                                return;
+                            }
+                            spawn(async move {
+                                match stop_trace_run().await {
+                                    Ok(response) => {
+                                        trace_status_sequence.set(response.sequence);
+                                        trace_run_status.set(response.status);
+                                    }
+                                    Err(error) => trace_error.set(Some(format!("Failed to stop trace: {error}"))),
+                                }
+                            });
+                        },
+                        "Stop Trace"
+                    }
+                    button {
+                        class: "px-2 py-1 rounded border border-emerald-200 bg-emerald-50 text-emerald-700 text-xs cursor-pointer hover:bg-emerald-100 hover:border-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300",
+                        onclick: move |_| {
+                            let parquet = trace_output().trim().to_string();
+                            if parquet.is_empty() {
+                                trace_error.set(Some("Output parquet must not be empty".to_string()));
+                                return;
+                            }
+                            spawn(async move {
+                                match load_trace_file(parquet).await {
+                                    Ok(next_summary) => {
+                                        summary.set(Some(next_summary));
+                                        histogram.set(None);
+                                        selected_pid_event_counts.set(None);
+                                        syscall_latency_stats.set(None);
+                                        event_flamegraph.set(None);
+                                        process_lifetimes.set(None);
+                                        process_events.set(None);
+                                        selected_pid.set(None);
+                                        reload_nonce.set(reload_nonce().wrapping_add(1));
+                                    }
+                                    Err(error) => trace_error.set(Some(format!("Failed to load trace file: {error}"))),
+                                }
+                            });
+                        },
+                        "Load Parquet"
+                    }
+                }
+                if let Some(err) = trace_error() {
+                    div { class: "text-[11px] text-red-700", "{err}" }
+                }
+                if let TraceRunStatus::Finished {
+                    output_parquet,
+                    error,
+                    ..
+                } = trace_run_status() {
+                    div { class: "text-[11px] text-gray-600",
+                        "Last output: "
+                        span { class: "font-mono", "{output_parquet}" }
+                    }
+                    if let Some(error) = error {
+                        div { class: "text-[11px] text-red-700", "{error}" }
+                    }
+                }
             }
 
             if let (Some(summary), Some(lifetimes), Some(range)) =
@@ -264,4 +550,73 @@ fn TraceViewer() -> Element {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_trace_status_poller(
+    mut trace_status_sequence: Signal<u64>,
+    mut trace_run_status: Signal<TraceRunStatus>,
+    mut trace_last_loaded_run_id: Signal<Option<u64>>,
+    mut trace_error: Signal<Option<String>>,
+    mut trace_poller_active: Signal<bool>,
+    mut summary: Signal<Option<TraceSummary>>,
+    mut histogram: Signal<Option<HistogramResponse>>,
+    mut selected_pid_event_counts: Signal<Option<EventTypeCounts>>,
+    mut syscall_latency_stats: Signal<Option<crate::api::SyscallLatencyStats>>,
+    mut event_flamegraph: Signal<Option<EventFlamegraphResponse>>,
+    mut process_lifetimes: Signal<Option<ProcessLifetimesResponse>>,
+    mut process_events: Signal<Option<ProcessEventsResponse>>,
+    mut selected_pid: Signal<Option<u32>>,
+    mut reload_nonce: Signal<u64>,
+) {
+    spawn(async move {
+        loop {
+            let last_sequence = trace_status_sequence();
+            match get_trace_run_status(Some(last_sequence), Some(2_000)).await {
+                Ok(response) => {
+                    trace_status_sequence.set(response.sequence);
+                    let status = response.status;
+                    if let TraceRunStatus::Finished {
+                        run_id,
+                        success,
+                        output_parquet,
+                        ..
+                    } = &status
+                        && *success
+                        && trace_last_loaded_run_id() != Some(*run_id)
+                    {
+                        match load_trace_file(output_parquet.clone()).await {
+                            Ok(next_summary) => {
+                                summary.set(Some(next_summary));
+                                histogram.set(None);
+                                selected_pid_event_counts.set(None);
+                                syscall_latency_stats.set(None);
+                                event_flamegraph.set(None);
+                                process_lifetimes.set(None);
+                                process_events.set(None);
+                                selected_pid.set(None);
+                                trace_last_loaded_run_id.set(Some(*run_id));
+                                reload_nonce.set(reload_nonce().wrapping_add(1));
+                            }
+                            Err(error) => trace_error.set(Some(format!(
+                                "Trace finished but failed to auto-load parquet: {error}"
+                            ))),
+                        }
+                    }
+
+                    let keep_polling = matches!(status, TraceRunStatus::Running { .. });
+                    trace_run_status.set(status);
+                    if !keep_polling {
+                        trace_poller_active.set(false);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    trace_error.set(Some(format!("Failed to query trace status: {error}")));
+                    trace_poller_active.set(false);
+                    break;
+                }
+            }
+        }
+    });
 }

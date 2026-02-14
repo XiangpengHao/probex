@@ -6,12 +6,13 @@ use axum::{
     extract::Query,
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use probex_common::viewer_api::{LoadTraceRequest, StartTraceRequest};
 use rust_embed::Embed;
 use serde::Deserialize;
 
-use crate::viewer_backend;
+use crate::{viewer_backend, viewer_trace_runtime};
 
 const INDEX_HTML: &str = "index.html";
 
@@ -79,14 +80,21 @@ struct ProbeSchemaDetailQuery {
     display_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TraceStatusQuery {
+    last_sequence: Option<u64>,
+    wait_ms: Option<u64>,
+}
+
 pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
     let parquet_path = Path::new(parquet_file)
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {}", parquet_file))?;
-
     viewer_backend::initialize(parquet_path.clone())
         .await
         .map_err(|error| anyhow!("failed to initialize viewer backend: {error}"))?;
+    viewer_trace_runtime::initialize()
+        .map_err(|error| anyhow!("failed to initialize trace runtime: {error}"))?;
     if ViewerAssets::get(INDEX_HTML).is_none() {
         return Err(anyhow!(
             "embedded viewer assets missing index.html; rebuild probex with bundled frontend assets"
@@ -111,6 +119,10 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/probe_schemas", get(get_probe_schemas))
         .route("/api/probe_schemas_page", get(get_probe_schemas_page))
         .route("/api/probe_schema_detail", get(get_probe_schema_detail))
+        .route("/api/trace/status", get(get_trace_status))
+        .route("/api/trace/start", post(post_trace_start))
+        .route("/api/trace/stop", post(post_trace_stop))
+        .route("/api/trace/load", post(post_trace_load))
         .route("/api/histogram", get(get_histogram))
         .route("/api/event_type_counts", get(get_event_type_counts))
         .route("/api/pid_event_type_counts", get(get_pid_event_type_counts))
@@ -194,6 +206,42 @@ async fn get_probe_schemas_page(Query(query): Query<ProbeSchemasPageQuery>) -> R
 
 async fn get_probe_schema_detail(Query(query): Query<ProbeSchemaDetailQuery>) -> Response {
     into_json_response(viewer_backend::query_probe_schema_detail(query.display_name).await)
+}
+
+async fn get_trace_status(Query(query): Query<TraceStatusQuery>) -> Response {
+    into_json_response(viewer_trace_runtime::status_wait(query.last_sequence, query.wait_ms).await)
+}
+
+async fn post_trace_start(Json(request): Json<StartTraceRequest>) -> Response {
+    into_json_response(viewer_trace_runtime::start(request).await)
+}
+
+async fn post_trace_stop() -> Response {
+    into_json_response(viewer_trace_runtime::stop().await)
+}
+
+async fn post_trace_load(Json(request): Json<LoadTraceRequest>) -> Response {
+    let parquet_path = match Path::new(request.parquet_path.as_str()).canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "failed to resolve parquet path '{}': {}",
+                    request.parquet_path, error
+                ),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = viewer_trace_runtime::load_trace(parquet_path.as_path()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load parquet trace: {}", error),
+        )
+            .into_response();
+    }
+    into_json_response(viewer_backend::query_summary().await)
 }
 
 fn parse_probe_kind(value: &str) -> Result<viewer_backend::ProbeSchemaKind, String> {

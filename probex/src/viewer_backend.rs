@@ -24,11 +24,10 @@ mod backend {
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, OnceLock, RwLock};
     use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
-    static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
-    static TRACE_FILE_METADATA: OnceLock<TraceFileMetadata> = OnceLock::new();
+    static LOADED_TRACE: OnceLock<RwLock<Option<LoadedTrace>>> = OnceLock::new();
 
     const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
     type BackendResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -38,20 +37,39 @@ mod backend {
         cpu_sample_frequency_hz: u64,
     }
 
-    fn get_ctx() -> BackendResult<&'static Arc<SessionContext>> {
-        SESSION_CTX
-            .get()
+    #[derive(Clone)]
+    struct LoadedTrace {
+        ctx: Arc<SessionContext>,
+        metadata: TraceFileMetadata,
+    }
+
+    fn loaded_trace_lock() -> &'static RwLock<Option<LoadedTrace>> {
+        LOADED_TRACE.get_or_init(|| RwLock::new(None))
+    }
+
+    fn get_loaded_trace() -> BackendResult<LoadedTrace> {
+        loaded_trace_lock()
+            .read()
+            .map_err(|_| IoError::other("failed to lock loaded trace state"))?
+            .clone()
             .ok_or_else(|| "DataFusion session not initialized".into())
     }
 
+    fn get_ctx() -> BackendResult<Arc<SessionContext>> {
+        Ok(get_loaded_trace()?.ctx)
+    }
+
+    fn get_trace_metadata() -> BackendResult<TraceFileMetadata> {
+        Ok(get_loaded_trace()?.metadata)
+    }
+
     pub async fn initialize(parquet_file: PathBuf) -> BackendResult<()> {
-        if SESSION_CTX.get().is_some() {
-            return Err(IoError::new(
-                ErrorKind::AlreadyExists,
-                "DataFusion session is already initialized",
-            )
-            .into());
-        }
+        load_trace_file(parquet_file).await?;
+        viewer_probe_catalog::initialize_probe_index_loading();
+        Ok(())
+    }
+
+    pub async fn load_trace_file(parquet_file: PathBuf) -> BackendResult<()> {
         if !parquet_file.exists() {
             return Err(IoError::new(
                 ErrorKind::NotFound,
@@ -61,7 +79,6 @@ mod backend {
         }
 
         let metadata = read_trace_file_metadata(&parquet_file)?;
-        let _ = TRACE_FILE_METADATA.set(metadata);
 
         let ctx = SessionContext::new();
 
@@ -92,14 +109,13 @@ mod backend {
         })?;
         let count = extract_i64(count_batch, "cnt", 0)?;
 
-        SESSION_CTX.set(Arc::new(ctx)).map_err(|_| {
-            IoError::new(
-                ErrorKind::AlreadyExists,
-                "DataFusion session already initialized",
-            )
-        })?;
-
-        viewer_probe_catalog::initialize_probe_index_loading();
+        let mut loaded = loaded_trace_lock()
+            .write()
+            .map_err(|_| IoError::other("failed to lock loaded trace state"))?;
+        *loaded = Some(LoadedTrace {
+            ctx: Arc::new(ctx),
+            metadata,
+        });
 
         log::info!("Loaded {count} events from {:?}", parquet_file);
         Ok(())
@@ -671,6 +687,7 @@ mod backend {
 
     pub async fn query_summary() -> BackendResult<TraceSummary> {
         let ctx = get_ctx()?;
+        let metadata = get_trace_metadata()?;
 
         // Get total count
         let count_df = ctx.sql("SELECT COUNT(*) as cnt FROM events").await?;
@@ -726,12 +743,7 @@ mod backend {
             unique_pids,
             min_ts_ns,
             max_ts_ns,
-            cpu_sample_frequency_hz: TRACE_FILE_METADATA
-                .get()
-                .ok_or_else(|| {
-                    IoError::new(ErrorKind::InvalidData, "trace metadata not initialized")
-                })?
-                .cpu_sample_frequency_hz,
+            cpu_sample_frequency_hz: metadata.cpu_sample_frequency_hz,
         })
     }
 
@@ -1515,6 +1527,12 @@ pub async fn initialize(
     parquet_file: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     backend::initialize(parquet_file).await
+}
+
+pub async fn load_trace_file(
+    parquet_file: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    backend::load_trace_file(parquet_file).await
 }
 
 pub async fn query_summary() -> Result<TraceSummary, Box<dyn std::error::Error + Send + Sync>> {

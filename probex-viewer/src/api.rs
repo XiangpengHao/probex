@@ -1,7 +1,7 @@
 pub use probex_common::viewer_api::{
     EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProbeSchema, ProbeSchemaKind,
     ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
-    SyscallLatencyStats, TraceSummary,
+    StartTraceRequest, SyscallLatencyStats, TraceRunStatus, TraceRunStatusResponse, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
@@ -26,6 +26,36 @@ where
     }
 
     let response = Request::get(&url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.ok() {
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("HTTP {status}: failed to read response body: {error}"))?;
+        return Err(format!("HTTP {status}: {text}"));
+    }
+
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn post_json<B, T>(path: &str, body: &B) -> ApiResult<T>
+where
+    B: serde::Serialize + ?Sized,
+    T: serde::de::DeserializeOwned,
+{
+    use gloo_net::http::Request;
+
+    let response = Request::post(path)
+        .header("content-type", "application/json")
+        .json(body)
+        .map_err(|error| error.to_string())?
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -91,6 +121,36 @@ pub async fn get_probe_schema_detail(display_name: String) -> ApiResult<ProbeSch
     get_json(
         "/api/probe_schema_detail",
         &[("display_name", display_name)],
+    )
+    .await
+}
+
+pub async fn get_trace_run_status(
+    last_sequence: Option<u64>,
+    wait_ms: Option<u64>,
+) -> ApiResult<TraceRunStatusResponse> {
+    let mut query = Vec::new();
+    if let Some(last_sequence) = last_sequence {
+        query.push(("last_sequence", last_sequence.to_string()));
+    }
+    if let Some(wait_ms) = wait_ms {
+        query.push(("wait_ms", wait_ms.to_string()));
+    }
+    get_json("/api/trace/status", &query).await
+}
+
+pub async fn start_trace_run(request: StartTraceRequest) -> ApiResult<TraceRunStatusResponse> {
+    post_json("/api/trace/start", &request).await
+}
+
+pub async fn stop_trace_run() -> ApiResult<TraceRunStatusResponse> {
+    post_json::<_, TraceRunStatusResponse>("/api/trace/stop", &()).await
+}
+
+pub async fn load_trace_file(parquet_path: String) -> ApiResult<TraceSummary> {
+    post_json(
+        "/api/trace/load",
+        &probex_common::viewer_api::LoadTraceRequest { parquet_path },
     )
     .await
 }

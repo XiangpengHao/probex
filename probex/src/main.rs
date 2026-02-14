@@ -153,6 +153,7 @@ use tokio::{io::unix::AsyncFd, signal};
 mod viewer_backend;
 mod viewer_probe_catalog;
 mod viewer_server;
+mod viewer_trace_runtime;
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
@@ -1310,16 +1311,25 @@ fn wait_for_child_stop(pid: Pid) -> Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+#[derive(Clone, Debug)]
+pub(crate) struct TraceCommandConfig {
+    pub output: String,
+    pub sample_freq_hz: u64,
+    pub program: String,
+    pub args: Vec<String>,
+}
 
-    let args = Args::parse();
+#[derive(Clone, Debug)]
+pub(crate) struct TraceCommandOutcome {
+    pub total_events: usize,
+    pub output_path: String,
+}
 
-    if let Some(parquet_file) = args.view.as_deref() {
-        return viewer_server::launch(parquet_file, args.port).await;
-    }
-
+pub(crate) async fn run_trace_command(
+    config: TraceCommandConfig,
+    mut stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
+    allow_ctrl_c: bool,
+) -> Result<TraceCommandOutcome> {
     // Bump the memlock rlimit
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -1342,12 +1352,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn child process with SIGSTOP
-    let (program, program_args) = args
-        .command
-        .split_first()
-        .ok_or_else(|| anyhow!("clap invariant violated: missing command in trace mode"))?;
-
-    let child_pid = spawn_child(program, program_args)?;
+    let child_pid = spawn_child(&config.program, &config.args)?;
     let child_pid_u32 = child_pid.as_raw() as u32;
     info!("Spawned child process with PID {}", child_pid);
 
@@ -1438,7 +1443,7 @@ async fn main() -> Result<()> {
     )?;
     let target_pid = u32::try_from(child_pid.as_raw())
         .context("child pid is negative and cannot be used for perf scope")?;
-    attach_cpu_sampler(&mut ebpf, target_pid, args.sample_freq)?;
+    attach_cpu_sampler(&mut ebpf, target_pid, config.sample_freq_hz)?;
 
     // Resume child process
     kill(child_pid, Signal::SIGCONT)
@@ -1446,8 +1451,8 @@ async fn main() -> Result<()> {
     info!("Resumed child process {}", child_pid);
 
     // Create Parquet batch writer
-    let mut writer = ParquetBatchWriter::new(&args.output, args.sample_freq)?;
-    info!("Writing events to {}", args.output);
+    let mut writer = ParquetBatchWriter::new(&config.output, config.sample_freq_hz)?;
+    info!("Writing events to {}", config.output);
     let mut snapshot_collector = ProcMapsSnapshotCollector::default();
 
     // Stack trace map for resolving stack ids into raw frame addresses.
@@ -1522,6 +1527,31 @@ async fn main() -> Result<()> {
     info!("Starting event loop...");
 
     loop {
+        if stop_signal.as_ref().is_some_and(|sig| *sig.borrow()) {
+            info!("Received stop request, exiting trace loop...");
+            if !child_wait.is_finished() {
+                let _ = kill(child_pid, Signal::SIGTERM);
+            }
+            break;
+        }
+
+        let stop_changed = async {
+            if let Some(signal) = stop_signal.as_mut() {
+                let _ = signal.changed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let ctrl_c = async {
+            if allow_ctrl_c {
+                let _ = signal::ctrl_c().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(stop_changed);
+        tokio::pin!(ctrl_c);
+
         tokio::select! {
             result = &mut child_wait => {
                 child_wait_done = true;
@@ -1541,10 +1571,15 @@ async fn main() -> Result<()> {
                 info!("Child process {} exited", child_pid);
                 break;
             }
-            // Check for Ctrl-C
-            _ = signal::ctrl_c() => {
+            _ = &mut stop_changed => {
+                info!("Received stop request, exiting...");
+                if !child_wait.is_finished() {
+                    let _ = kill(child_pid, Signal::SIGTERM);
+                }
+                break;
+            }
+            _ = &mut ctrl_c => {
                 info!("Received Ctrl-C, exiting...");
-                // Kill child process if still running
                 if !child_wait.is_finished() {
                     let _ = kill(child_pid, Signal::SIGTERM);
                 }
@@ -1612,9 +1647,9 @@ async fn main() -> Result<()> {
 
     if total_events > 0 && total_maps > 0 {
         embedded_snapshot_rows = embed_proc_maps_snapshots_into_events_parquet(
-            &args.output,
+            &config.output,
             snapshot_collector.snapshot_index(),
-            args.sample_freq,
+            config.sample_freq_hz,
         )?;
         info!(
             "Post-processing complete: embedded proc map snapshots into {} event rows",
@@ -1622,17 +1657,48 @@ async fn main() -> Result<()> {
         );
     }
 
-    info!("Done. Wrote {} events to {}", total_events, args.output);
+    info!("Done. Wrote {} events to {}", total_events, config.output);
     if total_maps > 0 {
         info!(
             "Captured {} proc map rows and embedded {} snapshots into {}",
-            total_maps, embedded_snapshot_rows, args.output
+            total_maps, embedded_snapshot_rows, config.output
         );
     }
 
+    Ok(TraceCommandOutcome {
+        total_events,
+        output_path: config.output,
+    })
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    let args = Args::parse();
+
+    if let Some(parquet_file) = args.view.as_deref() {
+        return viewer_server::launch(parquet_file, args.port).await;
+    }
+    let (program, program_args) = args
+        .command
+        .split_first()
+        .ok_or_else(|| anyhow!("clap invariant violated: missing command in trace mode"))?;
+    let outcome = run_trace_command(
+        TraceCommandConfig {
+            output: args.output.clone(),
+            sample_freq_hz: args.sample_freq,
+            program: program.clone(),
+            args: program_args.to_vec(),
+        },
+        None,
+        true,
+    )
+    .await?;
+
     // Launch the viewer if we have events and --no-viewer wasn't specified
-    if total_events > 0 && !args.no_viewer {
-        viewer_server::launch(&args.output, args.port).await?;
+    if outcome.total_events > 0 && !args.no_viewer {
+        viewer_server::launch(&outcome.output_path, args.port).await?;
     }
 
     Ok(())

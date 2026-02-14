@@ -320,4 +320,44 @@ pub mod viewer_api {
         pub has_more: bool,
         pub is_loading: bool,
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct StartTraceRequest {
+        pub program: String,
+        pub args: Vec<String>,
+        pub output_parquet: String,
+        pub sample_freq_hz: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct LoadTraceRequest {
+        pub parquet_path: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum TraceRunStatus {
+        Idle,
+        Running {
+            run_id: u64,
+            command: Vec<String>,
+            output_parquet: String,
+            started_at_unix_ms: u64,
+        },
+        Finished {
+            run_id: u64,
+            command: Vec<String>,
+            output_parquet: String,
+            started_at_unix_ms: u64,
+            finished_at_unix_ms: u64,
+            exit_code: i32,
+            success: bool,
+            error: Option<String>,
+        },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TraceRunStatusResponse {
+        pub sequence: u64,
+        pub status: TraceRunStatus,
+    }
 }
