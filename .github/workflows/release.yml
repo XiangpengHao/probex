@@ -206,7 +206,7 @@ jobs:
             set -euo pipefail
             PROBEX_SKIP_FRONTEND_BUNDLE=1 PROBEX_SKIP_EBPF_BUILD=1 cargo publish \
               -p probex-common -p probex-ebpf -p probex \
-              --locked --allow-dirty --no-verify --token "$CARGO_REGISTRY_TOKEN"
+              --locked --allow-dirty --no-verify
           '
 
       - name: Package release artifacts
