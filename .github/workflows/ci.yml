@@ -7,61 +7,32 @@ on:
       - main
 
 jobs:
-  rust-checks:
+  nix-ci:
     runs-on: ubuntu-latest
-    env:
-      CARGO_TARGET_DIR: /tmp/cargo-target
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
 
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Enable Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
 
-      - name: Install nightly rust-src for eBPF build script
-        run: rustup toolchain install nightly --component rust-src
-
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> ${{ env.CARGO_TARGET_DIR }}
-
-      - name: Install cargo-binstall
-        uses: taiki-e/install-action@cargo-binstall
-
-      - name: Install bpf-linker, dx, and wasm tooling
-        run: cargo binstall --no-confirm bpf-linker dioxus-cli@0.7.3 wasm-bindgen-cli
-
-      - name: Install wasm-opt (binaryen)
+      - name: Run CI in Nix Dev Shell
         run: |
-          if ! command -v wasm-opt >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y binaryen
-          fi
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+            cargo fmt --all -- --check
+            cargo clippy -p probex -p probex-common -p probex-viewer --all-targets
+            cargo check -p probex -p probex-common
+            cargo check -p probex-viewer --target wasm32-unknown-unknown
 
-      - name: Run clippy
-        run: cargo clippy -p probex -p probex-common -p probex-viewer --all-targets
-
-      - name: Run cargo check
-        run: |
-          cargo check -p probex -p probex-common
-          cargo check -p probex-viewer --target wasm32-unknown-unknown
-
-      - name: Verify frontend -> backend build pipeline
-        run: |
-          dx bundle --release --platform web -p probex-viewer
-          rm -rf probex/assets/viewer
-          mkdir -p probex/assets/viewer
-          cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
-          cargo build --release -p probex
-
-      - name: Verify probex package includes embedded frontend assets
-        run: |
-          cargo package -p probex --allow-dirty --no-verify --list | grep '^assets/viewer/index.html$'
+            dx bundle --release --platform web -p probex-viewer
+            rm -rf probex/assets/viewer
+            mkdir -p probex/assets/viewer
+            cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
+            cargo build --release -p probex
+            cargo package -p probex --allow-dirty --no-verify --list | grep "^assets/viewer/index.html$"
+          '

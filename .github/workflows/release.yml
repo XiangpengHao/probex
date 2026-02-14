@@ -32,33 +32,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust toolchains
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
 
-      - name: Add wasm target
-        run: rustup target add wasm32-unknown-unknown
-
-      - name: Install nightly rust-src for eBPF build script
-        run: rustup toolchain install nightly --component rust-src
-
-      - name: Install bpf-linker
-        run: cargo install --locked bpf-linker
-
-      - name: Install dx and wasm tooling
-        run: |
-          cargo install --locked dioxus-cli --version 0.7.3
-          cargo install --locked wasm-bindgen-cli
-
-      - name: Install wasm-opt (binaryen)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen
-
-      - name: Cache Rust build outputs
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> ${{ env.CARGO_TARGET_DIR }}
+      - name: Enable Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
 
       - name: Compute and bump versions
         id: release
@@ -128,7 +106,11 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Update lockfile
-        run: cargo update -w
+        run: |
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            cargo update -w
+          '
 
       - name: Commit version bump
         id: version_commit
@@ -142,66 +124,96 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Ensure crate versions are not already published
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
-          for crate in probex-common probex-ebpf probex; do
-            if cargo info "$crate@$version" >/dev/null 2>&1; then
-              echo "$crate@$version is already published on crates.io"
-              exit 1
-            fi
-          done
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            for crate in probex-common probex-ebpf probex; do
+              if cargo info "$crate@$RELEASE_VERSION" >/dev/null 2>&1; then
+                echo "$crate@$RELEASE_VERSION is already published on crates.io"
+                exit 1
+              fi
+            done
+          '
 
       - name: Build frontend bundle
         run: |
-          set -euo pipefail
-          dx bundle --release --platform web -p probex-viewer
-          rm -rf probex/assets/viewer
-          mkdir -p probex/assets/viewer
-          cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            dx bundle --release --platform web -p probex-viewer
+            rm -rf probex/assets/viewer
+            mkdir -p probex/assets/viewer
+            cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
+          '
 
       - name: Validate package contents
         run: |
-          set -euo pipefail
-          cargo package -p probex --allow-dirty --no-verify --list | grep '^assets/viewer/index.html$'
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            cargo package -p probex --allow-dirty --no-verify --list | grep "^assets/viewer/index.html$"
+          '
 
       - name: Publish probex-common
-        run: cargo publish -p probex-common --locked --token "$CARGO_REGISTRY_TOKEN"
+        run: |
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            cargo publish -p probex-common --locked --token "$CARGO_REGISTRY_TOKEN"
+          '
 
       - name: Wait for probex-common index propagation
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
-          for attempt in $(seq 1 30); do
-            if cargo info "probex-common@$version" >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "probex-common@$version did not appear in crates.io index in time"
-          exit 1
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            for attempt in $(seq 1 30); do
+              if cargo info "probex-common@$RELEASE_VERSION" >/dev/null 2>&1; then
+                exit 0
+              fi
+              sleep 10
+            done
+            echo "probex-common@$RELEASE_VERSION did not appear in crates.io index in time"
+            exit 1
+          '
 
       - name: Publish probex-ebpf
-        run: cargo publish -p probex-ebpf --locked --token "$CARGO_REGISTRY_TOKEN"
+        run: |
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            cargo publish -p probex-ebpf --locked --token "$CARGO_REGISTRY_TOKEN"
+          '
 
       - name: Wait for probex-ebpf index propagation
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          set -euo pipefail
-          version="${{ steps.release.outputs.version }}"
-          for attempt in $(seq 1 30); do
-            if cargo info "probex-ebpf@$version" >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "probex-ebpf@$version did not appear in crates.io index in time"
-          exit 1
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            for attempt in $(seq 1 30); do
+              if cargo info "probex-ebpf@$RELEASE_VERSION" >/dev/null 2>&1; then
+                exit 0
+              fi
+              sleep 10
+            done
+            echo "probex-ebpf@$RELEASE_VERSION did not appear in crates.io index in time"
+            exit 1
+          '
 
       - name: Publish probex
-        run: cargo publish -p probex --locked --token "$CARGO_REGISTRY_TOKEN"
+        run: |
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            cargo publish -p probex --locked --token "$CARGO_REGISTRY_TOKEN"
+          '
 
       - name: Build release binary
-        run: cargo build --release -p probex --locked
+        run: |
+          nix develop --accept-flake-config -c bash -lc '
+            set -euo pipefail
+            cargo build --release -p probex --locked
+          '
 
       - name: Package release artifacts
         id: package
