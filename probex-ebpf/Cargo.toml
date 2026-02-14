@@ -1,6 +1,6 @@
 [package]
 name = "probex-ebpf"
-version = "0.1.4"
+version = "0.1.6"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ documentation = "https://docs.rs/probex-ebpf"
 description = "eBPF programs used by the probex profiler"
 
 [dependencies]
-probex-common = { path = "../probex-common", version = "0.1.4" }
+probex-common = { path = "../probex-common", version = "0.1.6" }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
