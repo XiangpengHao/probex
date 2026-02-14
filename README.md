@@ -5,11 +5,31 @@ It runs a command, collects everything you need, and visualizes it.
 
 ## Usage
 
+### Nix
 ```
 nix run github:XiangpengHao/probex -- sleep 1
 ```
 
-Other package managers coming soon, contributions welcome!
+### Cargo
+
+```shell
+cargo install probex
+sudo probex -- sleep 1
+```
+
+Or build from source:
+```shell
+cargo build --release -p probex --locked
+sudo target/release/probex -- sleep 1
+```
+
+### Download binary
+
+```shell
+wget https://github.com/XiangpengHao/probex/releases/download/latest/probex-linux-x86_64-latest.tar.gz
+tar -xzf probex-linux-x86_64-latest.tar.gz
+sudo ./probex-linux-x86_64-latest/probex -- sleep 1
+```
 
 ## What it looks like
 ![](doc/screenshots/screenshot.png)

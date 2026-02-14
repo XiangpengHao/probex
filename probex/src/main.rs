@@ -104,9 +104,10 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
+    env,
     ffi::CString,
     fs::File,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -114,9 +115,10 @@ use anyhow::{Context as _, Result, anyhow};
 use arrow::{
     array::{
         Array, ArrayRef, Int32Builder, Int64Builder, ListBuilder, StringArray, StringBuilder,
-        StructBuilder, UInt8Builder, UInt32Array, UInt32Builder, UInt64Array, UInt64Builder,
+        StringViewArray, StringViewBuilder, UInt8Builder, UInt32Array, UInt32Builder, UInt64Array,
+        UInt64Builder,
     },
-    datatypes::{DataType, Field, Fields, Schema},
+    datatypes::{DataType, Field, Schema},
     record_batch::{RecordBatch, RecordBatchReader},
 };
 use aya::{
@@ -149,6 +151,7 @@ use probex_common::{
     STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
+use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
 mod viewer_backend;
 mod viewer_server;
@@ -156,6 +159,8 @@ mod viewer_server;
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
 const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
+const PARQUET_METADATA_STACK_TRACE_FORMAT_KEY: &str = "probex.stack_trace_format";
+const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
 
 #[derive(Parser, Debug)]
 #[command(name = "probex")]
@@ -229,8 +234,6 @@ struct Event {
     fd: Option<i64>,
     count: Option<u64>,
     ret: Option<i64>,
-    // Optional inline process map snapshot for this event's tgid.
-    proc_maps_snapshot: Option<Vec<ProcMapInlineSegment>>,
 }
 
 #[derive(Clone, Debug)]
@@ -241,22 +244,8 @@ struct ProcMapInlineSegment {
     path: String,
 }
 
-fn proc_maps_snapshot_data_type() -> DataType {
-    let segment_fields = Fields::from(vec![
-        Field::new("start_addr", DataType::UInt64, false),
-        Field::new("end_addr", DataType::UInt64, false),
-        Field::new("file_offset", DataType::UInt64, false),
-        Field::new("path", DataType::Utf8, false),
-    ]);
-    DataType::List(Arc::new(Field::new(
-        "item",
-        DataType::Struct(segment_fields),
-        true,
-    )))
-}
-
-/// Creates the Arrow schema for the unified event table
-fn create_schema() -> Schema {
+/// Creates the Arrow schema for the temporary event table before stack finalization.
+fn create_intermediate_schema() -> Schema {
     Schema::new(vec![
         Field::new("event_type", DataType::Utf8, false),
         Field::new("ts_ns", DataType::UInt64, false),
@@ -285,7 +274,42 @@ fn create_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
-        Field::new("proc_maps_snapshot", proc_maps_snapshot_data_type(), true),
+    ])
+}
+
+/// Creates the final Arrow schema for persisted traces.
+fn create_final_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("event_type", DataType::Utf8, false),
+        Field::new("ts_ns", DataType::UInt64, false),
+        Field::new("pid", DataType::UInt32, false),
+        Field::new("tgid", DataType::UInt32, false),
+        Field::new("process_name", DataType::Utf8, true),
+        Field::new("stack_id", DataType::Int32, true),
+        Field::new("kernel_stack_id", DataType::Int32, true),
+        Field::new("stack_kind", DataType::Utf8, true),
+        Field::new(
+            "stack_trace",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true))),
+            true,
+        ),
+        Field::new("cpu", DataType::UInt8, false),
+        // SchedSwitch fields (nullable)
+        Field::new("prev_pid", DataType::UInt32, true),
+        Field::new("next_pid", DataType::UInt32, true),
+        Field::new("prev_state", DataType::Int64, true),
+        // ProcessFork fields (nullable)
+        Field::new("parent_pid", DataType::UInt32, true),
+        Field::new("child_pid", DataType::UInt32, true),
+        // ProcessExit fields (nullable)
+        Field::new("exit_code", DataType::Int32, true),
+        // PageFault fields (nullable)
+        Field::new("address", DataType::UInt64, true),
+        Field::new("error_code", DataType::UInt64, true),
+        // Syscall fields (nullable)
+        Field::new("fd", DataType::Int64, true),
+        Field::new("count", DataType::UInt64, true),
+        Field::new("ret", DataType::Int64, true),
     ])
 }
 
@@ -301,7 +325,7 @@ struct ParquetBatchWriter {
 impl ParquetBatchWriter {
     /// Create a new ParquetBatchWriter that writes to the specified file
     fn new(path: &str, sample_freq_hz: u64) -> Result<Self> {
-        let schema = Arc::new(create_schema());
+        let schema = Arc::new(create_intermediate_schema());
         let file =
             File::create(path).with_context(|| format!("failed to create output file {}", path))?;
 
@@ -365,22 +389,6 @@ impl ParquetBatchWriter {
         let mut fd_builder = Int64Builder::with_capacity(batch_len);
         let mut count_builder = UInt64Builder::with_capacity(batch_len);
         let mut ret_builder = Int64Builder::with_capacity(batch_len);
-        let proc_map_item_fields = vec![
-            Field::new("start_addr", DataType::UInt64, false),
-            Field::new("end_addr", DataType::UInt64, false),
-            Field::new("file_offset", DataType::UInt64, false),
-            Field::new("path", DataType::Utf8, false),
-        ];
-        let proc_map_item_builder = StructBuilder::new(
-            proc_map_item_fields,
-            vec![
-                Box::new(UInt64Builder::new()),
-                Box::new(UInt64Builder::new()),
-                Box::new(UInt64Builder::new()),
-                Box::new(StringBuilder::new()),
-            ],
-        );
-        let mut proc_maps_snapshot_builder = ListBuilder::new(proc_map_item_builder);
 
         for event in self.batch.drain(..) {
             event_type_builder.append_value(event.event_type);
@@ -405,34 +413,6 @@ impl ParquetBatchWriter {
             fd_builder.append_option(event.fd);
             count_builder.append_option(event.count);
             ret_builder.append_option(event.ret);
-            if let Some(segments) = event.proc_maps_snapshot {
-                for segment in segments {
-                    proc_maps_snapshot_builder
-                        .values()
-                        .field_builder::<UInt64Builder>(0)
-                        .expect("proc_maps_snapshot.start_addr builder type should match")
-                        .append_value(segment.start_addr);
-                    proc_maps_snapshot_builder
-                        .values()
-                        .field_builder::<UInt64Builder>(1)
-                        .expect("proc_maps_snapshot.end_addr builder type should match")
-                        .append_value(segment.end_addr);
-                    proc_maps_snapshot_builder
-                        .values()
-                        .field_builder::<UInt64Builder>(2)
-                        .expect("proc_maps_snapshot.file_offset builder type should match")
-                        .append_value(segment.file_offset);
-                    proc_maps_snapshot_builder
-                        .values()
-                        .field_builder::<StringBuilder>(3)
-                        .expect("proc_maps_snapshot.path builder type should match")
-                        .append_value(segment.path);
-                    proc_maps_snapshot_builder.values().append(true);
-                }
-                proc_maps_snapshot_builder.append(true);
-            } else {
-                proc_maps_snapshot_builder.append(false);
-            }
         }
 
         let columns: Vec<ArrayRef> = vec![
@@ -458,7 +438,6 @@ impl ParquetBatchWriter {
             Arc::new(fd_builder.finish()),
             Arc::new(count_builder.finish()),
             Arc::new(ret_builder.finish()),
-            Arc::new(proc_maps_snapshot_builder.finish()),
         ];
 
         let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
@@ -876,11 +855,6 @@ fn maybe_capture_proc_maps_snapshot(
     snapshot_cache.insert(tgid, maps);
 }
 
-fn row_requires_inline_proc_maps(stack_kind: Option<&str>, stack_frames: Option<&str>) -> bool {
-    matches!(stack_kind, Some("user") | Some("both"))
-        && stack_frames.is_some_and(|frames| !frames.is_empty())
-}
-
 fn find_inline_segments_for_event(
     snapshot_index: &ProcMapsSnapshotIndex,
     tgid: u32,
@@ -891,11 +865,302 @@ fn find_inline_segments_for_event(
     Some(segments.as_slice())
 }
 
-fn embed_proc_maps_snapshots_into_events_parquet(
+fn extract_option_utf8_from_column<'a>(
+    column: &'a dyn Array,
+    row: usize,
+    column_name: &str,
+) -> Result<Option<&'a str>> {
+    if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok((!arr.is_null(row)).then(|| arr.value(row)));
+    }
+    if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+        return Ok((!arr.is_null(row)).then(|| arr.value(row)));
+    }
+    Err(anyhow!("events column {column_name} has unexpected type"))
+}
+
+fn mapped_frame_fallback_label(path: &str, file_offset: u64) -> String {
+    format!("{path}+0x{file_offset:x}")
+}
+
+fn sanitize_stack_trace_label(label: &str) -> String {
+    let cleaned = label
+        .replace(';', ":")
+        .replace(['\n', '\r'], " ")
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        "[unknown]".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn labels_to_stack_trace(labels: Vec<String>) -> Option<String> {
+    let cleaned = labels
+        .into_iter()
+        .map(|label| sanitize_stack_trace_label(&label))
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.join(";"))
+    }
+}
+
+fn parse_stack_trace_labels(stack_trace: &str) -> Vec<String> {
+    stack_trace
+        .split(';')
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_kernel_labels_from_stack_trace(stack_trace: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut in_kernel_section = false;
+    for frame in stack_trace.split(';').filter(|frame| !frame.is_empty()) {
+        if frame == "[kernel]" {
+            in_kernel_section = true;
+            labels.push(frame.to_string());
+            continue;
+        }
+        if in_kernel_section {
+            labels.push(frame.to_string());
+        }
+    }
+    labels
+}
+
+fn parse_stack_frames_hex(stack_frames: &str) -> Result<Vec<u64>> {
+    let mut frames = Vec::new();
+    for token in stack_frames.split(';') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let hex = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .unwrap_or(trimmed);
+        let ip = u64::from_str_radix(hex, 16)
+            .with_context(|| format!("invalid stack frame address '{trimmed}'"))?;
+        frames.push(ip);
+    }
+    Ok(frames)
+}
+
+fn find_segment_for_ip(segments: &[ProcMapInlineSegment], ip: u64) -> Option<&ProcMapInlineSegment> {
+    segments
+        .iter()
+        .find(|segment| ip >= segment.start_addr && ip < segment.end_addr)
+}
+
+fn symbol_labels_from_address_info(address_info: wholesym::AddressInfo) -> Option<Vec<String>> {
+    if let Some(frames) = &address_info.frames {
+        let mut labels: Vec<String> = frames
+            .iter()
+            .filter_map(|frame| {
+                frame
+                    .function
+                    .as_ref()
+                    .filter(|function| !function.is_empty())
+                    .cloned()
+            })
+            .collect();
+        if !labels.is_empty() {
+            labels.reverse();
+            return Some(labels);
+        }
+    }
+
+    if address_info.symbol.name.is_empty() || address_info.symbol.name == "??" {
+        None
+    } else {
+        Some(vec![address_info.symbol.name])
+    }
+}
+
+struct ExportUserSymbolizer {
+    symbol_manager: SymbolManager,
+    symbol_cache: std::collections::HashMap<(String, u64), Option<Vec<String>>>,
+    symbol_map_cache: std::collections::HashMap<String, Option<wholesym::SymbolMap>>,
+}
+
+impl ExportUserSymbolizer {
+    fn new() -> Self {
+        Self {
+            symbol_manager: SymbolManager::with_config(SymbolManagerConfig::default()),
+            symbol_cache: std::collections::HashMap::new(),
+            symbol_map_cache: std::collections::HashMap::new(),
+        }
+    }
+
+    fn runtime_file_offset(runtime_ip: u64, map_start: u64, map_file_offset: u64) -> u64 {
+        runtime_ip
+            .saturating_sub(map_start)
+            .saturating_add(map_file_offset)
+    }
+
+    async fn ensure_symbol_map_loaded(&mut self, path: &str) {
+        if self.symbol_map_cache.contains_key(path) {
+            return;
+        }
+        let symbol_map = self
+            .symbol_manager
+            .load_symbol_map_for_binary_at_path(Path::new(path), None)
+            .await
+            .ok();
+        self.symbol_map_cache.insert(path.to_string(), symbol_map);
+    }
+
+    async fn symbolize_addrs_batch(&mut self, path: &str, addrs: &[u64]) {
+        if addrs.is_empty() {
+            return;
+        }
+
+        let path_key = path.to_string();
+        let mut unresolved = Vec::new();
+        let mut seen = HashSet::new();
+        for addr in addrs {
+            if !seen.insert(*addr) {
+                continue;
+            }
+            let cache_key = (path_key.clone(), *addr);
+            if self.symbol_cache.contains_key(&cache_key) {
+                continue;
+            }
+            unresolved.push(*addr);
+        }
+
+        if unresolved.is_empty() {
+            return;
+        }
+
+        self.ensure_symbol_map_loaded(path).await;
+
+        let Some(symbol_map) = self.symbol_map_cache.get(&path_key).and_then(|m| m.as_ref()) else {
+            for addr in unresolved {
+                self.symbol_cache.insert((path_key.clone(), addr), None);
+            }
+            return;
+        };
+
+        for addr in unresolved {
+            let symbol = symbol_map
+                .lookup(LookupAddress::FileOffset(addr))
+                .await
+                .and_then(symbol_labels_from_address_info);
+            self.symbol_cache.insert((path_key.clone(), addr), symbol);
+        }
+    }
+
+    fn lookup_symbol_labels(&self, path: &str, addr: u64) -> Option<Vec<String>> {
+        self.symbol_cache
+            .get(&(path.to_string(), addr))
+            .cloned()
+            .flatten()
+    }
+}
+
+#[derive(Default)]
+struct UserFrameRewriteStats {
+    mapped_fallback_frames: usize,
+    raw_fallback_frames: usize,
+}
+
+#[derive(Default)]
+struct StackTraceFinalizationStats {
+    rewritten_rows: usize,
+    symbolized_user_rows: usize,
+    symbolized_mixed_rows: usize,
+    mapped_fallback_frames: usize,
+    raw_fallback_frames: usize,
+}
+
+async fn symbolize_user_frames_for_export(
+    frames: &[u64],
+    inline_snapshot: Option<&[ProcMapInlineSegment]>,
+    symbolizer: &mut ExportUserSymbolizer,
+) -> (Vec<String>, UserFrameRewriteStats) {
+    let mut labels = Vec::with_capacity(frames.len() + 1);
+    labels.push("[user]".to_string());
+
+    let Some(segments) = inline_snapshot else {
+        labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
+        return (
+            labels,
+            UserFrameRewriteStats {
+                raw_fallback_frames: frames.len(),
+                ..Default::default()
+            },
+        );
+    };
+
+    if segments.is_empty() {
+        labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
+        return (
+            labels,
+            UserFrameRewriteStats {
+                raw_fallback_frames: frames.len(),
+                ..Default::default()
+            },
+        );
+    }
+
+    let mapped_segments: Vec<Option<&ProcMapInlineSegment>> = frames
+        .iter()
+        .map(|ip| find_segment_for_ip(segments, *ip))
+        .collect();
+
+    let mut frame_symbol_keys: Vec<Option<(String, u64)>> = Vec::with_capacity(frames.len());
+    let mut unresolved_by_path: std::collections::HashMap<String, Vec<u64>> =
+        std::collections::HashMap::new();
+
+    for (ip, maybe_segment) in frames.iter().zip(mapped_segments.iter()) {
+        if let Some(segment) = maybe_segment {
+            let file_offset = ExportUserSymbolizer::runtime_file_offset(
+                *ip,
+                segment.start_addr,
+                segment.file_offset,
+            );
+            frame_symbol_keys.push(Some((segment.path.clone(), file_offset)));
+            unresolved_by_path
+                .entry(segment.path.clone())
+                .or_default()
+                .push(file_offset);
+        } else {
+            frame_symbol_keys.push(None);
+        }
+    }
+
+    for (path, addrs) in unresolved_by_path {
+        symbolizer.symbolize_addrs_batch(&path, &addrs).await;
+    }
+
+    let mut stats = UserFrameRewriteStats::default();
+    for (ip, maybe_key) in frames.iter().zip(frame_symbol_keys.into_iter()) {
+        if let Some((path, addr)) = maybe_key {
+            if let Some(symbols) = symbolizer.lookup_symbol_labels(&path, addr) {
+                labels.extend(symbols);
+            } else {
+                stats.mapped_fallback_frames += 1;
+                labels.push(mapped_frame_fallback_label(&path, addr));
+            }
+        } else {
+            stats.raw_fallback_frames += 1;
+            labels.push(format!("0x{ip:x}"));
+        }
+    }
+    (labels, stats)
+}
+
+async fn symbolize_stack_traces_into_events_parquet(
     events_output_path: &str,
     snapshot_index: &ProcMapsSnapshotIndex,
     sample_freq_hz: u64,
-) -> Result<usize> {
+) -> Result<StackTraceFinalizationStats> {
     let file = File::open(events_output_path)
         .with_context(|| format!("failed to open events file {}", events_output_path))?;
     let reader_builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -905,38 +1170,47 @@ fn embed_proc_maps_snapshots_into_events_parquet(
         .build()
         .with_context(|| format!("failed to build reader for {}", events_output_path))?;
 
-    let schema = reader.schema();
-    let proc_maps_snapshot_idx = schema
-        .index_of("proc_maps_snapshot")
-        .with_context(|| "events schema missing proc_maps_snapshot column")?;
-    let tgid_idx = schema
+    let source_schema = reader.schema();
+    let tgid_idx = source_schema
         .index_of("tgid")
         .with_context(|| "events schema missing tgid column")?;
-    let ts_ns_idx = schema
+    let ts_ns_idx = source_schema
         .index_of("ts_ns")
         .with_context(|| "events schema missing ts_ns column")?;
-    let stack_kind_idx = schema
+    let stack_kind_idx = source_schema
         .index_of("stack_kind")
         .with_context(|| "events schema missing stack_kind column")?;
-    let stack_frames_idx = schema
+    let stack_frames_idx = source_schema
         .index_of("stack_frames")
         .with_context(|| "events schema missing stack_frames column")?;
+    let stack_trace_idx = source_schema
+        .index_of("stack_trace")
+        .with_context(|| "events schema missing stack_trace column")?;
 
     let tmp_output_path = format!("{events_output_path}.postprocess.tmp");
     let output_file = File::create(&tmp_output_path)
         .with_context(|| format!("failed to create temp output {}", tmp_output_path))?;
-    let key_value_metadata = vec![KeyValue::new(
-        PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY.to_string(),
-        sample_freq_hz.to_string(),
-    )];
+    let key_value_metadata = vec![
+        KeyValue::new(
+            PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY.to_string(),
+            sample_freq_hz.to_string(),
+        ),
+        KeyValue::new(
+            PARQUET_METADATA_STACK_TRACE_FORMAT_KEY.to_string(),
+            STACK_TRACE_FORMAT_SYMBOLIZED_V1.to_string(),
+        ),
+    ];
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .set_key_value_metadata(Some(key_value_metadata))
         .build();
-    let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))
+    let final_schema = Arc::new(create_final_schema());
+    let mut writer = ArrowWriter::try_new(output_file, final_schema.clone(), Some(props))
         .with_context(|| "failed to create post-process parquet writer")?;
 
-    let mut rows_with_snapshot = 0usize;
+    let mut symbolizer = ExportUserSymbolizer::new();
+    let mut stats = StackTraceFinalizationStats::default();
+
     for batch in &mut reader {
         let batch = batch.with_context(|| "failed to read events batch")?;
 
@@ -950,96 +1224,94 @@ fn embed_proc_maps_snapshots_into_events_parquet(
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| anyhow!("events column ts_ns has unexpected type"))?;
-        let stack_kind_array = batch
-            .column(stack_kind_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| anyhow!("events column stack_kind has unexpected type"))?;
-        let stack_frames_array = batch
-            .column(stack_frames_idx)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| anyhow!("events column stack_frames has unexpected type"))?;
-
-        let proc_map_item_fields = vec![
-            Field::new("start_addr", DataType::UInt64, false),
-            Field::new("end_addr", DataType::UInt64, false),
-            Field::new("file_offset", DataType::UInt64, false),
-            Field::new("path", DataType::Utf8, false),
-        ];
-        let proc_map_item_builder = StructBuilder::new(
-            proc_map_item_fields,
-            vec![
-                Box::new(UInt64Builder::new()),
-                Box::new(UInt64Builder::new()),
-                Box::new(UInt64Builder::new()),
-                Box::new(StringBuilder::new()),
-            ],
-        );
-        let mut proc_maps_snapshot_builder = ListBuilder::new(proc_map_item_builder);
+        let stack_kind_column = batch.column(stack_kind_idx).as_ref();
+        let stack_frames_column = batch.column(stack_frames_idx).as_ref();
+        let stack_trace_column = batch.column(stack_trace_idx).as_ref();
+        let mut stack_trace_builder = ListBuilder::new(StringViewBuilder::new());
 
         for row_idx in 0..batch.num_rows() {
-            let stack_kind = if stack_kind_array.is_null(row_idx) {
-                None
-            } else {
-                Some(stack_kind_array.value(row_idx))
-            };
-            let stack_frames = if stack_frames_array.is_null(row_idx) {
-                None
-            } else {
-                Some(stack_frames_array.value(row_idx))
-            };
-            if !row_requires_inline_proc_maps(stack_kind, stack_frames) {
-                proc_maps_snapshot_builder.append(false);
-                continue;
-            }
-
+            stats.rewritten_rows += 1;
+            let stack_kind =
+                extract_option_utf8_from_column(stack_kind_column, row_idx, "stack_kind")?;
+            let stack_frames =
+                extract_option_utf8_from_column(stack_frames_column, row_idx, "stack_frames")?;
+            let current_stack_trace =
+                extract_option_utf8_from_column(stack_trace_column, row_idx, "stack_trace")?;
             let tgid = tgid_array.value(row_idx);
-            if tgid == 0 {
-                proc_maps_snapshot_builder.append(false);
-                continue;
-            }
-
             let ts_ns = ts_ns_array.value(row_idx);
-            let Some(segments) = find_inline_segments_for_event(snapshot_index, tgid, ts_ns) else {
-                proc_maps_snapshot_builder.append(false);
-                continue;
+            let rewritten_stack_trace = match (stack_kind, stack_frames) {
+                (Some("user"), Some(frames_hex)) if !frames_hex.is_empty() => {
+                    let frames = parse_stack_frames_hex(frames_hex)?;
+                    if frames.is_empty() {
+                        labels_to_stack_trace(current_stack_trace.map(parse_stack_trace_labels).unwrap_or_default())
+                    } else {
+                        let snapshot = if tgid == 0 {
+                            None
+                        } else {
+                            find_inline_segments_for_event(snapshot_index, tgid, ts_ns)
+                        };
+                        let (labels, row_stats) =
+                            symbolize_user_frames_for_export(&frames, snapshot, &mut symbolizer)
+                                .await;
+                        stats.symbolized_user_rows += 1;
+                        stats.mapped_fallback_frames += row_stats.mapped_fallback_frames;
+                        stats.raw_fallback_frames += row_stats.raw_fallback_frames;
+                        labels_to_stack_trace(labels)
+                    }
+                }
+                (Some("both"), Some(frames_hex)) if !frames_hex.is_empty() => {
+                    let frames = parse_stack_frames_hex(frames_hex)?;
+                    if frames.is_empty() {
+                        labels_to_stack_trace(current_stack_trace.map(parse_stack_trace_labels).unwrap_or_default())
+                    } else {
+                        let snapshot = if tgid == 0 {
+                            None
+                        } else {
+                            find_inline_segments_for_event(snapshot_index, tgid, ts_ns)
+                        };
+                        let (mut labels, row_stats) =
+                            symbolize_user_frames_for_export(&frames, snapshot, &mut symbolizer)
+                                .await;
+                        if let Some(trace) = current_stack_trace {
+                            labels.extend(parse_kernel_labels_from_stack_trace(trace));
+                        }
+                        stats.symbolized_mixed_rows += 1;
+                        stats.mapped_fallback_frames += row_stats.mapped_fallback_frames;
+                        stats.raw_fallback_frames += row_stats.raw_fallback_frames;
+                        labels_to_stack_trace(labels)
+                    }
+                }
+                _ => labels_to_stack_trace(current_stack_trace.map(parse_stack_trace_labels).unwrap_or_default()),
             };
-            if segments.is_empty() {
-                proc_maps_snapshot_builder.append(false);
-                continue;
+            if let Some(rewritten_stack_trace) = rewritten_stack_trace {
+                let labels = parse_stack_trace_labels(&rewritten_stack_trace);
+                if labels.is_empty() {
+                    stack_trace_builder.append(false);
+                } else {
+                    for label in labels {
+                        stack_trace_builder.values().append_value(label);
+                    }
+                    stack_trace_builder.append(true);
+                }
+            } else {
+                stack_trace_builder.append(false);
             }
-
-            rows_with_snapshot += 1;
-            for segment in segments {
-                proc_maps_snapshot_builder
-                    .values()
-                    .field_builder::<UInt64Builder>(0)
-                    .expect("proc_maps_snapshot.start_addr builder type should match")
-                    .append_value(segment.start_addr);
-                proc_maps_snapshot_builder
-                    .values()
-                    .field_builder::<UInt64Builder>(1)
-                    .expect("proc_maps_snapshot.end_addr builder type should match")
-                    .append_value(segment.end_addr);
-                proc_maps_snapshot_builder
-                    .values()
-                    .field_builder::<UInt64Builder>(2)
-                    .expect("proc_maps_snapshot.file_offset builder type should match")
-                    .append_value(segment.file_offset);
-                proc_maps_snapshot_builder
-                    .values()
-                    .field_builder::<StringBuilder>(3)
-                    .expect("proc_maps_snapshot.path builder type should match")
-                    .append_value(segment.path.as_str());
-                proc_maps_snapshot_builder.values().append(true);
-            }
-            proc_maps_snapshot_builder.append(true);
         }
 
-        let mut columns = batch.columns().to_vec();
-        columns[proc_maps_snapshot_idx] = Arc::new(proc_maps_snapshot_builder.finish());
-        let rewritten_batch = RecordBatch::try_new(schema.clone(), columns)
+        let rewritten_stack_trace_column: ArrayRef = Arc::new(stack_trace_builder.finish());
+        let mut final_columns = Vec::with_capacity(final_schema.fields().len());
+        for field in final_schema.fields() {
+            if field.name() == "stack_trace" {
+                final_columns.push(rewritten_stack_trace_column.clone());
+                continue;
+            }
+            let source_idx = source_schema
+                .index_of(field.name())
+                .with_context(|| format!("events schema missing {} column", field.name()))?;
+            final_columns.push(batch.column(source_idx).clone());
+        }
+
+        let rewritten_batch = RecordBatch::try_new(final_schema.clone(), final_columns)
             .with_context(|| "failed to construct rewritten events batch")?;
         writer
             .write(&rewritten_batch)
@@ -1056,7 +1328,7 @@ fn embed_proc_maps_snapshots_into_events_parquet(
         )
     })?;
 
-    Ok(rows_with_snapshot)
+    Ok(stats)
 }
 
 fn format_stack_frames_hex(frames: &[u64]) -> Option<String> {
@@ -1268,7 +1540,91 @@ fn read_cpu_sample_stats(
     Ok(totals)
 }
 
-fn spawn_child(program: &str, args: &[String]) -> Result<Pid> {
+#[derive(Clone, Copy, Debug)]
+struct PrivilegeDropTarget {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+fn parse_env_id(name: &str) -> Result<Option<u32>> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u32>()
+            .map(Some)
+            .with_context(|| format!("invalid {name} value '{value}'")),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow!("failed to read {name}: {err}")),
+    }
+}
+
+fn resolve_privilege_drop_target() -> Result<Option<PrivilegeDropTarget>> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(None);
+    }
+
+    let sudo_uid = parse_env_id("SUDO_UID")?;
+    let sudo_gid = parse_env_id("SUDO_GID")?;
+    match (sudo_uid, sudo_gid) {
+        (Some(uid), Some(gid)) => Ok(Some(PrivilegeDropTarget { uid, gid })),
+        (None, None) => {
+            warn!(
+                "running as root without SUDO_UID/SUDO_GID; staying root for runtime and output files"
+            );
+            Ok(None)
+        }
+        _ => Err(anyhow!(
+            "running as root but SUDO_UID/SUDO_GID are inconsistent; both must be set to drop privileges"
+        )),
+    }
+}
+
+fn drop_process_privileges(target: PrivilegeDropTarget) -> Result<()> {
+    let ret = unsafe { libc::setgroups(0, std::ptr::null()) };
+    if ret != 0 {
+        return Err(anyhow!(
+            "setgroups(0, NULL) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let ret = unsafe { libc::setgid(target.gid) };
+    if ret != 0 {
+        return Err(anyhow!(
+            "setgid({}) failed: {}",
+            target.gid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let ret = unsafe { libc::setuid(target.uid) };
+    if ret != 0 {
+        return Err(anyhow!(
+            "setuid({}) failed: {}",
+            target.uid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let uid_matches = unsafe { libc::geteuid() == target.uid };
+    let gid_matches = unsafe { libc::getegid() == target.gid };
+    if !uid_matches || !gid_matches {
+        return Err(anyhow!(
+            "privilege drop verification failed: euid={}, egid={}, expected uid={}, gid={}",
+            unsafe { libc::geteuid() },
+            unsafe { libc::getegid() },
+            target.uid,
+            target.gid
+        ));
+    }
+
+    Ok(())
+}
+
+fn spawn_child(
+    program: &str,
+    args: &[String],
+    privilege_drop: Option<PrivilegeDropTarget>,
+) -> Result<Pid> {
     let mut cstrings = Vec::with_capacity(args.len() + 1);
     cstrings.push(
         CString::new(program)
@@ -1286,6 +1642,12 @@ fn spawn_child(program: &str, args: &[String]) -> Result<Pid> {
     match unsafe { fork()? } {
         ForkResult::Parent { child } => Ok(child),
         ForkResult::Child => unsafe {
+            if let Some(target) = privilege_drop
+                && let Err(error) = drop_process_privileges(target)
+            {
+                eprintln!("failed to drop child privileges before exec: {error}");
+                libc::_exit(126);
+            }
             libc::raise(libc::SIGSTOP);
             libc::execvp(argv[0], argv.as_ptr());
             libc::_exit(127);
@@ -1314,6 +1676,7 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
+    let privilege_drop_target = resolve_privilege_drop_target()?;
 
     if let Some(parquet_file) = args.view.as_deref() {
         return viewer_server::launch(parquet_file, args.port).await;
@@ -1346,7 +1709,7 @@ async fn main() -> Result<()> {
         .split_first()
         .ok_or_else(|| anyhow!("clap invariant violated: missing command in trace mode"))?;
 
-    let child_pid = spawn_child(program, program_args)?;
+    let child_pid = spawn_child(program, program_args, privilege_drop_target)?;
     let child_pid_u32 = child_pid.as_raw() as u32;
     info!("Spawned child process with PID {}", child_pid);
 
@@ -1438,6 +1801,14 @@ async fn main() -> Result<()> {
     let target_pid = u32::try_from(child_pid.as_raw())
         .context("child pid is negative and cannot be used for perf scope")?;
     attach_cpu_sampler(&mut ebpf, target_pid, args.sample_freq)?;
+
+    if let Some(target) = privilege_drop_target {
+        drop_process_privileges(target).context("failed to drop runtime privileges")?;
+        info!(
+            "Dropped privileges to uid={}, gid={} after eBPF setup",
+            target.uid, target.gid
+        );
+    }
 
     // Resume child process
     kill(child_pid, Signal::SIGCONT)
@@ -1607,26 +1978,25 @@ async fn main() -> Result<()> {
     // Finish writing and close the Parquet file
     let total_events = writer.finish()?;
     let total_maps = snapshot_collector.total_rows();
-    let mut embedded_snapshot_rows = 0usize;
 
-    if total_events > 0 && total_maps > 0 {
-        embedded_snapshot_rows = embed_proc_maps_snapshots_into_events_parquet(
-            &args.output,
-            snapshot_collector.snapshot_index(),
-            args.sample_freq,
-        )?;
-        info!(
-            "Post-processing complete: embedded proc map snapshots into {} event rows",
-            embedded_snapshot_rows
-        );
-    }
+    let finalization_stats = symbolize_stack_traces_into_events_parquet(
+        &args.output,
+        snapshot_collector.snapshot_index(),
+        args.sample_freq,
+    )
+    .await?;
+    info!(
+        "Post-processing complete: rows={}, symbolized_user_rows={}, symbolized_mixed_rows={}, mapped_fallback_frames={}, raw_fallback_frames={}",
+        finalization_stats.rewritten_rows,
+        finalization_stats.symbolized_user_rows,
+        finalization_stats.symbolized_mixed_rows,
+        finalization_stats.mapped_fallback_frames,
+        finalization_stats.raw_fallback_frames,
+    );
 
     info!("Done. Wrote {} events to {}", total_events, args.output);
     if total_maps > 0 {
-        info!(
-            "Captured {} proc map rows and embedded {} snapshots into {}",
-            total_maps, embedded_snapshot_rows, args.output
-        );
+        info!("Captured {} proc map rows while tracing", total_maps);
     }
 
     // Launch the viewer if we have events and --no-viewer wasn't specified

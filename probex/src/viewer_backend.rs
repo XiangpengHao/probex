@@ -12,26 +12,27 @@ use std::error::Error;
 mod backend {
     use super::*;
     use datafusion::arrow::array::{
-        Array, Int32Array, Int64Array, ListArray, StringArray, StringViewArray, StructArray,
-        UInt32Array, UInt64Array,
+        Array, Int32Array, Int64Array, ListArray, StringArray, StringViewArray, UInt32Array,
+        UInt64Array,
     };
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::prelude::*;
     use inferno::flamegraph;
     use parquet::file::reader::{FileReader, SerializedFileReader};
-    use std::collections::HashSet;
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
-    use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
     static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
     static TRACE_FILE_METADATA: OnceLock<TraceFileMetadata> = OnceLock::new();
 
     const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
+    const PARQUET_METADATA_STACK_TRACE_FORMAT_KEY: &str = "probex.stack_trace_format";
+    const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
     type BackendResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Debug)]
     struct TraceFileMetadata {
         cpu_sample_frequency_hz: u64,
     }
@@ -67,16 +68,57 @@ mod backend {
         ctx.register_parquet("events", path_str.as_ref(), ParquetReadOptions::default())
             .await?;
         let events_table = ctx.table("events").await?;
-        let has_inline_proc_maps = events_table
+        let has_stack_trace = events_table
+            .schema()
+            .has_column_with_unqualified_name("stack_trace");
+        let has_legacy_stack_frames = events_table
+            .schema()
+            .has_column_with_unqualified_name("stack_frames");
+        let has_legacy_proc_maps = events_table
             .schema()
             .has_column_with_unqualified_name("proc_maps_snapshot");
 
-        if !has_inline_proc_maps {
+        if !has_stack_trace {
             return Err(IoError::new(
                 ErrorKind::InvalidData,
                 format!(
-                    "Trace {} is missing required proc_maps_snapshot column. Regenerate with current probex.",
+                    "Trace {} is missing required stack_trace column. Regenerate with current probex.",
                     parquet_file.display()
+                ),
+            )
+            .into());
+        }
+        if has_legacy_stack_frames || has_legacy_proc_maps {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Trace {} uses legacy stack columns. Regenerate with current probex.",
+                    parquet_file.display()
+                ),
+            )
+            .into());
+        }
+        let stack_trace_field = events_table
+            .schema()
+            .field_with_unqualified_name("stack_trace")
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to resolve stack_trace field: {error}"),
+                )
+            })?;
+        let expected_stack_trace_type =
+            DataType::List(Arc::new(datafusion::arrow::datatypes::Field::new(
+                "item",
+                DataType::Utf8View,
+                true,
+            )));
+        if stack_trace_field.data_type() != &expected_stack_trace_type {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "column 'stack_trace' must have type List<Utf8View>, got {:?}",
+                    stack_trace_field.data_type()
                 ),
             )
             .into());
@@ -101,20 +143,18 @@ mod backend {
         Ok(())
     }
 
-    fn read_trace_file_metadata(parquet_file: &Path) -> BackendResult<TraceFileMetadata> {
+    fn read_trace_file_metadata(parquet_file: &std::path::Path) -> BackendResult<TraceFileMetadata> {
         let file = File::open(parquet_file)?;
         let reader = SerializedFileReader::new(file)?;
 
-        let cpu_sample_frequency_hz = reader
-            .metadata()
-            .file_metadata()
-            .key_value_metadata()
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| entry.key == PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY)
-            })
-            .and_then(|entry| entry.value.as_ref())
+        let key_value_entries = reader.metadata().file_metadata().key_value_metadata();
+        let metadata_value = |key: &str| -> Option<&str> {
+            key_value_entries
+                .and_then(|entries| entries.iter().find(|entry| entry.key == key))
+                .and_then(|entry| entry.value.as_deref())
+        };
+
+        let cpu_sample_frequency_hz = metadata_value(PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY)
             .ok_or_else(|| {
                 IoError::new(
                     ErrorKind::InvalidData,
@@ -140,6 +180,28 @@ mod backend {
                 format!(
                     "metadata '{}' must be > 0",
                     PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY
+                ),
+            )
+            .into());
+        }
+        let stack_trace_format = metadata_value(PARQUET_METADATA_STACK_TRACE_FORMAT_KEY)
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "required parquet metadata key '{}' missing",
+                        PARQUET_METADATA_STACK_TRACE_FORMAT_KEY
+                    ),
+                )
+            })?;
+        if stack_trace_format != STACK_TRACE_FORMAT_SYMBOLIZED_V1 {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "metadata '{}' must be '{}', got '{}'",
+                    PARQUET_METADATA_STACK_TRACE_FORMAT_KEY,
+                    STACK_TRACE_FORMAT_SYMBOLIZED_V1,
+                    stack_trace_format
                 ),
             )
             .into());
@@ -212,6 +274,66 @@ mod backend {
         Err(IoError::new(
             ErrorKind::InvalidData,
             format!("column '{col}' has unexpected string type"),
+        )
+        .into())
+    }
+
+    fn extract_option_stack_trace_labels(
+        batch: &datafusion::arrow::record_batch::RecordBatch,
+        row: usize,
+    ) -> BackendResult<Option<Vec<String>>> {
+        let column = batch.column_by_name("stack_trace").ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "missing column 'stack_trace'")
+        })?;
+        let list_array = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                "column 'stack_trace' has unexpected type, expected List",
+            )
+        })?;
+        if list_array.is_null(row) {
+            return Ok(None);
+        }
+
+        let values = list_array.value(row);
+        if let Some(arr) = values.as_any().downcast_ref::<StringViewArray>() {
+            let mut labels = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                if arr.is_null(idx) {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "stack_trace label contains NULL",
+                    )
+                    .into());
+                }
+                let label = arr.value(idx);
+                if !label.is_empty() {
+                    labels.push(label.to_string());
+                }
+            }
+            return Ok(Some(labels));
+        }
+        if let Some(arr) = values.as_any().downcast_ref::<StringArray>() {
+            let mut labels = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                if arr.is_null(idx) {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "stack_trace label contains NULL",
+                    )
+                    .into());
+                }
+                let label = arr.value(idx);
+                if !label.is_empty() {
+                    labels.push(label.to_string());
+                }
+            }
+            return Ok(Some(labels));
+        }
+
+        Err(IoError::new(
+            ErrorKind::InvalidData,
+            "stack_trace list items must be Utf8View/Utf8",
         )
         .into())
     }
@@ -929,324 +1051,6 @@ mod backend {
         })
     }
 
-    #[derive(Clone, Debug)]
-    struct ProcMapSegment {
-        start_addr: u64,
-        end_addr: u64,
-        file_offset: u64,
-        path: String,
-    }
-
-    #[derive(Clone, Debug)]
-    struct SampledStackRow {
-        stack_kind: Option<String>,
-        stack_frames: Option<String>,
-        stack_trace: Option<String>,
-        proc_maps_snapshot: Option<Vec<ProcMapSegment>>,
-    }
-
-    fn extract_option_proc_maps_snapshot(
-        batch: &datafusion::arrow::record_batch::RecordBatch,
-        row: usize,
-    ) -> BackendResult<Option<Vec<ProcMapSegment>>> {
-        let column = batch.column_by_name("proc_maps_snapshot").ok_or_else(|| {
-            IoError::new(
-                ErrorKind::InvalidData,
-                "missing column 'proc_maps_snapshot'",
-            )
-        })?;
-        let list_array = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-            IoError::new(
-                ErrorKind::InvalidData,
-                "column 'proc_maps_snapshot' has unexpected type, expected List",
-            )
-        })?;
-        if list_array.is_null(row) {
-            return Ok(None);
-        }
-
-        let list_values = list_array.value(row);
-        let struct_array = list_values
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| {
-                IoError::new(
-                    ErrorKind::InvalidData,
-                    "proc_maps_snapshot list item has unexpected type, expected Struct",
-                )
-            })?;
-        let start_array = struct_array
-            .column_by_name("start_addr")
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing start_addr"))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "start_addr type mismatch"))?;
-        let end_array = struct_array
-            .column_by_name("end_addr")
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing end_addr"))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "end_addr type mismatch"))?;
-        let offset_array = struct_array
-            .column_by_name("file_offset")
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing file_offset"))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "file_offset type mismatch"))?;
-        let path_column = struct_array
-            .column_by_name("path")
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing path"))?;
-
-        let mut segments = Vec::with_capacity(struct_array.len());
-        for idx in 0..struct_array.len() {
-            if start_array.is_null(idx) || end_array.is_null(idx) || offset_array.is_null(idx) {
-                continue;
-            }
-
-            let path = if let Some(path_array) =
-                path_column.as_any().downcast_ref::<StringViewArray>()
-            {
-                if path_array.is_null(idx) {
-                    continue;
-                }
-                path_array.value(idx).to_string()
-            } else if let Some(path_array) = path_column.as_any().downcast_ref::<StringArray>() {
-                if path_array.is_null(idx) {
-                    continue;
-                }
-                path_array.value(idx).to_string()
-            } else {
-                return Err(IoError::new(ErrorKind::InvalidData, "path type mismatch").into());
-            };
-
-            segments.push(ProcMapSegment {
-                start_addr: start_array.value(idx),
-                end_addr: end_array.value(idx),
-                file_offset: offset_array.value(idx),
-                path,
-            });
-        }
-
-        Ok(Some(segments))
-    }
-
-    struct OfflineUserSymbolizer {
-        symbol_manager: SymbolManager,
-        symbol_cache: std::collections::HashMap<(String, u64), Option<Vec<String>>>,
-        symbol_map_cache: std::collections::HashMap<String, Option<wholesym::SymbolMap>>,
-    }
-
-    impl OfflineUserSymbolizer {
-        fn new() -> Self {
-            Self {
-                symbol_manager: SymbolManager::with_config(SymbolManagerConfig::default()),
-                symbol_cache: std::collections::HashMap::new(),
-                symbol_map_cache: std::collections::HashMap::new(),
-            }
-        }
-
-        fn runtime_file_offset(runtime_ip: u64, map_start: u64, map_file_offset: u64) -> u64 {
-            runtime_ip
-                .saturating_sub(map_start)
-                .saturating_add(map_file_offset)
-        }
-
-        async fn ensure_symbol_map_loaded(&mut self, path: &str) {
-            if self.symbol_map_cache.contains_key(path) {
-                return;
-            }
-            let symbol_map = self
-                .symbol_manager
-                .load_symbol_map_for_binary_at_path(Path::new(path), None)
-                .await
-                .ok();
-            self.symbol_map_cache.insert(path.to_string(), symbol_map);
-        }
-
-        async fn symbolize_addrs_batch(&mut self, path: &str, addrs: &[u64]) {
-            if addrs.is_empty() {
-                return;
-            }
-
-            let path_key = path.to_string();
-            let mut unresolved = Vec::new();
-            let mut seen = HashSet::new();
-            for addr in addrs {
-                if !seen.insert(*addr) {
-                    continue;
-                }
-                let cache_key = (path_key.clone(), *addr);
-                if self.symbol_cache.contains_key(&cache_key) {
-                    continue;
-                }
-                unresolved.push(*addr);
-            }
-
-            if unresolved.is_empty() {
-                return;
-            }
-
-            self.ensure_symbol_map_loaded(path).await;
-
-            let Some(symbol_map) = self
-                .symbol_map_cache
-                .get(&path_key)
-                .and_then(|m| m.as_ref())
-            else {
-                for addr in unresolved {
-                    self.symbol_cache.insert((path_key.clone(), addr), None);
-                }
-                return;
-            };
-
-            for addr in unresolved {
-                let symbol = symbol_map
-                    .lookup(LookupAddress::FileOffset(addr))
-                    .await
-                    .and_then(symbol_labels_from_address_info);
-                self.symbol_cache.insert((path_key.clone(), addr), symbol);
-            }
-        }
-
-        fn lookup_symbol_labels(&self, path: &str, addr: u64) -> Option<Vec<String>> {
-            self.symbol_cache
-                .get(&(path.to_string(), addr))
-                .cloned()
-                .flatten()
-        }
-    }
-
-    fn symbol_labels_from_address_info(address_info: wholesym::AddressInfo) -> Option<Vec<String>> {
-        if let Some(frames) = &address_info.frames {
-            let mut labels: Vec<String> = frames
-                .iter()
-                .filter_map(|frame| {
-                    frame
-                        .function
-                        .as_ref()
-                        .filter(|function| !function.is_empty())
-                        .cloned()
-                })
-                .collect();
-            if !labels.is_empty() {
-                // wholesym returns inline frames from innermost to outermost.
-                // Folded stacks should be root to leaf.
-                labels.reverse();
-                return Some(labels);
-            }
-        }
-
-        if address_info.symbol.name.is_empty() || address_info.symbol.name == "??" {
-            None
-        } else {
-            Some(vec![address_info.symbol.name])
-        }
-    }
-
-    fn parse_stack_frames(stack_frames: &str) -> BackendResult<Vec<u64>> {
-        let mut frames = Vec::new();
-        for token in stack_frames.split(';') {
-            let trimmed = token.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let hex = trimmed
-                .strip_prefix("0x")
-                .or_else(|| trimmed.strip_prefix("0X"))
-                .unwrap_or(trimmed);
-            let ip = u64::from_str_radix(hex, 16).map_err(|error| {
-                IoError::new(
-                    ErrorKind::InvalidData,
-                    format!("invalid stack frame address '{trimmed}': {error}"),
-                )
-            })?;
-            frames.push(ip);
-        }
-        Ok(frames)
-    }
-
-    fn find_segment_for_ip(segments: &[ProcMapSegment], ip: u64) -> Option<&ProcMapSegment> {
-        segments
-            .iter()
-            .find(|segment| ip >= segment.start_addr && ip < segment.end_addr)
-    }
-
-    async fn symbolize_user_frames(
-        frames: &[u64],
-        inline_snapshot: Option<&[ProcMapSegment]>,
-        symbolizer: &mut OfflineUserSymbolizer,
-    ) -> Vec<String> {
-        let mut labels = Vec::with_capacity(frames.len() + 1);
-        labels.push("[user]".to_string());
-
-        let Some(segments) = inline_snapshot else {
-            labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
-            return labels;
-        };
-
-        if segments.is_empty() {
-            labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
-            return labels;
-        }
-
-        let mapped_segments: Vec<Option<&ProcMapSegment>> = frames
-            .iter()
-            .map(|ip| find_segment_for_ip(segments, *ip))
-            .collect();
-
-        let mut frame_symbol_keys: Vec<Option<(String, u64)>> = Vec::with_capacity(frames.len());
-        let mut unresolved_by_path: std::collections::HashMap<String, Vec<u64>> =
-            std::collections::HashMap::new();
-
-        for (ip, maybe_segment) in frames.iter().zip(mapped_segments.iter()) {
-            if let Some(segment) = maybe_segment {
-                let file_offset = OfflineUserSymbolizer::runtime_file_offset(
-                    *ip,
-                    segment.start_addr,
-                    segment.file_offset,
-                );
-                frame_symbol_keys.push(Some((segment.path.clone(), file_offset)));
-                unresolved_by_path
-                    .entry(segment.path.clone())
-                    .or_default()
-                    .push(file_offset);
-            } else {
-                frame_symbol_keys.push(None);
-            }
-        }
-
-        for (path, addrs) in unresolved_by_path {
-            symbolizer.symbolize_addrs_batch(&path, &addrs).await;
-        }
-
-        for (ip, maybe_key) in frames.iter().zip(frame_symbol_keys.into_iter()) {
-            if let Some((path, addr)) = maybe_key
-                && let Some(symbols) = symbolizer.lookup_symbol_labels(&path, addr)
-            {
-                labels.extend(symbols);
-            } else {
-                labels.push(format!("0x{ip:x}"));
-            }
-        }
-        labels
-    }
-
-    fn parse_kernel_labels_from_stack_trace(stack_trace: &str) -> Vec<String> {
-        let mut labels = Vec::new();
-        let mut in_kernel_section = false;
-        for frame in stack_trace.split(';').filter(|frame| !frame.is_empty()) {
-            if frame == "[kernel]" {
-                in_kernel_section = true;
-                labels.push(frame.to_string());
-                continue;
-            }
-            if in_kernel_section {
-                labels.push(frame.to_string());
-            }
-        }
-        labels
-    }
-
     fn sanitize_flame_frame_label(label: &str) -> String {
         let cleaned = label
             .replace(';', ":")
@@ -1317,19 +1121,14 @@ mod backend {
             format!("ts_ns >= {}", start_ns),
             format!("ts_ns <= {}", end_ns),
             format!("event_type = '{}'", event_type.replace('\'', "''")),
-            "(\
-              (stack_frames IS NOT NULL AND stack_frames <> '')\
-              OR\
-              (stack_trace IS NOT NULL AND stack_trace <> '')\
-             )"
-            .to_string(),
+            "(stack_trace IS NOT NULL)".to_string(),
         ];
         if let Some(pid) = pid {
             conditions.push(format!("pid = {}", pid));
         }
 
         let sql = format!(
-            "SELECT stack_kind, stack_frames, stack_trace, proc_maps_snapshot
+            "SELECT stack_trace
              FROM events
              WHERE {}",
             conditions.join(" AND ")
@@ -1337,7 +1136,7 @@ mod backend {
         let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
 
-        let mut sampled_rows: Vec<SampledStackRow> = Vec::new();
+        let mut sampled_stack_traces: Vec<Vec<String>> = Vec::new();
         let mut rows_seen = 0usize;
         let mut rng_state = {
             use std::collections::hash_map::DefaultHasher;
@@ -1353,121 +1152,32 @@ mod backend {
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let stack_kind = extract_option_string(batch, "stack_kind", row)?;
-                let stack_frames = extract_option_string(batch, "stack_frames", row)?;
-                let stack_trace = extract_option_string(batch, "stack_trace", row)?;
-                let proc_maps_snapshot = extract_option_proc_maps_snapshot(batch, row)?;
-                let sampled_row = SampledStackRow {
-                    stack_kind,
-                    stack_frames,
-                    stack_trace,
-                    proc_maps_snapshot,
+                let Some(stack_trace_labels) = extract_option_stack_trace_labels(batch, row)? else {
+                    continue;
                 };
+                if stack_trace_labels.is_empty() {
+                    continue;
+                }
 
                 rows_seen += 1;
-                if sampled_rows.len() < max_stacks {
-                    sampled_rows.push(sampled_row);
+                if sampled_stack_traces.len() < max_stacks {
+                    sampled_stack_traces.push(stack_trace_labels);
                     continue;
                 }
 
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let idx = (rng_state as usize) % rows_seen;
                 if idx < max_stacks {
-                    sampled_rows[idx] = sampled_row;
+                    sampled_stack_traces[idx] = stack_trace_labels;
                 }
             }
         }
-
-        let mut user_symbolizer = OfflineUserSymbolizer::new();
 
         let mut folded_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut total_samples = 0usize;
 
-        for row in sampled_rows {
-            let labels: Vec<String> = match (row.stack_kind.as_deref(), row.stack_frames.as_deref())
-            {
-                (Some("user"), Some(frames_hex)) if !frames_hex.is_empty() => {
-                    let snapshot = row.proc_maps_snapshot.as_deref().ok_or_else(|| {
-                        IoError::new(
-                            ErrorKind::InvalidData,
-                            "user stack row missing required proc_maps_snapshot",
-                        )
-                    })?;
-                    if snapshot.is_empty() {
-                        return Err(IoError::new(
-                            ErrorKind::InvalidData,
-                            "user stack row has empty proc_maps_snapshot",
-                        )
-                        .into());
-                    }
-                    let frames = parse_stack_frames(frames_hex)?;
-                    if frames.is_empty() {
-                        return Err(IoError::new(
-                            ErrorKind::InvalidData,
-                            "user stack row contains no parseable frames",
-                        )
-                        .into());
-                    }
-                    symbolize_user_frames(&frames, Some(snapshot), &mut user_symbolizer).await
-                }
-                (Some("both"), Some(frames_hex)) if !frames_hex.is_empty() => {
-                    let snapshot = row.proc_maps_snapshot.as_deref().ok_or_else(|| {
-                        IoError::new(
-                            ErrorKind::InvalidData,
-                            "mixed stack row missing required proc_maps_snapshot",
-                        )
-                    })?;
-                    if snapshot.is_empty() {
-                        return Err(IoError::new(
-                            ErrorKind::InvalidData,
-                            "mixed stack row has empty proc_maps_snapshot",
-                        )
-                        .into());
-                    }
-                    let frames = parse_stack_frames(frames_hex)?;
-                    if frames.is_empty() {
-                        return Err(IoError::new(
-                            ErrorKind::InvalidData,
-                            "mixed stack row contains no parseable frames",
-                        )
-                        .into());
-                    }
-                    let mut labels =
-                        symbolize_user_frames(&frames, Some(snapshot), &mut user_symbolizer).await;
-                    if let Some(stack_trace) = row.stack_trace.as_deref() {
-                        labels.extend(parse_kernel_labels_from_stack_trace(stack_trace));
-                    }
-                    labels
-                }
-                (Some("user"), _) => {
-                    return Err(IoError::new(
-                        ErrorKind::InvalidData,
-                        "user stack row missing stack_frames payload",
-                    )
-                    .into());
-                }
-                (Some("both"), _) => {
-                    return Err(IoError::new(
-                        ErrorKind::InvalidData,
-                        "mixed stack row missing stack_frames payload",
-                    )
-                    .into());
-                }
-                _ => row
-                    .stack_trace
-                    .as_deref()
-                    .unwrap_or("")
-                    .split(';')
-                    .filter(|frame| !frame.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            };
-
-            if labels.is_empty() {
-                continue;
-            }
-
+        for labels in sampled_stack_traces {
             total_samples += 1;
             let folded = labels
                 .into_iter()
