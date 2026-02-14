@@ -3,10 +3,51 @@ use std::{ffi::OsString, fs, path::Path, path::PathBuf, process::Command};
 
 fn main() -> anyhow::Result<()> {
     ensure_frontend_bundle()?;
-    build_ebpf()
+    ensure_ebpf_binary()
 }
 
-fn build_ebpf() -> anyhow::Result<()> {
+fn ensure_ebpf_binary() -> anyhow::Result<()> {
+    println!("cargo:rerun-if-changed=assets/ebpf");
+    println!("cargo:rerun-if-env-changed=PROBEX_SKIP_EBPF_BUILD");
+    println!("cargo:rerun-if-env-changed=PROBEX_FORCE_EBPF_BUILD");
+
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .context("CARGO_MANIFEST_DIR is missing for probex build script")?,
+    );
+    let out_dir =
+        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| anyhow!("OUT_DIR not set"))?);
+    let output_binary = out_dir.join("probex");
+    let arch = bpf_target_arch()?;
+    let prebuilt_binary = manifest_dir
+        .join("assets")
+        .join("ebpf")
+        .join(arch)
+        .join("probex");
+    let force_build = std::env::var("PROBEX_FORCE_EBPF_BUILD").as_deref() == Ok("1");
+
+    if !force_build && prebuilt_binary.is_file() {
+        let _ = fs::copy(&prebuilt_binary, &output_binary).with_context(|| {
+            format!(
+                "failed to copy prebuilt eBPF binary {} -> {}",
+                prebuilt_binary.display(),
+                output_binary.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    if std::env::var("PROBEX_SKIP_EBPF_BUILD").as_deref() == Ok("1") {
+        return Err(anyhow!(
+            "embedded eBPF binary missing at {}",
+            prebuilt_binary.display()
+        ));
+    }
+
+    build_ebpf_from_source(&output_binary)
+}
+
+fn build_ebpf_from_source(output_binary: &Path) -> anyhow::Result<()> {
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .exec()
         .context("MetadataCommand::exec")?;
@@ -21,8 +62,9 @@ fn build_ebpf() -> anyhow::Result<()> {
         .as_std_path();
     println!("cargo:rerun-if-changed={}", root_dir.display());
 
-    let out_dir =
-        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| anyhow!("OUT_DIR not set"))?);
+    let out_dir = output_binary
+        .parent()
+        .ok_or_else(|| anyhow!("output path has no parent: {}", output_binary.display()))?;
     let target_dir = out_dir.join("probex-ebpf");
     let target = bpf_target_triple()?;
     let bpf_target_arch = bpf_target_arch()?;
@@ -55,9 +97,8 @@ fn build_ebpf() -> anyhow::Result<()> {
         return Err(anyhow!("{cmd:?} failed: {status:?}"));
     }
 
-    let built_binary = target_dir.join(&target).join("release").join("probex");
-    let output_binary = out_dir.join("probex");
-    let _ = fs::copy(&built_binary, &output_binary).with_context(|| {
+    let built_binary = target_dir.join(target).join("release").join("probex");
+    let _ = fs::copy(&built_binary, output_binary).with_context(|| {
         format!(
             "failed to copy eBPF binary {} -> {}",
             built_binary.display(),

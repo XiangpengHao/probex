@@ -7,7 +7,14 @@ repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/probex"
 description = "Low-friction Linux eBPF profiler with integrated web viewer"
-include = ["Cargo.toml", "build.rs", "src/**", "assets/viewer/**", "tests/**"]
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "src/**",
+    "assets/viewer/**",
+    "assets/ebpf/**",
+    "tests/**",
+]
 
 [dependencies]
 probex-common = { path = "../probex-common", version = "0.1.8", features = ["user"] }
