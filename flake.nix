@@ -30,7 +30,7 @@
               "rust-src"
               "llvm-tools-preview"
             ];
-            targets = [ "wasm32-unknown-unknown" ];
+            targets = [ "wasm32-unknown-unknown" "x86_64-unknown-linux-gnu" ];
           }
         );
         # Fetch daisyUI bundle files
