@@ -71,6 +71,8 @@ pub fn ProcessTimeline(
     let process_bar_drag_state = use_signal(|| Option::<ProcessBarDragState>::None);
     let process_bar_drag_preview = use_signal(|| Option::<ProcessBarDragPreview>::None);
     let process_bar_width_px = use_signal(|| 0.0f64);
+    // Hover time for cross-hair line between timeline overview and process bars
+    let mut hover_time_ns = use_signal(|| Option::<u64>::None);
 
     let full_duration_ns = range.full_end_ns.saturating_sub(range.full_start_ns);
     let full_duration = full_duration_ns as f64;
@@ -169,6 +171,9 @@ pub fn ProcessTimeline(
                         view_end_ns: range.view_end_ns,
                     },
                     on_change_range,
+                    on_hover_time: EventHandler::new(move |time: Option<u64>| {
+                        hover_time_ns.set(time);
+                    }),
                 }
             }
 
@@ -351,7 +356,33 @@ pub fn ProcessTimeline(
                 div { class: "w-20 shrink-0" }
             }
 
-            div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
+            // Process rows with hover crosshair overlay
+            div { class: "relative",
+                // Hover time crosshair line overlay - positioned over the bar area
+                if let Some(hover_ns) = hover_time_ns() {
+                    if hover_ns >= range.view_start_ns && hover_ns <= range.view_end_ns {
+                        {
+                            let view_duration = (range.view_end_ns - range.view_start_ns) as f64;
+                            let hover_pct = ((hover_ns - range.view_start_ns) as f64
+                                / view_duration
+                                * 100.0)
+                                .clamp(0.0, 100.0);
+                            rsx! {
+                                // Container matching the bar area (between w-56 label and w-20 duration columns)
+                                div {
+                                    class: "absolute top-0 bottom-0 pointer-events-none z-10",
+                                    style: "left: 224px; right: 80px;",
+                                    div {
+                                        class: "absolute top-0 bottom-0 w-px bg-gray-400/70",
+                                        style: "left: {hover_pct}%;",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
                 {tree.visible_process_rows.iter().map(|(proc, tree_pos)| {
                     let depth = tree_pos.ancestor_is_last.len();
 
@@ -718,6 +749,7 @@ pub fn ProcessTimeline(
                         }
                     }
                 })}
+                }
             }
 
             // Continue selection while cursor leaves the process bar.
@@ -820,6 +852,7 @@ fn TimelineOverview(
     data: TimelineOverviewData,
     range: TimelineOverviewRange,
     on_change_range: EventHandler<(u64, u64)>,
+    on_hover_time: EventHandler<Option<u64>>,
 ) -> Element {
     let TimelineOverviewData {
         histogram,
@@ -1018,11 +1051,24 @@ fn TimelineOverview(
                 }
             },
             onmousemove: move |evt: MouseEvent| {
+                // Track hover time for crosshair line
+                let cw = container_width_px();
+                if cw > 0.0 {
+                    let element_x = evt.element_coordinates().x;
+                    let hover_frac = (element_x / cw).clamp(0.0, 1.0);
+                    let hover_ns = full_start_ns + (hover_frac * full_range).round() as u64;
+                    on_hover_time.call(Some(hover_ns));
+                }
+
+                // Handle drag if active
                 let Some(d) = drag() else { return };
                 let (start, end) = compute_range(d, evt.client_coordinates().x);
                 if drag_preview_range() != Some((start, end)) {
                     drag_preview_range.set(Some((start, end)));
                 }
+            },
+            onmouseleave: move |_| {
+                on_hover_time.call(None);
             },
             onmouseup: move |_| {
                 if drag().is_some() {

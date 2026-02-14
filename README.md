@@ -12,7 +12,10 @@ nix run github:XiangpengHao/probex -- sleep 1
 
 ### Cargo
 
+You need to have the `bpf-linker` tool installed.
+
 ```shell
+cargo install bpf-linker
 cargo install probex
 sudo probex -- sleep 1
 ```
@@ -26,9 +29,9 @@ sudo target/release/probex -- sleep 1
 ### Download binary
 
 ```shell
-wget https://github.com/XiangpengHao/probex/releases/download/latest/probex-linux-x86_64-latest.tar.gz
-tar -xzf probex-linux-x86_64-latest.tar.gz
-sudo ./probex-linux-x86_64-latest/probex -- sleep 1
+wget -O probex.tar.gz $(curl -s https://api.github.com/repos/XiangpengHao/probex/releases/latest | grep "browser_download_url.*linux-x86_64.*tar.gz" | cut -d : -f 2,3 | tr -d \")
+tar -xzf probex.tar.gz
+sudo ./probex -- sleep 1
 ```
 
 ## What it looks like
