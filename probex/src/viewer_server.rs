@@ -70,13 +70,18 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
     viewer_backend::initialize(parquet_path.clone())
         .await
         .map_err(|error| anyhow!("failed to initialize viewer backend: {error}"))?;
+    if ViewerAssets::get(INDEX_HTML).is_none() {
+        return Err(anyhow!(
+            "embedded viewer assets missing index.html; rebuild probex with bundled frontend assets"
+        ));
+    }
 
     let bind_addr = format!("0.0.0.0:{port}");
     let launch_urls = viewer_launch_urls(port);
     let primary_url = launch_urls
         .first()
         .cloned()
-        .unwrap_or_else(|| format!("http://localhost:{port}"));
+        .expect("viewer launch urls should always include localhost");
     let alt_urls = launch_urls.iter().skip(1).cloned().collect::<Vec<String>>();
     if alt_urls.is_empty() {
         log::info!("Launching viewer at {primary_url}");
@@ -202,14 +207,7 @@ async fn static_handler(uri: Uri) -> Response {
 }
 
 fn index_html_response() -> Response {
-    match embedded_asset_response(INDEX_HTML) {
-        Some(response) => response,
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "viewer assets are not embedded. Build frontend first with `dx bundle --release --platform web -p probex-viewer`, then rebuild probex.",
-        )
-            .into_response(),
-    }
+    embedded_asset_response(INDEX_HTML).expect("embedded viewer assets must include index.html")
 }
 
 fn embedded_asset_response(path: &str) -> Option<Response> {

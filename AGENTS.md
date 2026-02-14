@@ -19,3 +19,5 @@
 - Do not add new dependency.
 - Prefer compact, information-dense summaries over tall cards; colocate related controls/stats and remove redundant panels.
 - We never care about compatibility. Focus on new code/feature/format only.
+- Prefer strict contracts over best-effort behavior: missing required schema/data is a hard failure.
+- Use types and parser invariants to make invalid states unrepresentable; avoid runtime “ignore/fallback” branches.

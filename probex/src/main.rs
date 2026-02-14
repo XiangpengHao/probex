@@ -127,7 +127,7 @@ use aya::{
     },
     util::kernel_symbols,
 };
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use log::{debug, info, warn};
 use nix::{
     sys::{
@@ -161,6 +161,11 @@ const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
 #[command(name = "probex")]
 #[command(about = "eBPF process tracing tool")]
 #[command(version)]
+#[command(group(
+    ArgGroup::new("mode")
+        .args(["view", "command"])
+        .required(true)
+))]
 struct Args {
     /// Output parquet file (default: trace.parquet)
     #[arg(short, long, default_value = "trace.parquet")]
@@ -171,11 +176,11 @@ struct Args {
     port: u16,
 
     /// Don't launch the viewer after tracing
-    #[arg(long)]
+    #[arg(long, conflicts_with = "view")]
     no_viewer: bool,
 
     /// View an existing parquet trace file without tracing a new command
-    #[arg(long, value_name = "PARQUET")]
+    #[arg(long, value_name = "PARQUET", conflicts_with = "command")]
     view: Option<String>,
 
     /// Perf-style CPU clock sampling frequency (Hz)
@@ -183,7 +188,11 @@ struct Args {
     sample_freq: u64,
 
     /// Command to run
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        required_unless_present = "view"
+    )]
     command: Vec<String>,
 }
 
@@ -478,8 +487,8 @@ impl ParquetBatchWriter {
     }
 }
 
-fn stack_kind_from_header(header: &EventHeader) -> Option<&'static str> {
-    match header.stack_kind {
+fn stack_kind_from_header(stack_kind: u8) -> Option<&'static str> {
+    match stack_kind {
         STACK_KIND_USER => Some("user"),
         STACK_KIND_KERNEL => Some("kernel"),
         STACK_KIND_BOTH => Some("both"),
@@ -487,7 +496,7 @@ fn stack_kind_from_header(header: &EventHeader) -> Option<&'static str> {
     }
 }
 
-fn event_base(event_type: &'static str, header: &EventHeader) -> Event {
+fn event_base(event_type: &'static str, header: EventHeader) -> Event {
     Event {
         event_type,
         ts_ns: header.timestamp_ns,
@@ -495,260 +504,219 @@ fn event_base(event_type: &'static str, header: &EventHeader) -> Event {
         tgid: header.tgid,
         stack_id: (header.stack_id >= 0).then_some(header.stack_id),
         kernel_stack_id: (header.kernel_stack_id >= 0).then_some(header.kernel_stack_id),
-        stack_kind: stack_kind_from_header(header),
+        stack_kind: stack_kind_from_header(header.stack_kind),
         cpu: header.cpu,
         ..Default::default()
     }
 }
 
-/// Parse event from ring buffer data into a flattened Event struct
-fn parse_event(data: &[u8]) -> Option<Event> {
-    if data.len() < std::mem::size_of::<EventHeader>() {
+fn read_unaligned_from_bytes<T: Copy>(data: &[u8]) -> Option<T> {
+    if data.len() < std::mem::size_of::<T>() {
         return None;
     }
+    Some(unsafe { std::ptr::read_unaligned(data.as_ptr() as *const T) })
+}
 
-    let header: &EventHeader = unsafe { &*(data.as_ptr() as *const EventHeader) };
-    let event_type = EventType::try_from(header.event_type).ok()?;
+/// Parse event from ring buffer data into a flattened Event struct
+fn parse_event(data: &[u8]) -> Result<Event> {
+    let header = read_unaligned_from_bytes::<EventHeader>(data).ok_or_else(|| {
+        anyhow!(
+            "event payload too short for EventHeader: {} bytes",
+            data.len()
+        )
+    })?;
+    let event_type = EventType::try_from(header.event_type)
+        .map_err(|value| anyhow!("unknown event_type discriminant: {value}"))?;
 
     match event_type {
         EventType::SchedSwitch => {
-            if data.len() < std::mem::size_of::<SchedSwitchEvent>() {
-                return None;
-            }
-            let event: &SchedSwitchEvent = unsafe { &*(data.as_ptr() as *const SchedSwitchEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SchedSwitchEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SchedSwitchEvent"))?;
+            Ok(Event {
                 prev_pid: Some(event.prev_pid),
                 next_pid: Some(event.next_pid),
                 prev_state: Some(event.prev_state),
-                ..event_base("sched_switch", &event.header)
+                ..event_base("sched_switch", event.header)
             })
         }
         EventType::ProcessFork => {
-            if data.len() < std::mem::size_of::<ProcessForkEvent>() {
-                return None;
-            }
-            let event: &ProcessForkEvent = unsafe { &*(data.as_ptr() as *const ProcessForkEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<ProcessForkEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for ProcessForkEvent"))?;
+            Ok(Event {
                 parent_pid: Some(event.parent_pid),
                 child_pid: Some(event.child_pid),
-                ..event_base("process_fork", &event.header)
+                ..event_base("process_fork", event.header)
             })
         }
         EventType::ProcessExit => {
-            if data.len() < std::mem::size_of::<ProcessExitEvent>() {
-                return None;
-            }
-            let event: &ProcessExitEvent = unsafe { &*(data.as_ptr() as *const ProcessExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<ProcessExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for ProcessExitEvent"))?;
+            Ok(Event {
                 exit_code: Some(event.exit_code),
-                ..event_base("process_exit", &event.header)
+                ..event_base("process_exit", event.header)
             })
         }
         EventType::PageFault => {
-            if data.len() < std::mem::size_of::<PageFaultEvent>() {
-                return None;
-            }
-            let event: &PageFaultEvent = unsafe { &*(data.as_ptr() as *const PageFaultEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<PageFaultEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for PageFaultEvent"))?;
+            Ok(Event {
                 address: Some(event.address),
                 error_code: Some(event.error_code),
-                ..event_base("page_fault", &event.header)
+                ..event_base("page_fault", event.header)
             })
         }
         EventType::SyscallReadEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..event_base("syscall_read_enter", &event.header)
+                ..event_base("syscall_read_enter", event.header)
             })
         }
         EventType::SyscallReadExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_read_exit", &event.header)
+                ..event_base("syscall_read_exit", event.header)
             })
         }
         EventType::SyscallWriteEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..event_base("syscall_write_enter", &event.header)
+                ..event_base("syscall_write_enter", event.header)
             })
         }
         EventType::SyscallWriteExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_write_exit", &event.header)
+                ..event_base("syscall_write_exit", event.header)
             })
         }
         EventType::SyscallMmapEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 address: Some(event.fd as u64),
                 count: Some(event.count),
-                ..event_base("syscall_mmap_enter", &event.header)
+                ..event_base("syscall_mmap_enter", event.header)
             })
         }
         EventType::SyscallMmapExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_mmap_exit", &event.header)
+                ..event_base("syscall_mmap_exit", event.header)
             })
         }
         EventType::SyscallMunmapEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 address: Some(event.fd as u64),
                 count: Some(event.count),
-                ..event_base("syscall_munmap_enter", &event.header)
+                ..event_base("syscall_munmap_enter", event.header)
             })
         }
         EventType::SyscallMunmapExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_munmap_exit", &event.header)
+                ..event_base("syscall_munmap_exit", event.header)
             })
         }
         EventType::SyscallBrkEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 address: Some(event.fd as u64),
-                ..event_base("syscall_brk_enter", &event.header)
+                ..event_base("syscall_brk_enter", event.header)
             })
         }
         EventType::SyscallBrkExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_brk_exit", &event.header)
+                ..event_base("syscall_brk_exit", event.header)
             })
         }
         EventType::SyscallIoUringSetupEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..event_base("syscall_io_uring_setup_enter", &event.header)
+                ..event_base("syscall_io_uring_setup_enter", event.header)
             })
         }
         EventType::SyscallIoUringSetupExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_io_uring_setup_exit", &event.header)
+                ..event_base("syscall_io_uring_setup_exit", event.header)
             })
         }
         EventType::SyscallIoUringEnterEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..event_base("syscall_io_uring_enter_enter", &event.header)
+                ..event_base("syscall_io_uring_enter_enter", event.header)
             })
         }
         EventType::SyscallIoUringEnterExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_io_uring_enter_exit", &event.header)
+                ..event_base("syscall_io_uring_enter_exit", event.header)
             })
         }
         EventType::SyscallIoUringRegisterEnter => {
-            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
-                return None;
-            }
-            let event: &SyscallEnterEvent =
-                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..event_base("syscall_io_uring_register_enter", &event.header)
+                ..event_base("syscall_io_uring_register_enter", event.header)
             })
         }
         EventType::SyscallIoUringRegisterExit => {
-            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
-                return None;
-            }
-            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
-            Some(Event {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
                 ret: Some(event.ret),
-                ..event_base("syscall_io_uring_register_exit", &event.header)
+                ..event_base("syscall_io_uring_register_exit", event.header)
             })
         }
         EventType::CpuSample => {
-            if data.len() < std::mem::size_of::<CpuSampleEvent>() {
-                return None;
-            }
-            let event: &CpuSampleEvent = unsafe { &*(data.as_ptr() as *const CpuSampleEvent) };
+            let event = read_unaligned_from_bytes::<CpuSampleEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for CpuSampleEvent"))?;
             let frame_count = usize::from(event.frame_count).min(MAX_CPU_SAMPLE_FRAMES);
             // Frame-pointer walk captures frames from leaf to root.
             // Flamegraph folding expects root to leaf.
             let mut frames: Vec<u64> = event.frames[..frame_count].to_vec();
             frames.reverse();
 
-            let mut out = event_base("cpu_sample", &event.header);
+            let mut out = event_base("cpu_sample", event.header);
             if let Some(stack_frames) = format_stack_frames_hex(&frames) {
                 out.stack_frames = Some(stack_frames.clone());
                 out.stack_trace = Some(format!("[user];{stack_frames}"));
             } else {
                 out.stack_kind = None;
             }
-            Some(out)
+            Ok(out)
         }
     }
 }
@@ -1111,14 +1079,11 @@ fn is_plausible_user_instruction_ip(ip: u64) -> bool {
 }
 
 fn read_stack_frames(
-    stack_id: i32,
+    stack_id: u32,
     is_user_stack: bool,
     stack_traces: &StackTraceMap<MapData>,
 ) -> Vec<u64> {
-    if stack_id < 0 {
-        return Vec::new();
-    }
-    let Ok(stack) = stack_traces.get(&(stack_id as u32), 0) else {
+    let Ok(stack) = stack_traces.get(&stack_id, 0) else {
         return Vec::new();
     };
 
@@ -1159,10 +1124,22 @@ fn materialize_stacks(
     kernel_syms: Option<&BTreeMap<u64, String>>,
 ) -> MaterializedStack {
     let user_frames = user_stack_id
-        .map(|stack_id| read_stack_frames(stack_id, true, stack_traces))
+        .map(|stack_id| {
+            read_stack_frames(
+                u32::try_from(stack_id).expect("stack_id should always be non-negative"),
+                true,
+                stack_traces,
+            )
+        })
         .unwrap_or_default();
     let kernel_frames = kernel_stack_id
-        .map(|stack_id| read_stack_frames(stack_id, false, stack_traces))
+        .map(|stack_id| {
+            read_stack_frames(
+                u32::try_from(stack_id).expect("kernel_stack_id should always be non-negative"),
+                false,
+                stack_traces,
+            )
+        })
         .unwrap_or_default();
 
     match stack_kind {
@@ -1339,21 +1316,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(parquet_file) = args.view.as_deref() {
-        if args.no_viewer {
-            warn!("Ignoring --no-viewer in --view mode");
-        }
-        if !args.command.is_empty() {
-            return Err(anyhow!(
-                "--view cannot be combined with a command; use one mode at a time"
-            ));
-        }
         return viewer_server::launch(parquet_file, args.port).await;
-    }
-
-    if args.command.is_empty() {
-        return Err(anyhow!(
-            "No command specified. Pass a command to trace, or use --view <trace.parquet>."
-        ));
     }
 
     // Bump the memlock rlimit
@@ -1378,8 +1341,10 @@ async fn main() -> Result<()> {
     }
 
     // Spawn child process with SIGSTOP
-    let program = &args.command[0];
-    let program_args = &args.command[1..];
+    let (program, program_args) = args
+        .command
+        .split_first()
+        .ok_or_else(|| anyhow!("clap invariant violated: missing command in trace mode"))?;
 
     let child_pid = spawn_child(program, program_args)?;
     let child_pid_u32 = child_pid.as_raw() as u32;
@@ -1391,8 +1356,10 @@ async fn main() -> Result<()> {
 
     // Insert child PID into TRACED_PIDS map
     {
-        let mut traced_pids: HashMap<_, u32, u8> =
-            HashMap::try_from(ebpf.map_mut("TRACED_PIDS").unwrap())?;
+        let mut traced_pids: HashMap<_, u32, u8> = HashMap::try_from(
+            ebpf.map_mut("TRACED_PIDS")
+                .ok_or_else(|| anyhow!("map TRACED_PIDS not found"))?,
+        )?;
         traced_pids.insert(child_pid_u32, 1, 0)?;
         info!("Added PID {} to traced PIDs", child_pid_u32);
     }
@@ -1566,9 +1533,9 @@ async fn main() -> Result<()> {
 
                 // Drain any remaining events
                 while let Some(item) = async_ring_buf.get_mut().next() {
-                    if let Some(mut event) = parse_event(&item) {
-                        handle_event(&mut event)?;
-                    }
+                    let mut event = parse_event(&item)
+                        .with_context(|| "failed to parse ring buffer event while draining")?;
+                    handle_event(&mut event)?;
                 }
                 info!("Child process {} exited", child_pid);
                 break;
@@ -1589,9 +1556,9 @@ async fn main() -> Result<()> {
 
                 // Process all available events
                 while let Some(item) = guard.get_inner_mut().next() {
-                    if let Some(mut event) = parse_event(&item) {
-                        handle_event(&mut event)?;
-                    }
+                    let mut event =
+                        parse_event(&item).with_context(|| "failed to parse ring buffer event")?;
+                    handle_event(&mut event)?;
                 }
 
                 guard.clear_ready();
@@ -1643,23 +1610,15 @@ async fn main() -> Result<()> {
     let mut embedded_snapshot_rows = 0usize;
 
     if total_events > 0 && total_maps > 0 {
-        match embed_proc_maps_snapshots_into_events_parquet(
+        embedded_snapshot_rows = embed_proc_maps_snapshots_into_events_parquet(
             &args.output,
             snapshot_collector.snapshot_index(),
             args.sample_freq,
-        ) {
-            Ok(rows_with_snapshot) => {
-                embedded_snapshot_rows = rows_with_snapshot;
-                info!(
-                    "Post-processing complete: embedded proc map snapshots into {} event rows",
-                    rows_with_snapshot
-                );
-            }
-            Err(error) => warn!(
-                "Failed to post-process inline proc map snapshots: {}",
-                error
-            ),
-        }
+        )?;
+        info!(
+            "Post-processing complete: embedded proc map snapshots into {} event rows",
+            embedded_snapshot_rows
+        );
     }
 
     info!("Done. Wrote {} events to {}", total_events, args.output);
@@ -1671,11 +1630,8 @@ async fn main() -> Result<()> {
     }
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
-    if total_events > 0
-        && !args.no_viewer
-        && let Err(error) = viewer_server::launch(&args.output, args.port).await
-    {
-        warn!("Skipping viewer launch: {error}");
+    if total_events > 0 && !args.no_viewer {
+        viewer_server::launch(&args.output, args.port).await?;
     }
 
     Ok(())

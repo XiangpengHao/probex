@@ -65,9 +65,13 @@ fn TraceViewer() -> Element {
     use_resource(move || async move {
         match get_summary().await {
             Ok(s) => {
-                if let Some(range) = ViewRange::new(s.min_ts_ns, s.max_ts_ns) {
-                    view_range.set(Some(range));
-                }
+                let Some(range) = ViewRange::new(s.min_ts_ns, s.max_ts_ns) else {
+                    error_msg.set(Some(
+                        "Invalid summary range: max_ts_ns must be >= min_ts_ns".to_string(),
+                    ));
+                    return;
+                };
+                view_range.set(Some(range));
                 let mut default_event_types: HashSet<String> =
                     s.event_types.iter().cloned().collect();
                 if default_event_types.len() > 1 {
@@ -195,7 +199,7 @@ fn TraceViewer() -> Element {
                         processes: lifetimes.processes,
                         process_events: process_events(),
                         histogram: hist_data,
-                        summary: summary_data.clone(),
+                        summary: summary.clone(),
                         pid_summary: pid_summary.clone(),
                         latency_stats: syscall_latency_stats(),
                         selected_flame_event_type: selected_flame_event_type_value.clone(),

@@ -19,9 +19,7 @@ pub fn ViewerHeader(summary: Option<TraceSummary>) -> Element {
                         StatBadge { label: "Events", value: format!("{}", s.total_events) }
                         StatBadge { label: "Duration", value: format_duration(duration) }
                         StatBadge { label: "PIDs", value: format!("{}", s.unique_pids.len()) }
-                        if let Some(freq_hz) = s.cpu_sample_frequency_hz {
-                            StatBadge { label: "Sample Hz", value: format!("{}", freq_hz) }
-                        }
+                        StatBadge { label: "Sample Hz", value: format!("{}", s.cpu_sample_frequency_hz) }
                     }
                 }
             }

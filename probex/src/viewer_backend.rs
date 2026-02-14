@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::error::Error;
 
 /// Histogram bucket for density visualization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,7 +55,7 @@ pub struct TraceSummary {
     pub unique_pids: Vec<u32>,
     pub min_ts_ns: u64,
     pub max_ts_ns: u64,
-    pub cpu_sample_frequency_hz: Option<u64>,
+    pub cpu_sample_frequency_hz: u64,
 }
 
 /// Process lifetime information for timeline visualization.
@@ -102,8 +103,8 @@ pub struct EventFlamegraphResponse {
 mod backend {
     use super::*;
     use datafusion::arrow::array::{
-        Array, Float32Array, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
-        StringViewArray, StructArray, UInt32Array, UInt64Array,
+        Array, Int32Array, Int64Array, ListArray, StringArray, StringViewArray, StructArray,
+        UInt32Array, UInt64Array,
     };
     use datafusion::prelude::*;
     use inferno::flamegraph;
@@ -119,23 +120,26 @@ mod backend {
     static TRACE_FILE_METADATA: OnceLock<TraceFileMetadata> = OnceLock::new();
 
     const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
+    type BackendResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-    #[derive(Clone, Copy, Debug, Default)]
+    #[derive(Clone, Copy, Debug)]
     struct TraceFileMetadata {
-        cpu_sample_frequency_hz: Option<u64>,
+        cpu_sample_frequency_hz: u64,
     }
 
-    fn get_ctx() -> Result<&'static Arc<SessionContext>, Box<dyn std::error::Error + Send + Sync>> {
+    fn get_ctx() -> BackendResult<&'static Arc<SessionContext>> {
         SESSION_CTX
             .get()
             .ok_or_else(|| "DataFusion session not initialized".into())
     }
 
-    pub async fn initialize(
-        parquet_file: PathBuf,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn initialize(parquet_file: PathBuf) -> BackendResult<()> {
         if SESSION_CTX.get().is_some() {
-            return Ok(());
+            return Err(IoError::new(
+                ErrorKind::AlreadyExists,
+                "DataFusion session is already initialized",
+            )
+            .into());
         }
         if !parquet_file.exists() {
             return Err(IoError::new(
@@ -145,7 +149,7 @@ mod backend {
             .into());
         }
 
-        let metadata = read_trace_file_metadata(&parquet_file);
+        let metadata = read_trace_file_metadata(&parquet_file)?;
         let _ = TRACE_FILE_METADATA.set(metadata);
 
         let ctx = SessionContext::new();
@@ -153,14 +157,10 @@ mod backend {
         let path_str = parquet_file.to_string_lossy();
         ctx.register_parquet("events", path_str.as_ref(), ParquetReadOptions::default())
             .await?;
-        let has_inline_proc_maps = ctx
-            .table("events")
-            .await
-            .map(|df| {
-                df.schema()
-                    .has_column_with_unqualified_name("proc_maps_snapshot")
-            })
-            .unwrap_or(false);
+        let events_table = ctx.table("events").await?;
+        let has_inline_proc_maps = events_table
+            .schema()
+            .has_column_with_unqualified_name("proc_maps_snapshot");
 
         if !has_inline_proc_maps {
             return Err(IoError::new(
@@ -176,20 +176,10 @@ mod backend {
         // Verify we can read the table
         let df = ctx.sql("SELECT COUNT(*) as cnt FROM events").await?;
         let batches = df.collect().await?;
-        let count = if let Some(batch) = batches.first() {
-            if batch.num_rows() > 0 {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .map(|arr| arr.value(0))
-                    .unwrap_or(0)
-            } else {
-                0
-            }
-        } else {
-            0
-        };
+        let count_batch = batches.first().ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "COUNT(*) query returned no rows")
+        })?;
+        let count = extract_i64(count_batch, "cnt", 0)?;
 
         SESSION_CTX.set(Arc::new(ctx)).map_err(|_| {
             IoError::new(
@@ -202,13 +192,9 @@ mod backend {
         Ok(())
     }
 
-    fn read_trace_file_metadata(parquet_file: &Path) -> TraceFileMetadata {
-        let Ok(file) = File::open(parquet_file) else {
-            return TraceFileMetadata::default();
-        };
-        let Ok(reader) = SerializedFileReader::new(file) else {
-            return TraceFileMetadata::default();
-        };
+    fn read_trace_file_metadata(parquet_file: &Path) -> BackendResult<TraceFileMetadata> {
+        let file = File::open(parquet_file)?;
+        let reader = SerializedFileReader::new(file)?;
 
         let cpu_sample_frequency_hz = reader
             .metadata()
@@ -220,138 +206,269 @@ mod backend {
                     .find(|entry| entry.key == PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY)
             })
             .and_then(|entry| entry.value.as_ref())
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|hz| *hz > 0);
-
-        TraceFileMetadata {
-            cpu_sample_frequency_hz,
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "required parquet metadata key '{}' missing",
+                        PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY
+                    ),
+                )
+            })?
+            .parse::<u64>()
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "invalid '{}' metadata value: {}",
+                        PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY, error
+                    ),
+                )
+            })?;
+        if cpu_sample_frequency_hz == 0 {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "metadata '{}' must be > 0",
+                    PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY
+                ),
+            )
+            .into());
         }
+
+        Ok(TraceFileMetadata {
+            cpu_sample_frequency_hz,
+        })
     }
 
     fn extract_string(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
         row: usize,
-    ) -> String {
-        batch
-            .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
-            .map(|arr| {
-                if arr.is_null(row) {
-                    String::new()
-                } else {
-                    arr.value(row).to_string()
-                }
-            })
-            .unwrap_or_default()
+    ) -> BackendResult<String> {
+        let column = batch.column_by_name(col).ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'"))
+        })?;
+        if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+            if arr.is_null(row) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has NULL at row {row}"),
+                )
+                .into());
+            }
+            return Ok(arr.value(row).to_string());
+        }
+        if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+            if arr.is_null(row) {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has NULL at row {row}"),
+                )
+                .into());
+            }
+            return Ok(arr.value(row).to_string());
+        }
+        Err(IoError::new(
+            ErrorKind::InvalidData,
+            format!("column '{col}' has unexpected string type"),
+        )
+        .into())
     }
 
     fn extract_option_string(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
         row: usize,
-    ) -> Option<String> {
-        batch
-            .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
-            .and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    let value = arr.value(row);
-                    if value.is_empty() {
-                        None
-                    } else {
-                        Some(value.to_string())
-                    }
-                }
-            })
+    ) -> BackendResult<Option<String>> {
+        let column = batch.column_by_name(col).ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'"))
+        })?;
+        if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+            return Ok(if arr.is_null(row) {
+                None
+            } else {
+                let value = arr.value(row);
+                (!value.is_empty()).then(|| value.to_string())
+            });
+        }
+        if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+            return Ok(if arr.is_null(row) {
+                None
+            } else {
+                let value = arr.value(row);
+                (!value.is_empty()).then(|| value.to_string())
+            });
+        }
+        Err(IoError::new(
+            ErrorKind::InvalidData,
+            format!("column '{col}' has unexpected string type"),
+        )
+        .into())
     }
 
     fn extract_u64(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
         row: usize,
-    ) -> u64 {
-        batch
+    ) -> BackendResult<u64> {
+        let arr = batch
             .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .map(|arr| if arr.is_null(row) { 0 } else { arr.value(row) })
-            .unwrap_or(0)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'")))?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has unexpected type, expected UInt64"),
+                )
+            })?;
+        if arr.is_null(row) {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!("column '{col}' has NULL at row {row}"),
+            )
+            .into());
+        }
+        Ok(arr.value(row))
     }
 
     fn extract_u32(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
         row: usize,
-    ) -> u32 {
-        batch
+    ) -> BackendResult<u32> {
+        let arr = batch
             .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
-            .map(|arr| if arr.is_null(row) { 0 } else { arr.value(row) })
-            .unwrap_or(0)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'")))?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has unexpected type, expected UInt32"),
+                )
+            })?;
+        if arr.is_null(row) {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!("column '{col}' has NULL at row {row}"),
+            )
+            .into());
+        }
+        Ok(arr.value(row))
     }
 
     fn extract_option_u64(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
         row: usize,
-    ) -> Option<u64> {
-        batch
+    ) -> BackendResult<Option<u64>> {
+        let arr = batch
             .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            })
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'")))?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has unexpected type, expected UInt64"),
+                )
+            })?;
+        Ok(if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row))
+        })
     }
 
     fn extract_option_u32(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
         row: usize,
-    ) -> Option<u32> {
-        batch
+    ) -> BackendResult<Option<u32>> {
+        let arr = batch
             .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
-            .and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            })
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'")))?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has unexpected type, expected UInt32"),
+                )
+            })?;
+        Ok(if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row))
+        })
     }
 
     fn extract_option_i32(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         col: &str,
         row: usize,
-    ) -> Option<i32> {
-        batch
+    ) -> BackendResult<Option<i32>> {
+        let arr = batch
             .column_by_name(col)
-            .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
-            .and_then(|arr| {
-                if arr.is_null(row) {
-                    None
-                } else {
-                    Some(arr.value(row))
-                }
-            })
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'")))?
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has unexpected type, expected Int32"),
+                )
+            })?;
+        Ok(if arr.is_null(row) {
+            None
+        } else {
+            Some(arr.value(row))
+        })
+    }
+
+    fn extract_i64(
+        batch: &datafusion::arrow::record_batch::RecordBatch,
+        col: &str,
+        row: usize,
+    ) -> BackendResult<i64> {
+        let arr = batch
+            .column_by_name(col)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, format!("missing column '{col}'")))?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("column '{col}' has unexpected type, expected Int64"),
+                )
+            })?;
+        if arr.is_null(row) {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!("column '{col}' has NULL at row {row}"),
+            )
+            .into());
+        }
+        Ok(arr.value(row))
     }
 
     pub async fn query_histogram(
         start_ns: u64,
         end_ns: u64,
         num_buckets: usize,
-    ) -> Result<HistogramResponse, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BackendResult<HistogramResponse> {
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
+        }
+        if num_buckets == 0 {
+            return Err(IoError::new(ErrorKind::InvalidInput, "num_buckets must be > 0").into());
+        }
         let ctx = get_ctx()?;
 
         let range = end_ns.saturating_sub(start_ns);
-        let bucket_count = num_buckets.max(1);
+        let bucket_count = num_buckets;
         let bucket_size = range.div_ceil(bucket_count as u64).max(1);
 
         // Query to get counts grouped by bucket and event type
@@ -388,52 +505,9 @@ mod backend {
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let bucket_idx = batch
-                    .column_by_name("bucket_idx")
-                    .and_then(|column| {
-                        column
-                            .as_any()
-                            .downcast_ref::<Int64Array>()
-                            .map(|arr| arr.value(row))
-                            .or_else(|| {
-                                column
-                                    .as_any()
-                                    .downcast_ref::<Int32Array>()
-                                    .map(|arr| arr.value(row) as i64)
-                            })
-                            .or_else(|| {
-                                column
-                                    .as_any()
-                                    .downcast_ref::<UInt64Array>()
-                                    .map(|arr| arr.value(row) as i64)
-                            })
-                            .or_else(|| {
-                                column
-                                    .as_any()
-                                    .downcast_ref::<UInt32Array>()
-                                    .map(|arr| arr.value(row) as i64)
-                            })
-                            .or_else(|| {
-                                column
-                                    .as_any()
-                                    .downcast_ref::<Float64Array>()
-                                    .map(|arr| arr.value(row).floor() as i64)
-                            })
-                            .or_else(|| {
-                                column
-                                    .as_any()
-                                    .downcast_ref::<Float32Array>()
-                                    .map(|arr| arr.value(row).floor() as i64)
-                            })
-                    })
-                    .unwrap_or(0);
-
-                let event_type = extract_string(batch, "event_type", row);
-                let cnt = batch
-                    .column_by_name("cnt")
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                    .map(|arr| arr.value(row) as usize)
-                    .unwrap_or(0);
+                let bucket_idx = extract_i64(batch, "bucket_idx", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+                let cnt = extract_i64(batch, "cnt", row)? as usize;
 
                 total_in_range += cnt;
 
@@ -456,7 +530,7 @@ mod backend {
     pub async fn query_event_type_counts(
         start_ns: Option<u64>,
         end_ns: Option<u64>,
-    ) -> Result<EventTypeCounts, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BackendResult<EventTypeCounts> {
         let ctx = get_ctx()?;
 
         let where_clause = match (start_ns, end_ns) {
@@ -478,12 +552,8 @@ mod backend {
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let event_type = extract_string(batch, "event_type", row);
-                let cnt = batch
-                    .column_by_name("cnt")
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                    .map(|arr| arr.value(row) as usize)
-                    .unwrap_or(0);
+                let event_type = extract_string(batch, "event_type", row)?;
+                let cnt = extract_i64(batch, "cnt", row)? as usize;
                 counts.insert(event_type, cnt);
             }
         }
@@ -495,7 +565,7 @@ mod backend {
         pid: u32,
         start_ns: Option<u64>,
         end_ns: Option<u64>,
-    ) -> Result<EventTypeCounts, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BackendResult<EventTypeCounts> {
         let ctx = get_ctx()?;
 
         let mut conditions = vec![format!("pid = {}", pid)];
@@ -518,12 +588,8 @@ mod backend {
         let mut counts = std::collections::HashMap::new();
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let event_type = extract_string(batch, "event_type", row);
-                let cnt = batch
-                    .column_by_name("cnt")
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                    .map(|arr| arr.value(row) as usize)
-                    .unwrap_or(0);
+                let event_type = extract_string(batch, "event_type", row)?;
+                let cnt = extract_i64(batch, "cnt", row)? as usize;
                 counts.insert(event_type, cnt);
             }
         }
@@ -535,7 +601,10 @@ mod backend {
         start_ns: u64,
         end_ns: u64,
         pid: Option<u32>,
-    ) -> Result<SyscallLatencyStats, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BackendResult<SyscallLatencyStats> {
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
+        }
         let ctx = get_ctx()?;
 
         let mut conditions = vec![
@@ -577,11 +646,9 @@ mod backend {
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let pid = extract_u32(batch, "pid", row);
-                let ts = extract_u64(batch, "ts_ns", row);
-                let event_type = extract_string(batch, "event_type", row);
-                let count = extract_option_u64(batch, "count", row).unwrap_or(0);
-
+                let pid = extract_u32(batch, "pid", row)?;
+                let ts = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
                 match event_type.as_str() {
                     "syscall_read_enter" => pending_read.entry(pid).or_default().push_back(ts),
                     "syscall_read_exit" => {
@@ -613,9 +680,21 @@ mod backend {
                         }
                     }
                     "syscall_mmap_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.ok_or_else(|| {
+                            IoError::new(
+                                ErrorKind::InvalidData,
+                                "syscall_mmap_enter row missing required count",
+                            )
+                        })?;
                         mmap_alloc_bytes = mmap_alloc_bytes.saturating_add(count);
                     }
                     "syscall_munmap_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.ok_or_else(|| {
+                            IoError::new(
+                                ErrorKind::InvalidData,
+                                "syscall_munmap_enter row missing required count",
+                            )
+                        })?;
                         munmap_free_bytes = munmap_free_bytes.saturating_add(count);
                     }
                     _ => {}
@@ -650,7 +729,9 @@ mod backend {
         let avg_ns = (sum / count as u128) as u64;
         let p50_idx = ((count - 1) * 50) / 100;
         let p95_idx = ((count - 1) * 95) / 100;
-        let max_ns = *sorted.last().unwrap_or(&0);
+        let max_ns = *sorted
+            .last()
+            .expect("sorted must be non-empty when latencies is non-empty");
 
         LatencySummary {
             count,
@@ -661,60 +742,56 @@ mod backend {
         }
     }
 
-    pub async fn query_summary() -> Result<TraceSummary, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn query_summary() -> BackendResult<TraceSummary> {
         let ctx = get_ctx()?;
 
         // Get total count
         let count_df = ctx.sql("SELECT COUNT(*) as cnt FROM events").await?;
         let count_batches = count_df.collect().await?;
-        let total_events = count_batches
-            .first()
-            .and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>())
-            .map(|arr| arr.value(0) as usize)
-            .unwrap_or(0);
+        let count_batch = count_batches.first().ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "COUNT(*) query returned no rows")
+        })?;
+        let total_events = extract_i64(count_batch, "cnt", 0)? as usize;
 
         // Get distinct event types
         let types_df = ctx
             .sql("SELECT DISTINCT event_type FROM events ORDER BY event_type")
             .await?;
         let types_batches = types_df.collect().await?;
-        let event_types: Vec<String> = types_batches
-            .iter()
-            .flat_map(|b| (0..b.num_rows()).map(move |i| extract_string(b, "event_type", i)))
-            .filter(|s| !s.is_empty())
-            .collect();
+        let mut event_types: Vec<String> = Vec::new();
+        for batch in &types_batches {
+            for i in 0..batch.num_rows() {
+                event_types.push(extract_string(batch, "event_type", i)?);
+            }
+        }
 
         // Get distinct PIDs
         let pids_df = ctx
             .sql("SELECT DISTINCT pid FROM events ORDER BY pid")
             .await?;
         let pids_batches = pids_df.collect().await?;
-        let unique_pids: Vec<u32> = pids_batches
-            .iter()
-            .flat_map(|b| (0..b.num_rows()).map(move |i| extract_u32(b, "pid", i)))
-            .collect();
+        let mut unique_pids: Vec<u32> = Vec::new();
+        for batch in &pids_batches {
+            for i in 0..batch.num_rows() {
+                unique_pids.push(extract_u32(batch, "pid", i)?);
+            }
+        }
 
         // Get time range
         let time_df = ctx
             .sql("SELECT MIN(ts_ns) as min_ts, MAX(ts_ns) as max_ts FROM events")
             .await?;
         let time_batches = time_df.collect().await?;
-        let (min_ts_ns, max_ts_ns) = time_batches
-            .first()
-            .map(|b| {
-                let min = b
-                    .column_by_name("min_ts")
-                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-                    .map(|arr| arr.value(0))
-                    .unwrap_or(0);
-                let max = b
-                    .column_by_name("max_ts")
-                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-                    .map(|arr| arr.value(0))
-                    .unwrap_or(0);
-                (min, max)
-            })
-            .unwrap_or((0, 0));
+        let (min_ts_ns, max_ts_ns) = if total_events == 0 {
+            (0, 0)
+        } else if let Some(batch) = time_batches.first() {
+            (
+                extract_u64(batch, "min_ts", 0)?,
+                extract_u64(batch, "max_ts", 0)?,
+            )
+        } else {
+            return Err(IoError::new(ErrorKind::InvalidData, "missing min/max result row").into());
+        };
 
         Ok(TraceSummary {
             total_events,
@@ -724,12 +801,14 @@ mod backend {
             max_ts_ns,
             cpu_sample_frequency_hz: TRACE_FILE_METADATA
                 .get()
-                .and_then(|metadata| metadata.cpu_sample_frequency_hz),
+                .ok_or_else(|| {
+                    IoError::new(ErrorKind::InvalidData, "trace metadata not initialized")
+                })?
+                .cpu_sample_frequency_hz,
         })
     }
 
-    pub async fn query_process_lifetimes()
-    -> Result<ProcessLifetimesResponse, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn query_process_lifetimes() -> BackendResult<ProcessLifetimesResponse> {
         let ctx = get_ctx()?;
 
         // Get all fork events (child creation)
@@ -747,19 +826,11 @@ mod backend {
         let times_df = ctx.sql(times_sql).await?;
         let times_batches = times_df.collect().await?;
 
-        // Best-effort process names for each PID (available in newer traces).
-        // This query may fail on older parquet files that do not have process_name.
-        let name_batches = match ctx
-            .sql(
-                "SELECT pid, process_name, ts_ns FROM events
-                 WHERE process_name IS NOT NULL AND process_name <> ''
-                 ORDER BY ts_ns",
-            )
-            .await
-        {
-            Ok(df) => df.collect().await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        let name_sql = "SELECT pid, process_name, ts_ns FROM events
+            WHERE process_name IS NOT NULL AND process_name <> ''
+            ORDER BY ts_ns";
+        let name_df = ctx.sql(name_sql).await?;
+        let name_batches = name_df.collect().await?;
 
         // Build maps
         let mut fork_info: std::collections::HashMap<u32, (u32, u64)> =
@@ -774,9 +845,9 @@ mod backend {
         // Parse fork events
         for batch in &fork_batches {
             for row in 0..batch.num_rows() {
-                let child_pid = extract_option_u32(batch, "child_pid", row);
-                let parent_pid = extract_option_u32(batch, "parent_pid", row);
-                let ts = extract_u64(batch, "ts_ns", row);
+                let child_pid = extract_option_u32(batch, "child_pid", row)?;
+                let parent_pid = extract_option_u32(batch, "parent_pid", row)?;
+                let ts = extract_u64(batch, "ts_ns", row)?;
                 if let (Some(child), Some(parent)) = (child_pid, parent_pid) {
                     fork_info.entry(child).or_insert((parent, ts));
                 }
@@ -786,9 +857,14 @@ mod backend {
         // Parse exit events
         for batch in &exit_batches {
             for row in 0..batch.num_rows() {
-                let pid = extract_u32(batch, "pid", row);
-                let exit_code = extract_option_i32(batch, "exit_code", row).unwrap_or(0);
-                let ts = extract_u64(batch, "ts_ns", row);
+                let pid = extract_u32(batch, "pid", row)?;
+                let exit_code = extract_option_i32(batch, "exit_code", row)?.ok_or_else(|| {
+                    IoError::new(
+                        ErrorKind::InvalidData,
+                        "process_exit row missing required exit_code",
+                    )
+                })?;
+                let ts = extract_u64(batch, "ts_ns", row)?;
                 exit_info.entry(pid).or_insert((exit_code, ts));
             }
         }
@@ -796,9 +872,9 @@ mod backend {
         // Parse first/last times
         for batch in &times_batches {
             for row in 0..batch.num_rows() {
-                let pid = extract_u32(batch, "pid", row);
-                let first = extract_u64(batch, "first_seen", row);
-                let last = extract_u64(batch, "last_seen", row);
+                let pid = extract_u32(batch, "pid", row)?;
+                let first = extract_u64(batch, "first_seen", row)?;
+                let last = extract_u64(batch, "last_seen", row)?;
                 pid_times.insert(pid, (first, last));
             }
         }
@@ -806,8 +882,8 @@ mod backend {
         // Parse process names (keep first-seen non-empty name for each PID)
         for batch in &name_batches {
             for row in 0..batch.num_rows() {
-                let pid = extract_u32(batch, "pid", row);
-                if let Some(name) = extract_option_string(batch, "process_name", row) {
+                let pid = extract_u32(batch, "pid", row)?;
+                if let Some(name) = extract_option_string(batch, "process_name", row)? {
                     pid_names.entry(pid).or_insert(name);
                 }
             }
@@ -851,15 +927,16 @@ mod backend {
         start_ns: u64,
         end_ns: u64,
         max_events_per_pid: usize,
-    ) -> Result<ProcessEventsResponse, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BackendResult<ProcessEventsResponse> {
         const CPU_SAMPLE_BUCKETS: usize = 600;
 
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
+        }
         if max_events_per_pid == 0 {
-            return Ok(ProcessEventsResponse {
-                events_by_pid: std::collections::HashMap::new(),
-                cpu_sample_counts_by_pid: std::collections::HashMap::new(),
-                cpu_sample_bucket_count: CPU_SAMPLE_BUCKETS,
-            });
+            return Err(
+                IoError::new(ErrorKind::InvalidInput, "max_events_per_pid must be > 0").into(),
+            );
         }
 
         let ctx = get_ctx()?;
@@ -884,11 +961,22 @@ mod backend {
         let range_ns = end_ns.saturating_sub(start_ns).max(1);
         let bucket_size_ns = range_ns.div_ceil(CPU_SAMPLE_BUCKETS as u64).max(1);
 
+        let mut rng_state = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = DefaultHasher::new();
+            start_ns.hash(&mut hasher);
+            end_ns.hash(&mut hasher);
+            max_events_per_pid.hash(&mut hasher);
+            hasher.finish() | 1
+        };
+
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let pid = extract_u32(batch, "pid", row);
-                let ts_ns = extract_u64(batch, "ts_ns", row);
-                let event_type = extract_string(batch, "event_type", row);
+                let pid = extract_u32(batch, "pid", row)?;
+                let ts_ns = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
 
                 if event_type == "cpu_sample" {
                     let mut bucket_idx = ts_ns.saturating_sub(start_ns) / bucket_size_ns;
@@ -911,7 +999,8 @@ mod backend {
                     events.push(EventMarker { ts_ns, event_type });
                 } else {
                     // Reservoir sampling: replace with decreasing probability
-                    let idx = rand_index(*seen);
+                    rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let idx = (rng_state as usize) % *seen;
                     if idx < max_events_per_pid {
                         events[idx] = EventMarker { ts_ns, event_type };
                     }
@@ -950,28 +1039,54 @@ mod backend {
     fn extract_option_proc_maps_snapshot(
         batch: &datafusion::arrow::record_batch::RecordBatch,
         row: usize,
-    ) -> Option<Vec<ProcMapSegment>> {
-        let column = batch.column_by_name("proc_maps_snapshot")?;
-        let list_array = column.as_any().downcast_ref::<ListArray>()?;
+    ) -> BackendResult<Option<Vec<ProcMapSegment>>> {
+        let column = batch.column_by_name("proc_maps_snapshot").ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                "missing column 'proc_maps_snapshot'",
+            )
+        })?;
+        let list_array = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidData,
+                "column 'proc_maps_snapshot' has unexpected type, expected List",
+            )
+        })?;
         if list_array.is_null(row) {
-            return None;
+            return Ok(None);
         }
 
         let list_values = list_array.value(row);
-        let struct_array = list_values.as_any().downcast_ref::<StructArray>()?;
+        let struct_array = list_values
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    "proc_maps_snapshot list item has unexpected type, expected Struct",
+                )
+            })?;
         let start_array = struct_array
-            .column_by_name("start_addr")?
+            .column_by_name("start_addr")
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing start_addr"))?
             .as_any()
-            .downcast_ref::<UInt64Array>()?;
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "start_addr type mismatch"))?;
         let end_array = struct_array
-            .column_by_name("end_addr")?
+            .column_by_name("end_addr")
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing end_addr"))?
             .as_any()
-            .downcast_ref::<UInt64Array>()?;
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "end_addr type mismatch"))?;
         let offset_array = struct_array
-            .column_by_name("file_offset")?
+            .column_by_name("file_offset")
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing file_offset"))?
             .as_any()
-            .downcast_ref::<UInt64Array>()?;
-        let path_column = struct_array.column_by_name("path")?;
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "file_offset type mismatch"))?;
+        let path_column = struct_array
+            .column_by_name("path")
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing path"))?;
 
         let mut segments = Vec::with_capacity(struct_array.len());
         for idx in 0..struct_array.len() {
@@ -992,7 +1107,7 @@ mod backend {
                 }
                 path_array.value(idx).to_string()
             } else {
-                continue;
+                return Err(IoError::new(ErrorKind::InvalidData, "path type mismatch").into());
             };
 
             segments.push(ProcMapSegment {
@@ -1003,7 +1118,7 @@ mod backend {
             });
         }
 
-        Some(segments)
+        Ok(Some(segments))
     }
 
     struct OfflineUserSymbolizer {
@@ -1119,18 +1234,26 @@ mod backend {
         }
     }
 
-    fn parse_stack_frames(stack_frames: &str) -> Vec<u64> {
-        stack_frames
-            .split(';')
-            .filter_map(|token| {
-                let trimmed = token.trim();
-                let hex = trimmed
-                    .strip_prefix("0x")
-                    .or_else(|| trimmed.strip_prefix("0X"))
-                    .unwrap_or(trimmed);
-                u64::from_str_radix(hex, 16).ok()
-            })
-            .collect()
+    fn parse_stack_frames(stack_frames: &str) -> BackendResult<Vec<u64>> {
+        let mut frames = Vec::new();
+        for token in stack_frames.split(';') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let hex = trimmed
+                .strip_prefix("0x")
+                .or_else(|| trimmed.strip_prefix("0X"))
+                .unwrap_or(trimmed);
+            let ip = u64::from_str_radix(hex, 16).map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid stack frame address '{trimmed}': {error}"),
+                )
+            })?;
+            frames.push(ip);
+        }
+        Ok(frames)
     }
 
     fn find_segment_for_ip(segments: &[ProcMapSegment], ip: u64) -> Option<&ProcMapSegment> {
@@ -1267,10 +1390,18 @@ mod backend {
         pid: Option<u32>,
         event_type: String,
         max_stacks: usize,
-    ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> BackendResult<EventFlamegraphResponse> {
         let ctx = get_ctx()?;
-        if event_type.is_empty() || max_stacks == 0 {
-            return Ok(EventFlamegraphResponse::default());
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
+        }
+        if event_type.is_empty() {
+            return Err(
+                IoError::new(ErrorKind::InvalidInput, "event_type must not be empty").into(),
+            );
+        }
+        if max_stacks == 0 {
+            return Err(IoError::new(ErrorKind::InvalidInput, "max_stacks must be > 0").into());
         }
 
         let mut conditions = vec![
@@ -1313,10 +1444,10 @@ mod backend {
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let stack_kind = extract_option_string(batch, "stack_kind", row);
-                let stack_frames = extract_option_string(batch, "stack_frames", row);
-                let stack_trace = extract_option_string(batch, "stack_trace", row);
-                let proc_maps_snapshot = extract_option_proc_maps_snapshot(batch, row);
+                let stack_kind = extract_option_string(batch, "stack_kind", row)?;
+                let stack_frames = extract_option_string(batch, "stack_frames", row)?;
+                let stack_trace = extract_option_string(batch, "stack_trace", row)?;
+                let proc_maps_snapshot = extract_option_proc_maps_snapshot(batch, row)?;
                 let sampled_row = SampledStackRow {
                     stack_kind,
                     stack_frames,
@@ -1348,30 +1479,76 @@ mod backend {
             let labels: Vec<String> = match (row.stack_kind.as_deref(), row.stack_frames.as_deref())
             {
                 (Some("user"), Some(frames_hex)) if !frames_hex.is_empty() => {
-                    let frames = parse_stack_frames(frames_hex);
-                    symbolize_user_frames(
-                        &frames,
-                        row.proc_maps_snapshot.as_deref(),
-                        &mut user_symbolizer,
-                    )
-                    .await
+                    let snapshot = row.proc_maps_snapshot.as_deref().ok_or_else(|| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            "user stack row missing required proc_maps_snapshot",
+                        )
+                    })?;
+                    if snapshot.is_empty() {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidData,
+                            "user stack row has empty proc_maps_snapshot",
+                        )
+                        .into());
+                    }
+                    let frames = parse_stack_frames(frames_hex)?;
+                    if frames.is_empty() {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidData,
+                            "user stack row contains no parseable frames",
+                        )
+                        .into());
+                    }
+                    symbolize_user_frames(&frames, Some(snapshot), &mut user_symbolizer).await
                 }
                 (Some("both"), Some(frames_hex)) if !frames_hex.is_empty() => {
-                    let frames = parse_stack_frames(frames_hex);
-                    let mut labels = symbolize_user_frames(
-                        &frames,
-                        row.proc_maps_snapshot.as_deref(),
-                        &mut user_symbolizer,
-                    )
-                    .await;
+                    let snapshot = row.proc_maps_snapshot.as_deref().ok_or_else(|| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            "mixed stack row missing required proc_maps_snapshot",
+                        )
+                    })?;
+                    if snapshot.is_empty() {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidData,
+                            "mixed stack row has empty proc_maps_snapshot",
+                        )
+                        .into());
+                    }
+                    let frames = parse_stack_frames(frames_hex)?;
+                    if frames.is_empty() {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidData,
+                            "mixed stack row contains no parseable frames",
+                        )
+                        .into());
+                    }
+                    let mut labels =
+                        symbolize_user_frames(&frames, Some(snapshot), &mut user_symbolizer).await;
                     if let Some(stack_trace) = row.stack_trace.as_deref() {
                         labels.extend(parse_kernel_labels_from_stack_trace(stack_trace));
                     }
                     labels
                 }
+                (Some("user"), _) => {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "user stack row missing stack_frames payload",
+                    )
+                    .into());
+                }
+                (Some("both"), _) => {
+                    return Err(IoError::new(
+                        ErrorKind::InvalidData,
+                        "mixed stack row missing stack_frames payload",
+                    )
+                    .into());
+                }
                 _ => row
                     .stack_trace
-                    .unwrap_or_default()
+                    .as_deref()
+                    .unwrap_or("")
                     .split(';')
                     .filter(|frame| !frame.is_empty())
                     .map(str::to_string)
@@ -1402,22 +1579,6 @@ mod backend {
             total_samples,
             svg,
         })
-    }
-
-    // Simple pseudo-random index for reservoir sampling
-    fn rand_index(n: usize) -> usize {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let mut hasher = DefaultHasher::new();
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        seed.hash(&mut hasher);
-        n.hash(&mut hasher);
-        (hasher.finish() as usize) % n
     }
 }
 

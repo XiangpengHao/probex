@@ -46,7 +46,7 @@ pub struct TraceSummary {
     pub unique_pids: Vec<u32>,
     pub min_ts_ns: u64,
     pub max_ts_ns: u64,
-    pub cpu_sample_frequency_hz: Option<u64>,
+    pub cpu_sample_frequency_hz: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -115,7 +115,7 @@ where
         let text = response
             .text()
             .await
-            .unwrap_or_else(|_| "request failed".to_string());
+            .map_err(|error| format!("HTTP {status}: failed to read response body: {error}"))?;
         return Err(format!("HTTP {status}: {text}"));
     }
 

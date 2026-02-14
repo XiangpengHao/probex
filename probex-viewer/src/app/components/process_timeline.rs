@@ -20,7 +20,7 @@ pub struct ProcessTimelineData {
     pub processes: Vec<ProcessLifetime>,
     pub process_events: Option<ProcessEventsResponse>,
     pub histogram: Option<HistogramResponse>,
-    pub summary: Option<TraceSummary>,
+    pub summary: TraceSummary,
     pub pid_summary: PidEventSummary,
     pub latency_stats: Option<SyscallLatencyStats>,
     pub selected_flame_event_type: Option<String>,
@@ -99,10 +99,7 @@ pub fn ProcessTimeline(
             )
         })
         .unwrap_or_else(|| (HashMap::new(), HashMap::new(), 0));
-    let sample_frequency_hz = data
-        .summary
-        .as_ref()
-        .and_then(|s| s.cpu_sample_frequency_hz);
+    let sample_frequency_hz = data.summary.cpu_sample_frequency_hz;
     let stats = data.latency_stats.clone().unwrap_or_default();
     let has_read_stats = stats.read.count > 0;
     let has_write_stats = stats.write.count > 0;
@@ -179,23 +176,15 @@ pub fn ProcessTimeline(
                             on_select_pid_option.call(evt.value().parse::<u32>().ok());
                         },
                         option { value: "", "All" }
-                        {
-                            data.summary
-                                .as_ref()
-                                .map(|s| {
-                                    s.unique_pids.iter().map(|pid| rsx! {
-                                        option { key: "{pid}", value: "{pid}", "{pid}" }
-                                    })
-                                })
-                                .into_iter()
-                                .flatten()
-                        }
+                        {data.summary.unique_pids.iter().map(|pid| rsx! {
+                            option { key: "{pid}", value: "{pid}", "{pid}" }
+                        })}
                     }
                     {
                         let ev_count = if selection.selected_pid.is_some() {
                             data.pid_summary.total
                         } else {
-                            data.summary.as_ref().map(|s| s.total_events).unwrap_or(0)
+                            data.summary.total_events
                         };
                         rsx! { span { class: "text-xs text-gray-400", "{ev_count} ev" } }
                     }
@@ -1413,12 +1402,9 @@ fn build_vertical_marker_paths(markers: &[CanvasEventMarker]) -> Vec<(&'static s
 fn build_cpu_usage_points(
     bucket_counts: &[u16],
     bucket_count: usize,
-    sample_frequency_hz: Option<u64>,
+    sample_frequency_hz: u64,
     view_duration_ns: u64,
 ) -> Vec<f64> {
-    // Older traces may not have sampling frequency in parquet metadata.
-    // Fall back to probex's historical default so usage overlay still renders.
-    let sample_frequency_hz = sample_frequency_hz.unwrap_or(999);
     if bucket_count == 0 || bucket_counts.is_empty() {
         return Vec::new();
     }
