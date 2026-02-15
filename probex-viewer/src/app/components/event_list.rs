@@ -7,10 +7,11 @@ const PAGE_SIZE: usize = 50;
 
 #[component]
 pub fn EventListCard(
-    pid: u32,
-    view_start_ns: u64,
-    view_end_ns: u64,
-    full_start_ns: u64,
+    pid: ReadSignal<u32>,
+    view_start_ns: ReadSignal<u64>,
+    view_end_ns: ReadSignal<u64>,
+    full_start_ns: ReadSignal<u64>,
+    event_types: ReadSignal<Vec<String>>,
 ) -> Element {
     let mut events = use_signal(|| Option::<EventListResponse>::None);
     let mut loading = use_signal(|| false);
@@ -19,9 +20,13 @@ pub fn EventListCard(
 
     use_resource(move || async move {
         let p = page();
+        let start = view_start_ns();
+        let end = view_end_ns();
+        let pid_val = pid();
+        let types = event_types();
         loading.set(true);
         expanded_idx.set(None);
-        match get_event_list(view_start_ns, view_end_ns, pid, PAGE_SIZE, p * PAGE_SIZE).await {
+        match get_event_list(start, end, pid_val, PAGE_SIZE, p * PAGE_SIZE, &types).await {
             Ok(data) => events.set(Some(data)),
             Err(e) => {
                 log::error!("Event list error: {}", e);
@@ -108,7 +113,7 @@ pub fn EventListCard(
                     tbody {
                         for (idx, event) in data.events.iter().enumerate() {
                             {
-                                let offset_ns = event.ts_ns.saturating_sub(full_start_ns);
+                                let offset_ns = event.ts_ns.saturating_sub(full_start_ns());
                                 let formatted_offset = format_duration_short(offset_ns);
                                 let event_type = event.event_type.clone();
                                 let top_frame = event.stack_trace.as_ref()

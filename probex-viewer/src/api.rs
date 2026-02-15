@@ -1,7 +1,8 @@
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts, HistogramResponse,
-    IoStatistics, IoTypeStats, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
-    SizeBucket, SyscallLatencyStats, TraceSummary,
+    CumulativeMemoryPoint, EventFlamegraphResponse, EventListResponse, EventMarker,
+    EventTypeCounts, HistogramResponse, IoStatistics, IoTypeStats, MemoryStatistics,
+    ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SizeBucket,
+    SyscallLatencyStats, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
@@ -154,18 +155,19 @@ pub async fn get_event_list(
     pid: u32,
     limit: usize,
     offset: usize,
+    event_types: &[String],
 ) -> ApiResult<EventListResponse> {
-    get_json(
-        "/api/event_list",
-        &[
-            ("start_ns", start_ns.to_string()),
-            ("end_ns", end_ns.to_string()),
-            ("pid", pid.to_string()),
-            ("limit", limit.to_string()),
-            ("offset", offset.to_string()),
-        ],
-    )
-    .await
+    let mut query = vec![
+        ("start_ns", start_ns.to_string()),
+        ("end_ns", end_ns.to_string()),
+        ("pid", pid.to_string()),
+        ("limit", limit.to_string()),
+        ("offset", offset.to_string()),
+    ];
+    if !event_types.is_empty() {
+        query.push(("event_types", event_types.join(",")));
+    }
+    get_json("/api/event_list", &query).await
 }
 
 pub async fn get_io_statistics(
@@ -181,4 +183,19 @@ pub async fn get_io_statistics(
         query.push(("pid", pid.to_string()));
     }
     get_json("/api/io_statistics", &query).await
+}
+
+pub async fn get_memory_statistics(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+) -> ApiResult<MemoryStatistics> {
+    let mut query = vec![
+        ("start_ns", start_ns.to_string()),
+        ("end_ns", end_ns.to_string()),
+    ];
+    if let Some(pid) = pid {
+        query.push(("pid", pid.to_string()));
+    }
+    get_json("/api/memory_statistics", &query).await
 }

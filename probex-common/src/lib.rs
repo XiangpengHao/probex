@@ -332,6 +332,24 @@ pub mod viewer_api {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct CumulativeMemoryPoint {
+        pub ts_ns: u64,
+        pub cumulative_bytes: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct MemoryStatistics {
+        pub by_operation: Vec<IoTypeStats>,
+        pub size_histogram: Vec<SizeBucket>,
+        pub total_alloc_ops: u64,
+        pub total_alloc_bytes: u64,
+        pub total_free_ops: u64,
+        pub total_free_bytes: u64,
+        pub cumulative_usage: Vec<CumulativeMemoryPoint>,
+        pub time_range_ns: (u64, u64),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct EventDetail {
         pub ts_ns: u64,
         pub event_type: String,

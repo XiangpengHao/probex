@@ -3,10 +3,10 @@
 //! Uses DataFusion to query parquet trace files.
 
 pub use probex_common::viewer_api::{
-    EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts,
-    HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencyBucket, LatencySummary,
-    ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SizeBucket,
-    SyscallLatencyStats, TraceSummary,
+    CumulativeMemoryPoint, EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker,
+    EventTypeCounts, HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencyBucket,
+    LatencySummary, MemoryStatistics, ProcessEventsResponse, ProcessLifetime,
+    ProcessLifetimesResponse, SizeBucket, SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
@@ -1353,6 +1353,208 @@ mod backend {
             .collect()
     }
 
+    pub async fn query_memory_statistics(
+        start_ns: u64,
+        end_ns: u64,
+        pid: Option<u32>,
+    ) -> BackendResult<MemoryStatistics> {
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
+        }
+        let ctx = get_ctx()?;
+
+        let mut conditions = vec![format!("ts_ns >= {start_ns}"), format!("ts_ns <= {end_ns}")];
+        if let Some(pid) = pid {
+            conditions.push(format!("pid = {pid}"));
+        }
+
+        let sql = format!(
+            "SELECT pid, ts_ns, event_type, count, ret
+             FROM events
+             WHERE {}
+               AND event_type IN (
+                 'syscall_mmap_enter', 'syscall_mmap_exit',
+                 'syscall_munmap_enter', 'syscall_munmap_exit',
+                 'syscall_brk_enter', 'syscall_brk_exit'
+               )
+             ORDER BY pid, ts_ns",
+            conditions.join(" AND ")
+        );
+
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        // Per-pid pending queues: mmap/munmap store (ts_ns, count), brk stores ts_ns
+        let mut pending_mmap: std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64)>,
+        > = std::collections::HashMap::new();
+        let mut pending_munmap: std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64)>,
+        > = std::collections::HashMap::new();
+        let mut pending_brk: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
+
+        // Per-pid last known brk address for delta computation
+        let mut last_brk: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+
+        // Collected (latency_ns, bytes) per operation
+        let mut mmap_data: Vec<(u64, u64)> = Vec::new();
+        let mut munmap_data: Vec<(u64, u64)> = Vec::new();
+        let mut brk_data: Vec<(u64, u64)> = Vec::new();
+
+        // Cumulative memory events: (ts_ns, signed_delta_bytes)
+        let mut cumulative_events: Vec<(u64, i64)> = Vec::new();
+
+        // Track brk alloc vs free separately for summary
+        let mut brk_grow_ops: u64 = 0;
+        let mut brk_grow_bytes: u64 = 0;
+        let mut brk_shrink_ops: u64 = 0;
+        let mut brk_shrink_bytes: u64 = 0;
+
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let pid = extract_u32(batch, "pid", row)?;
+                let ts = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+
+                match event_type.as_str() {
+                    "syscall_mmap_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        pending_mmap.entry(pid).or_default().push_back((ts, count));
+                    }
+                    "syscall_mmap_exit" => {
+                        if let Some(queue) = pending_mmap.get_mut(&pid)
+                            && let Some((enter_ts, requested_bytes)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            // ret >= 0 means success (valid mapped address)
+                            if ret >= 0 {
+                                let latency = ts - enter_ts;
+                                mmap_data.push((latency, requested_bytes));
+                                cumulative_events.push((ts, requested_bytes as i64));
+                            }
+                        }
+                    }
+                    "syscall_munmap_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        pending_munmap.entry(pid).or_default().push_back((ts, count));
+                    }
+                    "syscall_munmap_exit" => {
+                        if let Some(queue) = pending_munmap.get_mut(&pid)
+                            && let Some((enter_ts, freed_bytes)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            // ret == 0 means success
+                            if ret == 0 {
+                                let latency = ts - enter_ts;
+                                munmap_data.push((latency, freed_bytes));
+                                cumulative_events.push((ts, -(freed_bytes as i64)));
+                            }
+                        }
+                    }
+                    "syscall_brk_enter" => {
+                        pending_brk.entry(pid).or_default().push_back(ts);
+                    }
+                    "syscall_brk_exit" => {
+                        if let Some(queue) = pending_brk.get_mut(&pid)
+                            && let Some(enter_ts) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            if ret > 0 {
+                                if let Some(&prev_brk) = last_brk.get(&pid) {
+                                    let delta = ret - prev_brk;
+                                    if delta != 0 {
+                                        let latency = ts - enter_ts;
+                                        let abs_delta = delta.unsigned_abs();
+                                        brk_data.push((latency, abs_delta));
+                                        cumulative_events.push((ts, delta));
+                                        if delta > 0 {
+                                            brk_grow_ops += 1;
+                                            brk_grow_bytes += abs_delta;
+                                        } else {
+                                            brk_shrink_ops += 1;
+                                            brk_shrink_bytes += abs_delta;
+                                        }
+                                    }
+                                }
+                                last_brk.insert(pid, ret);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Build per-operation stats using same helper as IO
+        let mut ops_data: std::collections::HashMap<&str, Vec<(u64, u64)>> =
+            std::collections::HashMap::new();
+        if !mmap_data.is_empty() {
+            ops_data.insert("mmap", mmap_data);
+        }
+        if !munmap_data.is_empty() {
+            ops_data.insert("munmap", munmap_data);
+        }
+        if !brk_data.is_empty() {
+            ops_data.insert("brk", brk_data);
+        }
+
+        let mut all_sizes: Vec<u64> = Vec::new();
+        for data in ops_data.values() {
+            for &(_, bytes) in data {
+                all_sizes.push(bytes);
+            }
+        }
+
+        let mut by_operation: Vec<IoTypeStats> = ops_data
+            .into_iter()
+            .map(|(op, data)| compute_io_type_stats(op.to_string(), data))
+            .collect();
+        by_operation.sort_by_key(|b| std::cmp::Reverse(b.total_ops));
+
+        // Compute alloc/free totals
+        let mmap_stats = by_operation.iter().find(|s| s.operation == "mmap");
+        let munmap_stats = by_operation.iter().find(|s| s.operation == "munmap");
+
+        let total_alloc_ops =
+            mmap_stats.map_or(0, |s| s.total_ops) + brk_grow_ops;
+        let total_alloc_bytes =
+            mmap_stats.map_or(0, |s| s.total_bytes) + brk_grow_bytes;
+        let total_free_ops =
+            munmap_stats.map_or(0, |s| s.total_ops) + brk_shrink_ops;
+        let total_free_bytes =
+            munmap_stats.map_or(0, |s| s.total_bytes) + brk_shrink_bytes;
+
+        // Build cumulative memory usage timeline
+        cumulative_events.sort_by_key(|(ts, _)| *ts);
+        let mut cumulative_usage: Vec<CumulativeMemoryPoint> =
+            Vec::with_capacity(cumulative_events.len());
+        let mut running_sum: i64 = 0;
+        for (ts, delta) in &cumulative_events {
+            running_sum += delta;
+            cumulative_usage.push(CumulativeMemoryPoint {
+                ts_ns: *ts,
+                cumulative_bytes: running_sum,
+            });
+        }
+
+        Ok(MemoryStatistics {
+            by_operation,
+            size_histogram: compute_size_histogram(&all_sizes),
+            total_alloc_ops,
+            total_alloc_bytes,
+            total_free_ops,
+            total_free_bytes,
+            cumulative_usage,
+            time_range_ns: (start_ns, end_ns),
+        })
+    }
+
     pub async fn query_event_flamegraph(
         start_ns: u64,
         end_ns: u64,
@@ -1463,11 +1665,19 @@ mod backend {
         pid: u32,
         limit: usize,
         offset: usize,
+        event_types: &[String],
     ) -> BackendResult<EventListResponse> {
         let ctx = get_ctx()?;
 
+        let type_filter = if event_types.is_empty() {
+            String::new()
+        } else {
+            let quoted: Vec<String> = event_types.iter().map(|t| format!("'{t}'")).collect();
+            format!(" AND event_type IN ({})", quoted.join(","))
+        };
+
         let count_sql = format!(
-            "SELECT COUNT(*) as cnt FROM events WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}"
+            "SELECT COUNT(*) as cnt FROM events WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter}"
         );
         let count_df = ctx.sql(&count_sql).await?;
         let count_batches = count_df.collect().await?;
@@ -1481,7 +1691,7 @@ mod backend {
 
         let sql = format!(
             "SELECT ts_ns, event_type, pid, stack_trace FROM events \
-             WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns} \
+             WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter} \
              ORDER BY ts_ns LIMIT {limit} OFFSET {offset}"
         );
         let df = ctx.sql(&sql).await?;
@@ -1582,12 +1792,21 @@ pub async fn query_io_statistics(
     backend::query_io_statistics(start_ns, end_ns, pid).await
 }
 
+pub async fn query_memory_statistics(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+) -> Result<MemoryStatistics, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_memory_statistics(start_ns, end_ns, pid).await
+}
+
 pub async fn query_event_list(
     start_ns: u64,
     end_ns: u64,
     pid: u32,
     limit: usize,
     offset: usize,
+    event_types: &[String],
 ) -> Result<EventListResponse, Box<dyn std::error::Error + Send + Sync>> {
-    backend::query_event_list(start_ns, end_ns, pid, limit, offset).await
+    backend::query_event_list(start_ns, end_ns, pid, limit, offset, event_types).await
 }

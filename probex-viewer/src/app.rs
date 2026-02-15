@@ -19,10 +19,11 @@ use view_model::{
 };
 
 use crate::api::{
-    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, IoStatistics,
+    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, IoStatistics, MemoryStatistics,
     ProcessEventsResponse, ProcessLifetimesResponse, TraceSummary, get_event_flamegraph,
-    get_event_type_counts, get_histogram, get_io_statistics, get_pid_event_type_counts,
-    get_process_events, get_process_lifetimes, get_summary, get_syscall_latency_stats,
+    get_event_type_counts, get_histogram, get_io_statistics, get_memory_statistics,
+    get_pid_event_type_counts, get_process_events, get_process_lifetimes, get_summary,
+    get_syscall_latency_stats,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -55,6 +56,8 @@ fn TraceViewer() -> Element {
     let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
     let mut io_statistics = use_signal(|| Option::<IoStatistics>::None);
     let mut io_statistics_loading = use_signal(|| false);
+    let mut memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
+    let mut memory_statistics_loading = use_signal(|| false);
 
     let mut error_msg = use_signal(|| Option::<String>::None);
 
@@ -191,6 +194,22 @@ fn TraceViewer() -> Element {
         io_statistics_loading.set(false);
     });
 
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+
+        memory_statistics_loading.set(true);
+        match get_memory_statistics(range.start_ns, range.end_ns, selected_pid()).await {
+            Ok(stats) => memory_statistics.set(Some(stats)),
+            Err(e) => {
+                log::error!("Memory statistics error: {}", e);
+                memory_statistics.set(None);
+            }
+        }
+        memory_statistics_loading.set(false);
+    });
+
     let summary_data = summary();
     let hist_data = histogram();
 
@@ -235,6 +254,8 @@ fn TraceViewer() -> Element {
                         flamegraph_loading: flamegraph_loading(),
                         io_statistics: io_statistics(),
                         io_statistics_loading: io_statistics_loading(),
+                        memory_statistics: memory_statistics(),
+                        memory_statistics_loading: memory_statistics_loading(),
                     },
                     selection: ProcessTimelineSelection {
                         enabled_event_types: enabled_event_types(),

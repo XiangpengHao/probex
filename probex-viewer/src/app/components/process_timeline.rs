@@ -14,10 +14,10 @@ use super::event_list::EventListCard;
 use super::flamegraph::{
     EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
 };
-use super::io_statistics::{IoStatisticsCard, IoStatsCardData};
+use super::io_statistics::{IoMemoryCard, IoMemoryCardData};
 use crate::api::{
-    EventFlamegraphResponse, HistogramResponse, IoStatistics, ProcessEventsResponse,
-    ProcessLifetime, SyscallLatencyStats, TraceSummary,
+    EventFlamegraphResponse, HistogramResponse, IoStatistics, MemoryStatistics,
+    ProcessEventsResponse, ProcessLifetime, SyscallLatencyStats, TraceSummary,
 };
 use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
@@ -56,6 +56,8 @@ pub struct ProcessTimelineData {
     pub flamegraph_loading: bool,
     pub io_statistics: Option<IoStatistics>,
     pub io_statistics_loading: bool,
+    pub memory_statistics: Option<MemoryStatistics>,
+    pub memory_statistics_loading: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -537,6 +539,8 @@ pub fn ProcessTimeline(
                     let flamegraph_loading_for_row = data.flamegraph_loading;
                     let io_statistics_for_row = data.io_statistics.clone();
                     let io_statistics_loading_for_row = data.io_statistics_loading;
+                    let memory_statistics_for_row = data.memory_statistics.clone();
+                    let memory_statistics_loading_for_row = data.memory_statistics_loading;
 
                     rsx! {
                         div {
@@ -771,7 +775,7 @@ pub fn ProcessTimeline(
                                         button {
                                             class: AnalysisTab::IoStatistics.class(analysis_tab()),
                                             onclick: move |_| analysis_tab.set(AnalysisTab::IoStatistics),
-                                            "IO Statistics"
+                                            "IO / Memory"
                                         }
                                         button {
                                             class: AnalysisTab::Events.class(analysis_tab()),
@@ -804,10 +808,12 @@ pub fn ProcessTimeline(
                                             }
                                         },
                                         AnalysisTab::IoStatistics => rsx! {
-                                            IoStatisticsCard {
-                                                data: IoStatsCardData {
-                                                    stats: io_statistics_for_row,
-                                                    loading: io_statistics_loading_for_row,
+                                            IoMemoryCard {
+                                                data: IoMemoryCardData {
+                                                    io_stats: io_statistics_for_row,
+                                                    io_loading: io_statistics_loading_for_row,
+                                                    mem_stats: memory_statistics_for_row,
+                                                    mem_loading: memory_statistics_loading_for_row,
                                                 },
                                             }
                                         },
@@ -817,6 +823,7 @@ pub fn ProcessTimeline(
                                                 view_start_ns: range.view_start_ns,
                                                 view_end_ns: range.view_end_ns,
                                                 full_start_ns: range.full_start_ns,
+                                                event_types: selection.enabled_event_types.iter().cloned().collect::<Vec<String>>(),
                                             }
                                         },
                                     }
