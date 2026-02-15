@@ -19,10 +19,10 @@ use view_model::{
 };
 
 use crate::api::{
-    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetimesResponse, TraceSummary, get_event_flamegraph, get_event_type_counts,
-    get_histogram, get_pid_event_type_counts, get_process_events, get_process_lifetimes,
-    get_summary, get_syscall_latency_stats,
+    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, IoStatistics,
+    ProcessEventsResponse, ProcessLifetimesResponse, TraceSummary, get_event_flamegraph,
+    get_event_type_counts, get_histogram, get_io_statistics, get_pid_event_type_counts,
+    get_process_events, get_process_lifetimes, get_summary, get_syscall_latency_stats,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -53,6 +53,8 @@ fn TraceViewer() -> Element {
     let mut flamegraph_loading = use_signal(|| false);
     let mut process_lifetimes = use_signal(|| Option::<ProcessLifetimesResponse>::None);
     let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
+    let mut io_statistics = use_signal(|| Option::<IoStatistics>::None);
+    let mut io_statistics_loading = use_signal(|| false);
 
     let mut error_msg = use_signal(|| Option::<String>::None);
 
@@ -60,7 +62,7 @@ fn TraceViewer() -> Element {
 
     let mut enabled_event_types = use_signal(HashSet::<String>::new);
     let mut selected_pid = use_signal(|| Option::<u32>::None);
-    let mut selected_flame_event_type = use_signal(|| Some("cpu_sample".to_string()));
+    let mut selected_flame_event_type = use_signal(|| "cpu_sample".to_string());
 
     use_resource(move || async move {
         match get_summary().await {
@@ -116,23 +118,28 @@ fn TraceViewer() -> Element {
             return;
         };
         let pid = selected_pid();
-        let selected_event_type = selected_flame_event_type();
+        let event_type = selected_flame_event_type();
 
-        if let (Some(pid), Some(event_type)) = (pid, selected_event_type) {
-            flamegraph_loading.set(true);
-            match get_event_flamegraph(
-                range.start_ns,
-                range.end_ns,
-                Some(pid),
-                event_type,
-                MAX_FLAME_STACKS,
-            )
-            .await
-            {
-                Ok(data) => event_flamegraph.set(Some(data)),
-                Err(e) => log::error!("Event flamegraph error: {}", e),
+        if let Some(pid) = pid {
+            if !event_type.is_empty() {
+                flamegraph_loading.set(true);
+                match get_event_flamegraph(
+                    range.start_ns,
+                    range.end_ns,
+                    Some(pid),
+                    event_type,
+                    MAX_FLAME_STACKS,
+                )
+                .await
+                {
+                    Ok(data) => event_flamegraph.set(Some(data)),
+                    Err(e) => log::error!("Event flamegraph error: {}", e),
+                }
+                flamegraph_loading.set(false);
+            } else {
+                flamegraph_loading.set(false);
+                event_flamegraph.set(None);
             }
-            flamegraph_loading.set(false);
         } else {
             flamegraph_loading.set(false);
             event_flamegraph.set(None);
@@ -168,6 +175,22 @@ fn TraceViewer() -> Element {
         }
     });
 
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+
+        io_statistics_loading.set(true);
+        match get_io_statistics(range.start_ns, range.end_ns, selected_pid()).await {
+            Ok(stats) => io_statistics.set(Some(stats)),
+            Err(e) => {
+                log::error!("IO statistics error: {}", e);
+                io_statistics.set(None);
+            }
+        }
+        io_statistics_loading.set(false);
+    });
+
     let summary_data = summary();
     let hist_data = histogram();
 
@@ -180,7 +203,11 @@ fn TraceViewer() -> Element {
         summary_data.as_ref(),
         selected_pid_value,
         &pid_summary,
-        selected_flame_event_type_value.as_deref(),
+        if selected_flame_event_type_value.is_empty() {
+            None
+        } else {
+            Some(selected_flame_event_type_value.as_str())
+        },
     );
 
     rsx! {
@@ -206,6 +233,8 @@ fn TraceViewer() -> Element {
                         flame_event_type_options,
                         flamegraph: event_flamegraph(),
                         flamegraph_loading: flamegraph_loading(),
+                        io_statistics: io_statistics(),
+                        io_statistics_loading: io_statistics_loading(),
                     },
                     selection: ProcessTimelineSelection {
                         enabled_event_types: enabled_event_types(),
@@ -253,7 +282,7 @@ fn TraceViewer() -> Element {
                             enabled_event_types.set(types);
                         }),
                         on_select_flame_event_type: EventHandler::new(
-                            move |event_type: Option<String>| {
+                            move |event_type: String| {
                                 selected_flame_event_type.set(event_type);
                             },
                         ),

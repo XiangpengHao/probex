@@ -1,7 +1,7 @@
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse,
-    ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats,
-    TraceSummary,
+    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse, IoStatistics,
+    IoTypeStats, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SizeBucket,
+    SyscallLatencyStats, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
@@ -146,4 +146,19 @@ pub async fn get_event_flamegraph(
         query.push(("pid", pid.to_string()));
     }
     get_json("/api/event_flamegraph", &query).await
+}
+
+pub async fn get_io_statistics(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+) -> ApiResult<IoStatistics> {
+    let mut query = vec![
+        ("start_ns", start_ns.to_string()),
+        ("end_ns", end_ns.to_string()),
+    ];
+    if let Some(pid) = pid {
+        query.push(("pid", pid.to_string()));
+    }
+    get_json("/api/io_statistics", &query).await
 }

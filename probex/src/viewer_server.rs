@@ -62,6 +62,13 @@ struct EventFlamegraphQuery {
     max_stacks: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct IoStatisticsQuery {
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+}
+
 pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
     let parquet_path = Path::new(parquet_file)
         .canonicalize()
@@ -97,7 +104,8 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/syscall_latency_stats", get(get_syscall_latency_stats))
         .route("/api/process_lifetimes", get(get_process_lifetimes))
         .route("/api/process_events", get(get_process_events))
-        .route("/api/event_flamegraph", get(get_event_flamegraph));
+        .route("/api/event_flamegraph", get(get_event_flamegraph))
+        .route("/api/io_statistics", get(get_io_statistics));
 
     let app = api_router.fallback(get(static_handler));
 
@@ -166,6 +174,12 @@ async fn get_event_flamegraph(Query(query): Query<EventFlamegraphQuery>) -> Resp
             query.max_stacks,
         )
         .await,
+    )
+}
+
+async fn get_io_statistics(Query(query): Query<IoStatisticsQuery>) -> Response {
+    into_json_response(
+        viewer_backend::query_io_statistics(query.start_ns, query.end_ns, query.pid).await,
     )
 }
 

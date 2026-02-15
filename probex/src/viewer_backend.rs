@@ -4,8 +4,8 @@
 
 pub use probex_common::viewer_api::{
     EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket, HistogramResponse,
-    LatencySummary, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
-    SyscallLatencyStats, TraceSummary,
+    IoStatistics, IoTypeStats, LatencyBucket, LatencySummary, ProcessEventsResponse,
+    ProcessLifetime, ProcessLifetimesResponse, SizeBucket, SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
@@ -1107,6 +1107,162 @@ mod backend {
         Ok(String::from_utf8(svg)?)
     }
 
+    pub async fn query_io_statistics(
+        start_ns: u64,
+        end_ns: u64,
+        pid: Option<u32>,
+    ) -> BackendResult<IoStatistics> {
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
+        }
+        let ctx = get_ctx()?;
+
+        let pid_filter = pid
+            .map(|p| format!("AND pid = {}", p))
+            .unwrap_or_default();
+
+        let sql = format!(
+            "SELECT io_type, latency_ns, request_bytes, actual_bytes
+             FROM events
+             WHERE event_type = 'io_complete'
+               AND ts_ns >= {start_ns}
+               AND ts_ns <= {end_ns}
+               {pid_filter}"
+        );
+
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        // Collect (latency, actual_bytes) per io_type, plus all sizes for the combined histogram
+        let mut ops_data: std::collections::HashMap<String, Vec<(u64, u64)>> =
+            std::collections::HashMap::new();
+        let mut all_sizes: Vec<u64> = Vec::new();
+        let mut total_ops: u64 = 0;
+        let mut total_bytes: u64 = 0;
+
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let io_type = extract_option_string(batch, "io_type", row)?
+                    .unwrap_or_else(|| "unknown".to_string());
+                let latency = extract_option_u64(batch, "latency_ns", row)?.unwrap_or(0);
+                let actual = extract_option_u64(batch, "actual_bytes", row)?.unwrap_or(0);
+
+                ops_data
+                    .entry(io_type)
+                    .or_default()
+                    .push((latency, actual));
+                all_sizes.push(actual);
+                total_ops += 1;
+                total_bytes = total_bytes.saturating_add(actual);
+            }
+        }
+
+        let mut by_operation: Vec<IoTypeStats> = ops_data
+            .into_iter()
+            .map(|(op, data)| compute_io_type_stats(op, data))
+            .collect();
+        by_operation.sort_by(|a, b| b.total_ops.cmp(&a.total_ops));
+
+        Ok(IoStatistics {
+            by_operation,
+            size_histogram: compute_size_histogram(&all_sizes),
+            total_ops,
+            total_bytes,
+            time_range_ns: (start_ns, end_ns),
+        })
+    }
+
+    fn compute_io_type_stats(operation: String, mut data: Vec<(u64, u64)>) -> IoTypeStats {
+        data.sort_by_key(|(lat, _)| *lat);
+
+        let total_ops = data.len() as u64;
+        let total_bytes: u64 = data.iter().map(|(_, b)| *b).sum();
+        let total_latency: u128 = data.iter().map(|(l, _)| *l as u128).sum();
+
+        let avg_latency_ns = if total_ops > 0 {
+            (total_latency / total_ops as u128) as u64
+        } else {
+            0
+        };
+        let p50_ns = percentile_latency(&data, 50);
+        let p95_ns = percentile_latency(&data, 95);
+        let p99_ns = percentile_latency(&data, 99);
+        let max_ns = data.last().map(|(l, _)| *l).unwrap_or(0);
+
+        let latency_histogram = latency_bucket_ranges()
+            .into_iter()
+            .map(|(min, max, label)| {
+                let count = data
+                    .iter()
+                    .filter(|(l, _)| *l >= min && *l < max)
+                    .count() as u64;
+                LatencyBucket {
+                    min_ns: min,
+                    max_ns: max,
+                    count,
+                    label: label.to_string(),
+                }
+            })
+            .collect();
+
+        IoTypeStats {
+            operation,
+            total_ops,
+            total_bytes,
+            avg_latency_ns,
+            p50_ns,
+            p95_ns,
+            p99_ns,
+            max_ns,
+            latency_histogram,
+        }
+    }
+
+    fn percentile_latency(sorted_data: &[(u64, u64)], pct: usize) -> u64 {
+        if sorted_data.is_empty() {
+            return 0;
+        }
+        let idx = (sorted_data.len() * pct / 100).min(sorted_data.len() - 1);
+        sorted_data[idx].0
+    }
+
+    fn latency_bucket_ranges() -> Vec<(u64, u64, &'static str)> {
+        vec![
+            (0, 1_000, "<1us"),
+            (1_000, 10_000, "1-10us"),
+            (10_000, 100_000, "10-100us"),
+            (100_000, 1_000_000, "100us-1ms"),
+            (1_000_000, 10_000_000, "1-10ms"),
+            (10_000_000, 100_000_000, "10-100ms"),
+            (100_000_000, 1_000_000_000, "100ms-1s"),
+            (1_000_000_000, u64::MAX, ">1s"),
+        ]
+    }
+
+    fn compute_size_histogram(sizes: &[u64]) -> Vec<SizeBucket> {
+        let ranges: Vec<(u64, u64, &str)> = vec![
+            (0, 64, "<64B"),
+            (64, 512, "64-512B"),
+            (512, 4_096, "512B-4KB"),
+            (4_096, 65_536, "4-64KB"),
+            (65_536, 1_048_576, "64KB-1MB"),
+            (1_048_576, 16_777_216, "1-16MB"),
+            (16_777_216, u64::MAX, ">16MB"),
+        ];
+        ranges
+            .into_iter()
+            .map(|(min, max, label)| {
+                let count = sizes.iter().filter(|&&s| s >= min && s < max).count() as u64;
+                SizeBucket {
+                    min_bytes: min,
+                    max_bytes: max,
+                    count,
+                    label: label.to_string(),
+                }
+            })
+            .collect()
+    }
+
     pub async fn query_event_flamegraph(
         start_ns: u64,
         end_ns: u64,
@@ -1274,4 +1430,12 @@ pub async fn query_event_flamegraph(
     max_stacks: usize,
 ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
     backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks).await
+}
+
+pub async fn query_io_statistics(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+) -> Result<IoStatistics, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_io_statistics(start_ns, end_ns, pid).await
 }
