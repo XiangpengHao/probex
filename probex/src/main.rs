@@ -100,6 +100,10 @@
 //! | syscall_io_uring_enter_exit | syscalls:sys_exit_io_uring_enter | ret |
 //! | syscall_io_uring_register_enter | syscalls:sys_enter_io_uring_register | fd, opcode |
 //! | syscall_io_uring_register_exit | syscalls:sys_exit_io_uring_register | ret |
+//! | syscall_fsync_enter | syscalls:sys_enter_fsync | fd |
+//! | syscall_fsync_exit | syscalls:sys_exit_fsync | ret |
+//! | syscall_fdatasync_enter | syscalls:sys_enter_fdatasync | fd |
+//! | syscall_fdatasync_exit | syscalls:sys_exit_fdatasync | ret |
 //! | cpu_sample | perf_event (cpu clock) | stack sample |
 
 use std::{
@@ -148,10 +152,11 @@ use parquet::{
     file::{metadata::KeyValue, properties::WriterProperties},
 };
 use probex_common::{
-    CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STATS_LEN, CpuSampleEvent,
-    EventHeader, EventType, MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent,
-    ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent,
-    SyscallEnterEvent, SyscallExitEvent,
+    CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
+    CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
+    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType,
+    MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH,
+    STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use serde::Serialize;
 use tokio::{io::unix::AsyncFd, signal};
@@ -727,6 +732,38 @@ fn parse_event(data: &[u8]) -> Result<Event> {
                 out.stack_kind = None;
             }
             Ok(out)
+        }
+        EventType::SyscallFsyncEnter => {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
+                fd: Some(event.fd),
+                ..event_base("syscall_fsync_enter", event.header)
+            })
+        }
+        EventType::SyscallFsyncExit => {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
+                ret: Some(event.ret),
+                ..event_base("syscall_fsync_exit", event.header)
+            })
+        }
+        EventType::SyscallFdatasyncEnter => {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
+                fd: Some(event.fd),
+                ..event_base("syscall_fdatasync_enter", event.header)
+            })
+        }
+        EventType::SyscallFdatasyncExit => {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
+                ret: Some(event.ret),
+                ..event_base("syscall_fdatasync_exit", event.header)
+            })
         }
     }
 }
@@ -2001,6 +2038,24 @@ pub(crate) async fn run_trace_command(
         "sys_exit_io_uring_register",
     )
     .with_context(|| "step=attach_tracepoint failed: sys_exit_io_uring_register")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_fsync", "syscalls", "sys_enter_fsync")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_fsync")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_fsync", "syscalls", "sys_exit_fsync")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_fsync")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_fdatasync",
+        "syscalls",
+        "sys_enter_fdatasync",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_fdatasync")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_fdatasync",
+        "syscalls",
+        "sys_exit_fdatasync",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_fdatasync")?;
 
     if custom_mode {
         let mut probes = custom_probe_plan
@@ -2231,17 +2286,22 @@ pub(crate) async fn run_trace_command(
 
     match read_cpu_sample_stats(&cpu_sample_stats) {
         Ok(stats) => {
+            let total = stats[CPU_SAMPLE_STAT_CALLBACK_TOTAL];
+            let filtered = stats[CPU_SAMPLE_STAT_FILTERED_NOT_TRACED];
             let emitted = stats[CPU_SAMPLE_STAT_EMITTED];
             let dropped = stats[CPU_SAMPLE_STAT_RINGBUF_DROPPED];
-            if dropped > 0 {
-                let drop_pct = (dropped as f64) * 100.0 / ((emitted + dropped) as f64);
-                info!(
-                    "Captured {} CPU samples ({} dropped, {:.1}% loss)",
-                    emitted, dropped, drop_pct
-                );
+            let user_stack = stats[CPU_SAMPLE_STAT_USER_STACK];
+            let kernel_stack = stats[CPU_SAMPLE_STAT_KERNEL_STACK];
+            let no_stack = stats[CPU_SAMPLE_STAT_NO_STACK];
+            let drop_pct = if emitted + dropped > 0 {
+                (dropped as f64) * 100.0 / ((emitted + dropped) as f64)
             } else {
-                info!("Captured {} CPU samples", emitted);
-            }
+                0.0
+            };
+            info!(
+                "CPU samples: {} total, {} filtered, {} emitted, {} dropped ({:.1}% loss) | stacks: {} user, {} kernel, {} none",
+                total, filtered, emitted, dropped, drop_pct, user_stack, kernel_stack, no_stack
+            );
         }
         Err(error) => debug!("Failed to read CPU sampler stats: {error}"),
     }

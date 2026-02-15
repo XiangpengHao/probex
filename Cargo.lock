@@ -4018,7 +4018,7 @@ dependencies = [
 
 [[package]]
 name = "probex"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4045,7 +4045,7 @@ dependencies = [
 
 [[package]]
 name = "probex-common"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aya",
  "serde",
@@ -4053,7 +4053,7 @@ dependencies = [
 
 [[package]]
 name = "probex-ebpf"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aya-ebpf",
  "aya-log-ebpf",

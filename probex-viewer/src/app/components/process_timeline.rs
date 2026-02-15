@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 
 use crate::api::EventMarker;
 
@@ -9,18 +10,37 @@ use crate::api::EventMarker;
 static EMPTY_EVENTS_MAP: LazyLock<HashMap<u32, Vec<EventMarker>>> = LazyLock::new(HashMap::new);
 static EMPTY_CPU_COUNTS_MAP: LazyLock<HashMap<u32, Vec<u16>>> = LazyLock::new(HashMap::new);
 
+use super::event_list::EventListCard;
 use super::flamegraph::{
     EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
 };
+use super::io_statistics::{IoStatisticsCard, IoStatsCardData};
 use crate::api::{
-    EventFlamegraphResponse, HistogramResponse, ProcessEventsResponse, ProcessLifetime,
-    SyscallLatencyStats, TraceSummary,
+    EventFlamegraphResponse, HistogramResponse, IoStatistics, ProcessEventsResponse,
+    ProcessLifetime, SyscallLatencyStats, TraceSummary,
 };
 use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
     get_event_marker_color,
 };
 use crate::app::view_model::PidEventSummary;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisTab {
+    Flamegraph,
+    IoStatistics,
+    Events,
+}
+
+impl AnalysisTab {
+    fn class(self, active: AnalysisTab) -> &'static str {
+        if self == active {
+            "px-2 py-0.5 text-xs font-medium text-blue-600 border-b-2 border-blue-600"
+        } else {
+            "px-2 py-0.5 text-xs font-medium text-gray-500 hover:text-gray-700"
+        }
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub struct ProcessTimelineData {
@@ -30,10 +50,12 @@ pub struct ProcessTimelineData {
     pub summary: TraceSummary,
     pub pid_summary: PidEventSummary,
     pub latency_stats: Option<SyscallLatencyStats>,
-    pub selected_flame_event_type: Option<String>,
+    pub selected_flame_event_type: String,
     pub flame_event_type_options: Vec<String>,
     pub flamegraph: Option<EventFlamegraphResponse>,
     pub flamegraph_loading: bool,
+    pub io_statistics: Option<IoStatistics>,
+    pub io_statistics_loading: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -57,7 +79,7 @@ pub struct ProcessTimelineActions {
     pub on_focus_process: EventHandler<(u32, u64, u64)>,
     pub on_change_range: EventHandler<(u64, u64)>,
     pub on_toggle_event_type: EventHandler<String>,
-    pub on_select_flame_event_type: EventHandler<Option<String>>,
+    pub on_select_flame_event_type: EventHandler<String>,
 }
 
 #[component]
@@ -71,6 +93,9 @@ pub fn ProcessTimeline(
     let process_bar_drag_state = use_signal(|| Option::<ProcessBarDragState>::None);
     let process_bar_drag_preview = use_signal(|| Option::<ProcessBarDragPreview>::None);
     let process_bar_width_px = use_signal(|| 0.0f64);
+    // Hover time for cross-hair line between timeline overview and process bars
+    let mut hover_time_ns = use_signal(|| Option::<u64>::None);
+    let mut analysis_tab = use_signal(|| AnalysisTab::Flamegraph);
 
     let full_duration_ns = range.full_end_ns.saturating_sub(range.full_start_ns);
     let full_duration = full_duration_ns as f64;
@@ -169,6 +194,9 @@ pub fn ProcessTimeline(
                         view_end_ns: range.view_end_ns,
                     },
                     on_change_range,
+                    on_hover_time: EventHandler::new(move |time: Option<u64>| {
+                        hover_time_ns.set(time);
+                    }),
                 }
             }
 
@@ -351,7 +379,33 @@ pub fn ProcessTimeline(
                 div { class: "w-20 shrink-0" }
             }
 
-            div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
+            // Process rows with hover crosshair overlay
+            div { class: "relative",
+                // Hover time crosshair line overlay - positioned over the bar area
+                if let Some(hover_ns) = hover_time_ns() {
+                    if hover_ns >= range.view_start_ns && hover_ns <= range.view_end_ns {
+                        {
+                            let view_duration = (range.view_end_ns - range.view_start_ns) as f64;
+                            let hover_pct = ((hover_ns - range.view_start_ns) as f64
+                                / view_duration
+                                * 100.0)
+                                .clamp(0.0, 100.0);
+                            rsx! {
+                                // Container matching the bar area (between w-56 label and w-20 duration columns)
+                                div {
+                                    class: "absolute top-0 bottom-0 pointer-events-none z-10",
+                                    style: "left: 224px; right: 80px;",
+                                    div {
+                                        class: "absolute top-0 bottom-0 w-px bg-gray-400/70",
+                                        style: "left: {hover_pct}%;",
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
                 {tree.visible_process_rows.iter().map(|(proc, tree_pos)| {
                     let depth = tree_pos.ancestor_is_last.len();
 
@@ -392,11 +446,13 @@ pub fn ProcessTimeline(
                     let pid = proc.pid;
                     let process_name = proc.process_name.as_deref().unwrap_or("unknown");
                     let is_selected = selection.selected_pid == Some(proc.pid);
-                    let process_label_class = if is_selected {
-                        "cursor-pointer overflow-hidden bg-blue-50 border border-blue-200 rounded px-1 py-0.5 min-w-0"
+                    let row_class = if is_selected {
+                        "flex items-center gap-2 h-7 group bg-blue-50 border border-blue-200 rounded"
                     } else {
-                        "cursor-pointer hover:bg-gray-50 overflow-hidden px-1 py-0.5 min-w-0"
+                        "flex items-center gap-2 h-7 group hover:bg-gray-50 rounded"
                     };
+                    let process_label_class =
+                        "cursor-pointer overflow-hidden px-1 py-0.5 min-w-0";
                     let process_start_ns = proc.start_ns;
                     let process_end_ns = proc.end_ns.unwrap_or(range.full_end_ns);
                     let focus_end_ns = if process_end_ns > process_start_ns {
@@ -468,13 +524,15 @@ pub fn ProcessTimeline(
                     let selected_flame_event_type_for_row = data.selected_flame_event_type.clone();
                     let flamegraph_for_row = data.flamegraph.clone();
                     let flamegraph_loading_for_row = data.flamegraph_loading;
+                    let io_statistics_for_row = data.io_statistics.clone();
+                    let io_statistics_loading_for_row = data.io_statistics_loading;
 
                     rsx! {
                         div {
                             key: "{proc.pid}",
                             class: "space-y-1",
 
-                            div { class: "flex items-center gap-2 h-7 group",
+                            div { class: "{row_class}",
                                 div {
                                     class: "w-56 shrink-0 flex items-center",
                                     style: "font-variant-numeric: tabular-nums;",
@@ -659,19 +717,17 @@ pub fn ProcessTimeline(
                                         onclick: {
                                             let mut process_bar_drag_state = process_bar_drag_state;
                                             let mut process_bar_drag_preview = process_bar_drag_preview;
-                                            move |_| {
+                                            move |evt: MouseEvent| {
                                                 process_bar_drag_state.set(None);
                                                 process_bar_drag_preview.set(None);
-                                                on_select_pid.call(pid);
-                                            }
-                                        },
-                                        ondoubleclick: {
-                                            let mut process_bar_drag_state = process_bar_drag_state;
-                                            let mut process_bar_drag_preview = process_bar_drag_preview;
-                                            move |_| {
-                                                process_bar_drag_state.set(None);
-                                                process_bar_drag_preview.set(None);
-                                                on_focus_process.call((pid, process_start_ns, focus_end_ns));
+                                                if evt.data().trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
+                                                    let detail = evt.data().as_web_event().detail();
+                                                    if detail == 2 {
+                                                        on_focus_process.call((pid, process_start_ns, focus_end_ns));
+                                                    } else if detail == 1 {
+                                                        on_select_pid.call(pid);
+                                                    }
+                                                }
                                             }
                                         },
                                     }
@@ -693,24 +749,64 @@ pub fn ProcessTimeline(
                             }
 
                             if row_is_selected {
-                                div { class: "ml-56 pl-2",
-                                    EventFlamegraphCard {
-                                        selection: FlamegraphCardSelection {
-                                            selected_event_type: selected_flame_event_type_for_row,
-                                            event_type_options: flame_event_type_options_for_row,
+                                div { class: "ml-56 pl-2 space-y-1",
+                                    // Tab bar
+                                    div { class: "flex items-center gap-0.5 border-b border-gray-200",
+                                        button {
+                                            class: AnalysisTab::Flamegraph.class(analysis_tab()),
+                                            onclick: move |_| analysis_tab.set(AnalysisTab::Flamegraph),
+                                            "Flamegraph"
+                                        }
+                                        button {
+                                            class: AnalysisTab::IoStatistics.class(analysis_tab()),
+                                            onclick: move |_| analysis_tab.set(AnalysisTab::IoStatistics),
+                                            "IO Statistics"
+                                        }
+                                        button {
+                                            class: AnalysisTab::Events.class(analysis_tab()),
+                                            onclick: move |_| analysis_tab.set(AnalysisTab::Events),
+                                            "Events"
+                                        }
+                                    }
+
+                                    // Tab content
+                                    match analysis_tab() {
+                                        AnalysisTab::Flamegraph => rsx! {
+                                            EventFlamegraphCard {
+                                                selection: FlamegraphCardSelection {
+                                                    selected_event_type: selected_flame_event_type_for_row,
+                                                    event_type_options: flame_event_type_options_for_row,
+                                                },
+                                                scope: FlamegraphCardScope {
+                                                    selected_pid: Some(proc.pid),
+                                                    full_start_ns: range.full_start_ns,
+                                                    view_start_ns: range.view_start_ns,
+                                                    view_end_ns: range.view_end_ns,
+                                                },
+                                                data: FlamegraphCardData {
+                                                    flamegraph: flamegraph_for_row,
+                                                    loading: flamegraph_loading_for_row,
+                                                },
+                                                on_select_event_type: move |event_type| {
+                                                    on_select_flame_event_type.call(event_type);
+                                                },
+                                            }
                                         },
-                                        scope: FlamegraphCardScope {
-                                            selected_pid: Some(proc.pid),
-                                            full_start_ns: range.full_start_ns,
-                                            view_start_ns: range.view_start_ns,
-                                            view_end_ns: range.view_end_ns,
+                                        AnalysisTab::IoStatistics => rsx! {
+                                            IoStatisticsCard {
+                                                data: IoStatsCardData {
+                                                    stats: io_statistics_for_row,
+                                                    loading: io_statistics_loading_for_row,
+                                                },
+                                            }
                                         },
-                                        data: FlamegraphCardData {
-                                            flamegraph: flamegraph_for_row,
-                                            loading: flamegraph_loading_for_row,
-                                        },
-                                        on_select_event_type: move |event_type| {
-                                            on_select_flame_event_type.call(event_type);
+                                        AnalysisTab::Events => rsx! {
+                                            EventListCard {
+                                                pid: proc.pid,
+                                                view_start_ns: range.view_start_ns,
+                                                view_end_ns: range.view_end_ns,
+                                                full_start_ns: range.full_start_ns,
+                                            }
                                         },
                                     }
                                 }
@@ -718,6 +814,7 @@ pub fn ProcessTimeline(
                         }
                     }
                 })}
+                }
             }
 
             // Continue selection while cursor leaves the process bar.
@@ -820,6 +917,7 @@ fn TimelineOverview(
     data: TimelineOverviewData,
     range: TimelineOverviewRange,
     on_change_range: EventHandler<(u64, u64)>,
+    on_hover_time: EventHandler<Option<u64>>,
 ) -> Element {
     let TimelineOverviewData {
         histogram,
@@ -1018,11 +1116,24 @@ fn TimelineOverview(
                 }
             },
             onmousemove: move |evt: MouseEvent| {
+                // Track hover time for crosshair line
+                let cw = container_width_px();
+                if cw > 0.0 {
+                    let element_x = evt.element_coordinates().x;
+                    let hover_frac = (element_x / cw).clamp(0.0, 1.0);
+                    let hover_ns = full_start_ns + (hover_frac * full_range).round() as u64;
+                    on_hover_time.call(Some(hover_ns));
+                }
+
+                // Handle drag if active
                 let Some(d) = drag() else { return };
                 let (start, end) = compute_range(d, evt.client_coordinates().x);
                 if drag_preview_range() != Some((start, end)) {
                     drag_preview_range.set(Some((start, end)));
                 }
+            },
+            onmouseleave: move |_| {
+                on_hover_time.call(None);
             },
             onmouseup: move |_| {
                 if drag().is_some() {

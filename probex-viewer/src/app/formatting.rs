@@ -65,3 +65,13 @@ pub fn format_net_bytes_signed(allocated: u64, freed: u64) -> String {
         format!("-{}", format_bytes(freed - allocated))
     }
 }
+
+pub fn format_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    }
+}

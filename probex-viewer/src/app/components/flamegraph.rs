@@ -5,7 +5,7 @@ use crate::app::formatting::format_duration_short;
 
 #[derive(Clone, PartialEq)]
 pub struct FlamegraphCardSelection {
-    pub selected_event_type: Option<String>,
+    pub selected_event_type: String,
     pub event_type_options: Vec<String>,
 }
 
@@ -28,7 +28,7 @@ pub fn EventFlamegraphCard(
     selection: FlamegraphCardSelection,
     scope: FlamegraphCardScope,
     data: FlamegraphCardData,
-    on_select_event_type: EventHandler<Option<String>>,
+    on_select_event_type: EventHandler<String>,
 ) -> Element {
     let FlamegraphCardSelection {
         selected_event_type,
@@ -45,7 +45,7 @@ pub fn EventFlamegraphCard(
         loading,
     } = data;
 
-    let event_type = selected_event_type.unwrap_or_default();
+    let event_type = selected_event_type;
     let flamegraph_data = flamegraph.unwrap_or_default();
     let total = flamegraph_data.total_samples;
     let svg_doc = flamegraph_data.svg.unwrap_or_default();
@@ -76,15 +76,9 @@ pub fn EventFlamegraphCard(
                 select {
                     class: "px-2 py-0.5 border border-gray-200 rounded text-xs bg-white min-w-[14rem]",
                     value: "{event_type}",
-                    onchange: move |evt| {
-                        let value = evt.value();
-                        if value.is_empty() {
-                            on_select_event_type.call(None);
-                        } else {
-                            on_select_event_type.call(Some(value));
-                        }
+                    onchange: move |evt: Event<FormData>| {
+                        on_select_event_type.call(evt.value());
                     },
-                    option { value: "", "None" }
                     {event_type_options.into_iter().map(|event_name| rsx! {
                         option { key: "{event_name}", value: "{event_name}", "{event_name}" }
                     })}

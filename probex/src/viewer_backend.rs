@@ -5,9 +5,9 @@
 pub use probex_common::viewer_api::{
     CustomEventDebugField, CustomEventDebugRow, CustomEventsDebugResponse, CustomPayloadSchema,
     CustomPayloadTypeKind, EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket,
-    HistogramResponse, LatencySummary, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource,
+    HistogramResponse, IoStatistics, IoTypeStats, LatencyBucket, LatencySummary, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource,
     ProbeSchemasPageResponse, ProbeSchemasResponse, ProcessEventsResponse, ProcessLifetime,
-    ProcessLifetimesResponse, SyscallLatencyStats, TraceSummary,
+    ProcessLifetimesResponse, SizeBucket, SyscallLatencyStats, TraceSummary, EventDetail, EventListResponse,
 };
 use std::error::Error;
 
@@ -1214,6 +1214,250 @@ mod backend {
         Ok(String::from_utf8(svg)?)
     }
 
+    pub async fn query_io_statistics(
+        start_ns: u64,
+        end_ns: u64,
+        pid: Option<u32>,
+    ) -> BackendResult<IoStatistics> {
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
+        }
+        let ctx = get_ctx()?;
+
+        let mut conditions = vec![format!("ts_ns >= {start_ns}"), format!("ts_ns <= {end_ns}")];
+        if let Some(pid) = pid {
+            conditions.push(format!("pid = {pid}"));
+        }
+
+        let sql = format!(
+            "SELECT pid, ts_ns, event_type, count, ret
+             FROM events
+             WHERE {}
+               AND event_type IN (
+                 'syscall_read_enter', 'syscall_read_exit',
+                 'syscall_write_enter', 'syscall_write_exit',
+                 'syscall_fsync_enter', 'syscall_fsync_exit',
+                 'syscall_fdatasync_enter', 'syscall_fdatasync_exit'
+               )
+             ORDER BY pid, ts_ns",
+            conditions.join(" AND ")
+        );
+
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        // Per-pid queues for enter events: (ts_ns, request_bytes)
+        let mut pending_read: std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64)>,
+        > = std::collections::HashMap::new();
+        let mut pending_write: std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64)>,
+        > = std::collections::HashMap::new();
+        let mut pending_fsync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
+        let mut pending_fdatasync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
+
+        // Collected (latency_ns, actual_bytes) per operation
+        let mut ops_data: std::collections::HashMap<&str, Vec<(u64, u64)>> =
+            std::collections::HashMap::new();
+
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let pid = extract_u32(batch, "pid", row)?;
+                let ts = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+
+                match event_type.as_str() {
+                    "syscall_read_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        pending_read.entry(pid).or_default().push_back((ts, count));
+                    }
+                    "syscall_read_exit" => {
+                        if let Some(queue) = pending_read.get_mut(&pid)
+                            && let Some((enter_ts, request_bytes)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            let actual_bytes = ret.max(0) as u64;
+                            ops_data
+                                .entry("read")
+                                .or_default()
+                                .push((ts - enter_ts, actual_bytes));
+                            let _ = request_bytes;
+                        }
+                    }
+                    "syscall_write_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        pending_write.entry(pid).or_default().push_back((ts, count));
+                    }
+                    "syscall_write_exit" => {
+                        if let Some(queue) = pending_write.get_mut(&pid)
+                            && let Some((enter_ts, request_bytes)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            let actual_bytes = ret.max(0) as u64;
+                            ops_data
+                                .entry("write")
+                                .or_default()
+                                .push((ts - enter_ts, actual_bytes));
+                            let _ = request_bytes;
+                        }
+                    }
+                    "syscall_fsync_enter" => {
+                        pending_fsync.entry(pid).or_default().push_back(ts);
+                    }
+                    "syscall_fsync_exit" => {
+                        if let Some(queue) = pending_fsync.get_mut(&pid)
+                            && let Some(enter_ts) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            ops_data
+                                .entry("fsync")
+                                .or_default()
+                                .push((ts - enter_ts, 0));
+                        }
+                    }
+                    "syscall_fdatasync_enter" => {
+                        pending_fdatasync.entry(pid).or_default().push_back(ts);
+                    }
+                    "syscall_fdatasync_exit" => {
+                        if let Some(queue) = pending_fdatasync.get_mut(&pid)
+                            && let Some(enter_ts) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            ops_data
+                                .entry("fdatasync")
+                                .or_default()
+                                .push((ts - enter_ts, 0));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut all_sizes: Vec<u64> = Vec::new();
+        let mut total_ops: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        for data in ops_data.values() {
+            for &(_, actual) in data {
+                all_sizes.push(actual);
+                total_ops += 1;
+                total_bytes = total_bytes.saturating_add(actual);
+            }
+        }
+
+        let mut by_operation: Vec<IoTypeStats> = ops_data
+            .into_iter()
+            .map(|(op, data)| compute_io_type_stats(op.to_string(), data))
+            .collect();
+        by_operation.sort_by_key(|b| std::cmp::Reverse(b.total_ops));
+
+        Ok(IoStatistics {
+            by_operation,
+            size_histogram: compute_size_histogram(&all_sizes),
+            total_ops,
+            total_bytes,
+            time_range_ns: (start_ns, end_ns),
+        })
+    }
+
+    fn compute_io_type_stats(operation: String, mut data: Vec<(u64, u64)>) -> IoTypeStats {
+        data.sort_by_key(|(lat, _)| *lat);
+
+        let total_ops = data.len() as u64;
+        let total_bytes: u64 = data.iter().map(|(_, b)| *b).sum();
+        let total_latency: u128 = data.iter().map(|(l, _)| *l as u128).sum();
+
+        let avg_latency_ns = if total_ops > 0 {
+            (total_latency / total_ops as u128) as u64
+        } else {
+            0
+        };
+        let p50_ns = percentile_latency(&data, 50);
+        let p95_ns = percentile_latency(&data, 95);
+        let p99_ns = percentile_latency(&data, 99);
+        let max_ns = data.last().map(|(l, _)| *l).unwrap_or(0);
+
+        let latency_histogram = latency_bucket_ranges()
+            .into_iter()
+            .map(|(min, max, label)| {
+                let count = data.iter().filter(|(l, _)| *l >= min && *l < max).count() as u64;
+                LatencyBucket {
+                    min_ns: min,
+                    max_ns: max,
+                    count,
+                    label: label.to_string(),
+                }
+            })
+            .collect();
+
+        let sizes: Vec<u64> = data.iter().map(|(_, b)| *b).collect();
+        let size_histogram = compute_size_histogram(&sizes);
+
+        IoTypeStats {
+            operation,
+            total_ops,
+            total_bytes,
+            avg_latency_ns,
+            p50_ns,
+            p95_ns,
+            p99_ns,
+            max_ns,
+            latency_histogram,
+            size_histogram,
+        }
+    }
+
+    fn percentile_latency(sorted_data: &[(u64, u64)], pct: usize) -> u64 {
+        if sorted_data.is_empty() {
+            return 0;
+        }
+        let idx = (sorted_data.len() * pct / 100).min(sorted_data.len() - 1);
+        sorted_data[idx].0
+    }
+
+    fn latency_bucket_ranges() -> Vec<(u64, u64, &'static str)> {
+        vec![
+            (0, 1_000, "<1us"),
+            (1_000, 10_000, "1-10us"),
+            (10_000, 100_000, "10-100us"),
+            (100_000, 1_000_000, "100us-1ms"),
+            (1_000_000, 10_000_000, "1-10ms"),
+            (10_000_000, 100_000_000, "10-100ms"),
+            (100_000_000, 1_000_000_000, "100ms-1s"),
+            (1_000_000_000, u64::MAX, ">1s"),
+        ]
+    }
+
+    fn compute_size_histogram(sizes: &[u64]) -> Vec<SizeBucket> {
+        let ranges: Vec<(u64, u64, &str)> = vec![
+            (0, 64, "<64B"),
+            (64, 512, "64-512B"),
+            (512, 4_096, "512B-4KB"),
+            (4_096, 65_536, "4-64KB"),
+            (65_536, 1_048_576, "64KB-1MB"),
+            (1_048_576, 16_777_216, "1-16MB"),
+            (16_777_216, u64::MAX, ">16MB"),
+        ];
+        ranges
+            .into_iter()
+            .map(|(min, max, label)| {
+                let count = sizes.iter().filter(|&&s| s >= min && s < max).count() as u64;
+                SizeBucket {
+                    min_bytes: min,
+                    max_bytes: max,
+                    count,
+                    label: label.to_string(),
+                }
+            })
+            .collect()
+    }
+
     pub async fn query_event_flamegraph(
         start_ns: u64,
         end_ns: u64,
@@ -1416,6 +1660,58 @@ mod backend {
             limit: CUSTOM_EVENTS_DEBUG_LIMIT,
         })
     }
+
+    pub async fn query_event_list(
+        start_ns: u64,
+        end_ns: u64,
+        pid: u32,
+        limit: usize,
+        offset: usize,
+    ) -> BackendResult<EventListResponse> {
+        let ctx = get_ctx()?;
+
+        let count_sql = format!(
+            "SELECT COUNT(*) as cnt FROM events WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}"
+        );
+        let count_df = ctx.sql(&count_sql).await?;
+        let count_batches = count_df.collect().await?;
+        let total_in_range = extract_i64(
+            count_batches.first().ok_or_else(|| {
+                IoError::new(ErrorKind::InvalidData, "count query returned no rows")
+            })?,
+            "cnt",
+            0,
+        )? as usize;
+
+        let sql = format!(
+            "SELECT ts_ns, event_type, pid, stack_trace FROM events \
+             WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns} \
+             ORDER BY ts_ns LIMIT {limit} OFFSET {offset}"
+        );
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        let mut events = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let ts_ns = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+                let pid = extract_u32(batch, "pid", row)?;
+                let stack_trace = extract_option_stack_trace_labels(batch, row)?;
+                events.push(EventDetail {
+                    ts_ns,
+                    event_type,
+                    pid,
+                    stack_trace,
+                });
+            }
+        }
+
+        Ok(EventListResponse {
+            events,
+            total_in_range,
+        })
+    }
 }
 
 pub use crate::viewer_probe_catalog::ProbeSchemasQuery;
@@ -1510,4 +1806,22 @@ pub async fn query_probe_schema_detail(
     display_name: String,
 ) -> Result<ProbeSchema, Box<dyn std::error::Error + Send + Sync>> {
     backend::query_probe_schema_detail(display_name).await
+}
+
+pub async fn query_io_statistics(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+) -> Result<IoStatistics, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_io_statistics(start_ns, end_ns, pid).await
+}
+
+pub async fn query_event_list(
+    start_ns: u64,
+    end_ns: u64,
+    pid: u32,
+    limit: usize,
+    offset: usize,
+) -> Result<EventListResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_event_list(start_ns, end_ns, pid, limit, offset).await
 }

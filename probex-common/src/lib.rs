@@ -25,6 +25,10 @@ pub enum EventType {
     SyscallIoUringRegisterEnter = 18,
     SyscallIoUringRegisterExit = 19,
     CpuSample = 20,
+    SyscallFsyncEnter = 21,
+    SyscallFsyncExit = 22,
+    SyscallFdatasyncEnter = 23,
+    SyscallFdatasyncExit = 24,
 }
 
 impl TryFrom<u8> for EventType {
@@ -53,6 +57,10 @@ impl TryFrom<u8> for EventType {
             18 => Ok(EventType::SyscallIoUringRegisterEnter),
             19 => Ok(EventType::SyscallIoUringRegisterExit),
             20 => Ok(EventType::CpuSample),
+            21 => Ok(EventType::SyscallFsyncEnter),
+            22 => Ok(EventType::SyscallFsyncExit),
+            23 => Ok(EventType::SyscallFdatasyncEnter),
+            24 => Ok(EventType::SyscallFdatasyncExit),
             v => Err(v),
         }
     }
@@ -470,5 +478,58 @@ pub mod viewer_api {
         pub events: Vec<CustomEventDebugRow>,
         pub shown: usize,
         pub limit: usize,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct LatencyBucket {
+        pub min_ns: u64,
+        pub max_ns: u64,
+        pub count: u64,
+        pub label: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct SizeBucket {
+        pub min_bytes: u64,
+        pub max_bytes: u64,
+        pub count: u64,
+        pub label: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct IoTypeStats {
+        pub operation: String,
+        pub total_ops: u64,
+        pub total_bytes: u64,
+        pub avg_latency_ns: u64,
+        pub p50_ns: u64,
+        pub p95_ns: u64,
+        pub p99_ns: u64,
+        pub max_ns: u64,
+        pub latency_histogram: Vec<LatencyBucket>,
+        pub size_histogram: Vec<SizeBucket>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct IoStatistics {
+        pub by_operation: Vec<IoTypeStats>,
+        pub size_histogram: Vec<SizeBucket>,
+        pub total_ops: u64,
+        pub total_bytes: u64,
+        pub time_range_ns: (u64, u64),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct EventDetail {
+        pub ts_ns: u64,
+        pub event_type: String,
+        pub pid: u32,
+        pub stack_trace: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct EventListResponse {
+        pub events: Vec<EventDetail>,
+        pub total_in_range: usize,
     }
 }

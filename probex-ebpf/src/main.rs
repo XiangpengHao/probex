@@ -974,6 +974,144 @@ fn try_sys_exit_io_uring_register(ctx: &TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
+/// sys_enter_fsync tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_fsync/format:
+/// - __syscall_nr: offset 8
+/// - fd: offset 16
+#[tracepoint]
+pub fn sys_enter_fsync(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_fsync(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_fsync(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallFsyncEnter),
+            fd,
+            count: 0,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_fsync tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_fsync/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_fsync(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_fsync(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_fsync(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallFsyncExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_enter_fdatasync tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_fdatasync/format:
+/// - __syscall_nr: offset 8
+/// - fd: offset 16
+#[tracepoint]
+pub fn sys_enter_fdatasync(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_fdatasync(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_fdatasync(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallFdatasyncEnter),
+            fd,
+            count: 0,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_fdatasync tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_fdatasync/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_fdatasync(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_fdatasync(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_fdatasync(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallFdatasyncExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
 #[cfg(probex_generated_probes)]
 include!(env!("PROBEX_GENERATED_PROBES_RS"));
 
