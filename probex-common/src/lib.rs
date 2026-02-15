@@ -343,6 +343,27 @@ pub mod viewer_api {
         pub filters: Vec<CustomProbeFilter>,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum CustomPayloadTypeKind {
+        U64,
+        I64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomPayloadFieldSchema {
+        pub field_id: u16,
+        pub name: String,
+        pub type_kind: CustomPayloadTypeKind,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomPayloadSchema {
+        pub schema_id: u32,
+        pub probe_display_name: String,
+        pub event_type: String,
+        pub fields: Vec<CustomPayloadFieldSchema>,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
     pub struct ProbeSchemasResponse {
         pub probes: Vec<ProbeSchema>,
@@ -397,5 +418,57 @@ pub mod viewer_api {
     pub struct TraceRunStatusResponse {
         pub sequence: u64,
         pub status: TraceRunStatus,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum TraceDebugStepStatus {
+        Pending,
+        Running,
+        Success,
+        Failed,
+        Skipped,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TraceDebugStep {
+        pub step: String,
+        pub status: TraceDebugStepStatus,
+        pub detail: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TraceDebugInfo {
+        pub generated_rust_code: String,
+        pub steps: Vec<TraceDebugStep>,
+        pub last_error: Option<String>,
+        pub updated_at_unix_ms: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventDebugField {
+        pub field_id: u16,
+        pub name: String,
+        pub type_kind: CustomPayloadTypeKind,
+        pub value_u64: u64,
+        pub value_i64: Option<i64>,
+        pub display_value: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventDebugRow {
+        pub ts_ns: u64,
+        pub event_type: String,
+        pub pid: u32,
+        pub tgid: u32,
+        pub process_name: Option<String>,
+        pub schema_id: u32,
+        pub fields: Vec<CustomEventDebugField>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct CustomEventsDebugResponse {
+        pub events: Vec<CustomEventDebugRow>,
+        pub shown: usize,
+        pub limit: usize,
     }
 }

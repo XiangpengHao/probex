@@ -120,6 +120,7 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/probe_schemas_page", get(get_probe_schemas_page))
         .route("/api/probe_schema_detail", get(get_probe_schema_detail))
         .route("/api/trace/status", get(get_trace_status))
+        .route("/api/trace/debug", get(get_trace_debug))
         .route("/api/trace/start", post(post_trace_start))
         .route("/api/trace/stop", post(post_trace_stop))
         .route("/api/trace/load", post(post_trace_load))
@@ -129,7 +130,8 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/syscall_latency_stats", get(get_syscall_latency_stats))
         .route("/api/process_lifetimes", get(get_process_lifetimes))
         .route("/api/process_events", get(get_process_events))
-        .route("/api/event_flamegraph", get(get_event_flamegraph));
+        .route("/api/event_flamegraph", get(get_event_flamegraph))
+        .route("/api/custom_events_debug", get(get_custom_events_debug));
 
     let app = api_router.fallback(get(static_handler));
 
@@ -206,6 +208,10 @@ async fn get_probe_schema_detail(Query(query): Query<ProbeSchemaDetailQuery>) ->
 
 async fn get_trace_status(Query(query): Query<TraceStatusQuery>) -> Response {
     into_json_response(viewer_trace_runtime::status_wait(query.last_sequence, query.wait_ms).await)
+}
+
+async fn get_trace_debug() -> Response {
+    into_json_response(viewer_trace_runtime::debug_info().await)
 }
 
 async fn post_trace_start(Json(request): Json<StartTraceRequest>) -> Response {
@@ -305,6 +311,10 @@ async fn get_event_flamegraph(Query(query): Query<EventFlamegraphQuery>) -> Resp
         )
         .await,
     )
+}
+
+async fn get_custom_events_debug() -> Response {
+    into_json_response(viewer_backend::query_custom_events_debug().await)
 }
 
 fn into_json_response<T>(result: Result<T, Box<dyn std::error::Error + Send + Sync>>) -> Response

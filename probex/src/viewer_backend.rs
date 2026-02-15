@@ -3,10 +3,11 @@
 //! Uses DataFusion to query parquet trace files.
 
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket, HistogramResponse,
-    LatencySummary, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource, ProbeSchemasPageResponse,
-    ProbeSchemasResponse, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
-    SyscallLatencyStats, TraceSummary,
+    CustomEventDebugField, CustomEventDebugRow, CustomEventsDebugResponse, CustomPayloadSchema,
+    CustomPayloadTypeKind, EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket,
+    HistogramResponse, LatencySummary, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource,
+    ProbeSchemasPageResponse, ProbeSchemasResponse, ProcessEventsResponse, ProcessLifetime,
+    ProcessLifetimesResponse, SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
@@ -21,6 +22,7 @@ mod backend {
     use datafusion::prelude::*;
     use inferno::flamegraph;
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use serde::Deserialize;
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
     use std::path::PathBuf;
@@ -30,12 +32,14 @@ mod backend {
 
     const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
     const PARQUET_METADATA_STACK_TRACE_FORMAT_KEY: &str = "probex.stack_trace_format";
+    const PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY: &str = "probex.custom_payload_schemas_v1";
     const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
     type BackendResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
     #[derive(Clone, Debug)]
     struct TraceFileMetadata {
         cpu_sample_frequency_hz: u64,
+        _custom_payload_schemas: Vec<CustomPayloadSchema>,
     }
 
     #[derive(Clone)]
@@ -96,6 +100,12 @@ mod backend {
         let has_legacy_proc_maps = events_table
             .schema()
             .has_column_with_unqualified_name("proc_maps_snapshot");
+        let has_custom_schema_id = events_table
+            .schema()
+            .has_column_with_unqualified_name("custom_schema_id");
+        let has_custom_payload_json = events_table
+            .schema()
+            .has_column_with_unqualified_name("custom_payload_json");
 
         if !has_stack_trace {
             return Err(IoError::new(
@@ -112,6 +122,16 @@ mod backend {
                 ErrorKind::InvalidData,
                 format!(
                     "Trace {} uses legacy stack columns. Regenerate with current probex.",
+                    parquet_file.display()
+                ),
+            )
+            .into());
+        }
+        if !has_custom_schema_id || !has_custom_payload_json {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Trace {} is missing required custom payload columns. Regenerate with current probex.",
                     parquet_file.display()
                 ),
             )
@@ -135,6 +155,45 @@ mod backend {
                 format!(
                     "column 'stack_trace' must have type List<Utf8View>, got {:?}",
                     stack_trace_field.data_type()
+                ),
+            )
+            .into());
+        }
+        let custom_schema_id_field = events_table
+            .schema()
+            .field_with_unqualified_name("custom_schema_id")
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to resolve custom_schema_id field: {error}"),
+                )
+            })?;
+        if custom_schema_id_field.data_type() != &DataType::UInt32 {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "column 'custom_schema_id' must have type UInt32, got {:?}",
+                    custom_schema_id_field.data_type()
+                ),
+            )
+            .into());
+        }
+        let custom_payload_json_field = events_table
+            .schema()
+            .field_with_unqualified_name("custom_payload_json")
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to resolve custom_payload_json field: {error}"),
+                )
+            })?;
+        let custom_payload_ty = custom_payload_json_field.data_type();
+        if custom_payload_ty != &DataType::Utf8 && custom_payload_ty != &DataType::Utf8View {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "column 'custom_payload_json' must have type Utf8 or Utf8View, got {:?}",
+                    custom_payload_ty
                 ),
             )
             .into());
@@ -225,9 +284,30 @@ mod backend {
             )
             .into());
         }
+        let custom_payload_schemas_json =
+            metadata_value(PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY).ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "required parquet metadata key '{}' missing",
+                        PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY
+                    ),
+                )
+            })?;
+        let custom_payload_schemas: Vec<CustomPayloadSchema> =
+            serde_json::from_str(custom_payload_schemas_json).map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "invalid '{}' metadata value: {}",
+                        PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY, error
+                    ),
+                )
+            })?;
 
         Ok(TraceFileMetadata {
             cpu_sample_frequency_hz,
+            _custom_payload_schemas: custom_payload_schemas,
         })
     }
 
@@ -1237,6 +1317,105 @@ mod backend {
             svg,
         })
     }
+
+    pub async fn query_custom_events_debug() -> BackendResult<CustomEventsDebugResponse> {
+        const CUSTOM_EVENTS_DEBUG_LIMIT: usize = 500;
+
+        #[derive(Debug, Deserialize)]
+        struct JsonPayloadValue {
+            field_id: u16,
+            name: String,
+            type_kind: String,
+            value_u64: u64,
+            value_i64: Option<i64>,
+        }
+
+        let ctx = get_ctx()?;
+        let sql = format!(
+            "SELECT ts_ns, event_type, pid, tgid, process_name, custom_schema_id, custom_payload_json \
+             FROM events \
+             WHERE custom_schema_id IS NOT NULL \
+             ORDER BY ts_ns ASC \
+             LIMIT {CUSTOM_EVENTS_DEBUG_LIMIT}"
+        );
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        let mut events = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let ts_ns = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+                let pid = extract_u32(batch, "pid", row)?;
+                let tgid = extract_u32(batch, "tgid", row)?;
+                let process_name = extract_option_string(batch, "process_name", row)?;
+                let schema_id =
+                    extract_option_u32(batch, "custom_schema_id", row)?.ok_or_else(|| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            "custom event row is missing custom_schema_id",
+                        )
+                    })?;
+                let payload_raw = extract_option_string(batch, "custom_payload_json", row)?
+                    .unwrap_or_else(|| "[]".to_string());
+                let payload_values: Vec<JsonPayloadValue> = serde_json::from_str(&payload_raw)
+                    .map_err(|error| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "invalid custom_payload_json at ts_ns={ts_ns}, pid={pid}: {error}"
+                            ),
+                        )
+                    })?;
+                let fields = payload_values
+                    .into_iter()
+                    .map(|value| {
+                        let type_kind = match value.type_kind.as_str() {
+                            "u64" => CustomPayloadTypeKind::U64,
+                            "i64" => CustomPayloadTypeKind::I64,
+                            other => {
+                                return Err(IoError::new(
+                                    ErrorKind::InvalidData,
+                                    format!("unsupported custom payload type kind '{other}'"),
+                                ));
+                            }
+                        };
+                        let display_value = match type_kind {
+                            CustomPayloadTypeKind::U64 => value.value_u64.to_string(),
+                            CustomPayloadTypeKind::I64 => value
+                                .value_i64
+                                .unwrap_or(value.value_u64 as i64)
+                                .to_string(),
+                        };
+                        Ok(CustomEventDebugField {
+                            field_id: value.field_id,
+                            name: value.name,
+                            type_kind,
+                            value_u64: value.value_u64,
+                            value_i64: value.value_i64,
+                            display_value,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, IoError>>()?;
+
+                events.push(CustomEventDebugRow {
+                    ts_ns,
+                    event_type,
+                    pid,
+                    tgid,
+                    process_name,
+                    schema_id,
+                    fields,
+                });
+            }
+        }
+
+        Ok(CustomEventsDebugResponse {
+            shown: events.len(),
+            events,
+            limit: CUSTOM_EVENTS_DEBUG_LIMIT,
+        })
+    }
 }
 
 pub use crate::viewer_probe_catalog::ProbeSchemasQuery;
@@ -1309,6 +1488,11 @@ pub async fn query_event_flamegraph(
     max_stacks: usize,
 ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
     backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks).await
+}
+
+pub async fn query_custom_events_debug()
+-> Result<CustomEventsDebugResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_custom_events_debug().await
 }
 
 pub async fn query_probe_schemas()

@@ -1,9 +1,9 @@
 pub use probex_common::viewer_api::{
-    CustomProbeFieldRef, CustomProbeFilter, CustomProbeFilterOp, CustomProbeSpec,
-    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse, ProbeSchema,
-    ProbeSchemaKind, ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime,
-    ProcessLifetimesResponse, StartTraceRequest, SyscallLatencyStats, TraceRunStatus,
-    TraceRunStatusResponse, TraceSummary,
+    CustomEventsDebugResponse, CustomProbeFieldRef, CustomProbeFilter, CustomProbeFilterOp,
+    CustomProbeSpec, EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse,
+    ProbeSchema, ProbeSchemaKind, ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime,
+    ProcessLifetimesResponse, StartTraceRequest, SyscallLatencyStats, TraceDebugInfo,
+    TraceDebugStepStatus, TraceRunStatus, TraceRunStatusResponse, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
@@ -139,6 +139,14 @@ pub async fn get_trace_run_status(
         query.push(("wait_ms", wait_ms.to_string()));
     }
     get_json("/api/trace/status", &query).await
+}
+
+pub async fn get_trace_debug_info() -> ApiResult<TraceDebugInfo> {
+    get_json("/api/trace/debug", &[]).await
+}
+
+pub async fn get_custom_events_debug() -> ApiResult<CustomEventsDebugResponse> {
+    get_json("/api/custom_events_debug", &[]).await
 }
 
 pub async fn start_trace_run(request: StartTraceRequest) -> ApiResult<TraceRunStatusResponse> {

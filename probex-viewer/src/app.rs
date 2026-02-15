@@ -19,12 +19,12 @@ use view_model::{
 };
 
 use crate::api::{
-    CustomProbeSpec, EventFlamegraphResponse, EventTypeCounts, HistogramResponse,
-    ProcessEventsResponse, ProcessLifetimesResponse, StartTraceRequest, TraceRunStatus,
-    TraceSummary, get_event_flamegraph, get_event_type_counts, get_histogram,
-    get_pid_event_type_counts, get_process_events, get_process_lifetimes, get_summary,
-    get_syscall_latency_stats, get_trace_run_status, load_trace_file, start_trace_run,
-    stop_trace_run,
+    CustomEventsDebugResponse, CustomProbeSpec, EventFlamegraphResponse, EventTypeCounts,
+    HistogramResponse, ProcessEventsResponse, ProcessLifetimesResponse, StartTraceRequest,
+    TraceDebugInfo, TraceDebugStepStatus, TraceRunStatus, TraceSummary, get_custom_events_debug,
+    get_event_flamegraph, get_event_type_counts, get_histogram, get_pid_event_type_counts,
+    get_process_events, get_process_lifetimes, get_summary, get_syscall_latency_stats,
+    get_trace_debug_info, get_trace_run_status, load_trace_file, start_trace_run, stop_trace_run,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -75,6 +75,14 @@ fn TraceViewer() -> Element {
     let trace_last_loaded_run_id = use_signal(|| Option::<u64>::None);
     let mut trace_error = use_signal(|| Option::<String>::None);
     let mut trace_poller_active = use_signal(|| false);
+    let mut trace_starting = use_signal(|| false);
+    let mut show_trace_debug = use_signal(|| false);
+    let mut trace_debug_info = use_signal(|| Option::<TraceDebugInfo>::None);
+    let mut trace_debug_loading = use_signal(|| false);
+    let mut trace_debug_error = use_signal(|| Option::<String>::None);
+    let mut custom_events_debug = use_signal(|| Option::<CustomEventsDebugResponse>::None);
+    let mut custom_events_debug_loading = use_signal(|| false);
+    let mut custom_events_debug_error = use_signal(|| Option::<String>::None);
 
     use_resource(move || async move {
         match get_trace_run_status(None, Some(0)).await {
@@ -234,8 +242,16 @@ fn TraceViewer() -> Element {
         &pid_summary,
         selected_flame_event_type_value.as_deref(),
     );
+    let trace_debug_snapshot = trace_debug_info();
+    let startup_status_text = startup_phase_text(trace_debug_snapshot.as_ref());
     let trace_status_text = match trace_run_status() {
-        TraceRunStatus::Idle => "Idle".to_string(),
+        TraceRunStatus::Idle => {
+            if trace_starting() {
+                startup_status_text.clone()
+            } else {
+                "Idle".to_string()
+            }
+        }
         TraceRunStatus::Running { run_id, .. } => format!("Running (#{run_id})"),
         TraceRunStatus::Finished {
             run_id,
@@ -250,8 +266,10 @@ fn TraceViewer() -> Element {
             }
         }
     };
+    let is_trace_busy =
+        trace_starting() || matches!(trace_run_status(), TraceRunStatus::Running { .. });
     let is_trace_running = matches!(trace_run_status(), TraceRunStatus::Running { .. });
-    let start_button_class = if is_trace_running {
+    let start_button_class = if is_trace_busy {
         "px-2 py-1 rounded border border-gray-200 bg-gray-100 text-gray-400 text-xs cursor-not-allowed"
     } else {
         "px-2 py-1 rounded border border-blue-200 bg-blue-50 text-blue-700 text-xs cursor-pointer hover:bg-blue-100 hover:border-blue-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-300"
@@ -276,10 +294,10 @@ fn TraceViewer() -> Element {
                 div { class: "flex items-center justify-between gap-2 flex-wrap",
                     h2 { class: "text-xs font-semibold text-gray-700", "Trace Command" }
                     div { class: "flex items-center gap-1.5",
-                        if is_trace_running {
+                        if is_trace_busy {
                             span { class: "inline-block h-2.5 w-2.5 rounded-full border-2 border-blue-300 border-t-blue-600 animate-spin" }
                         }
-                        span { class: if is_trace_running { "text-[11px] text-blue-700" } else { "text-[11px] text-gray-500" }, "{trace_status_text}" }
+                        span { class: if is_trace_busy { "text-[11px] text-blue-700" } else { "text-[11px] text-gray-500" }, "{trace_status_text}" }
                     }
                 }
                 div { class: "grid grid-cols-1 lg:grid-cols-4 gap-2",
@@ -316,9 +334,9 @@ fn TraceViewer() -> Element {
                 div { class: "flex items-center gap-2 flex-wrap",
                     button {
                         class: "{start_button_class}",
-                        disabled: is_trace_running,
+                        disabled: is_trace_busy,
                         onclick: move |_| {
-                            if is_trace_running {
+                            if is_trace_busy {
                                 return;
                             }
                             let parsed_sample = match trace_sample_freq().trim().parse::<u64>() {
@@ -343,7 +361,23 @@ fn TraceViewer() -> Element {
                                 .map(str::to_string)
                                 .collect::<Vec<_>>();
                             let selected_custom_probes = custom_probes();
+                            trace_starting.set(true);
                             trace_error.set(None);
+                            spawn(async move {
+                                while trace_starting() {
+                                    match get_trace_debug_info().await {
+                                        Ok(debug) => {
+                                            trace_debug_info.set(Some(debug));
+                                            trace_debug_error.set(None);
+                                        }
+                                        Err(error) => {
+                                            trace_debug_error.set(Some(format!("Failed to load trace debug info: {error}")));
+                                            break;
+                                        }
+                                    }
+                                    let _ = get_trace_run_status(None, Some(250)).await;
+                                }
+                            });
                             spawn(async move {
                                 match start_trace_run(StartTraceRequest {
                                     program,
@@ -353,6 +387,7 @@ fn TraceViewer() -> Element {
                                     custom_probes: selected_custom_probes,
                                 }).await {
                                     Ok(response) => {
+                                        trace_starting.set(false);
                                         trace_status_sequence.set(response.sequence);
                                         let status = response.status;
                                         let should_poll = matches!(status, TraceRunStatus::Running { .. });
@@ -377,11 +412,20 @@ fn TraceViewer() -> Element {
                                             );
                                         }
                                     }
-                                    Err(error) => trace_error.set(Some(format!("Failed to start trace: {error}"))),
+                                    Err(error) => {
+                                        trace_starting.set(false);
+                                        trace_error.set(Some(format!("Failed to start trace: {error}")));
+                                    }
                                 }
                             });
                         },
-                        if is_trace_running { "Tracing..." } else { "Start Trace" }
+                        if is_trace_running {
+                            "Tracing..."
+                        } else if trace_starting() {
+                            "Starting..."
+                        } else {
+                            "Start Trace"
+                        }
                     }
                     button {
                         class: "px-2 py-1 rounded border border-gray-200 bg-white text-gray-700 text-xs cursor-pointer hover:bg-gray-50 hover:border-gray-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300",
@@ -465,9 +509,166 @@ fn TraceViewer() -> Element {
                         },
                         "Load Parquet"
                     }
+                    button {
+                        class: if show_trace_debug() {
+                            "px-2 py-1 rounded border border-violet-300 bg-violet-100 text-violet-800 text-xs cursor-pointer hover:bg-violet-200 hover:border-violet-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300"
+                        } else {
+                            "px-2 py-1 rounded border border-violet-200 bg-violet-50 text-violet-700 text-xs cursor-pointer hover:bg-violet-100 hover:border-violet-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300"
+                        },
+                        onclick: move |_| {
+                            let next_open = !show_trace_debug();
+                            show_trace_debug.set(next_open);
+                            if !next_open {
+                                return;
+                            }
+                            trace_debug_loading.set(true);
+                            custom_events_debug_loading.set(true);
+                            trace_debug_error.set(None);
+                            custom_events_debug_error.set(None);
+                            spawn(async move {
+                                match get_trace_debug_info().await {
+                                    Ok(debug) => trace_debug_info.set(Some(debug)),
+                                    Err(error) => trace_debug_error.set(Some(format!("Failed to load trace debug info: {error}"))),
+                                }
+                                trace_debug_loading.set(false);
+                            });
+                            spawn(async move {
+                                match get_custom_events_debug().await {
+                                    Ok(events) => custom_events_debug.set(Some(events)),
+                                    Err(error) => custom_events_debug_error.set(Some(format!("Failed to load custom events debug data: {error}"))),
+                                }
+                                custom_events_debug_loading.set(false);
+                            });
+                        },
+                        if show_trace_debug() { "Hide Debug" } else { "Debug" }
+                    }
+                    if show_trace_debug() {
+                        button {
+                            class: "px-2 py-1 rounded border border-gray-200 bg-white text-gray-700 text-xs cursor-pointer hover:bg-gray-50 hover:border-gray-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300",
+                            disabled: trace_debug_loading() || custom_events_debug_loading(),
+                            onclick: move |_| {
+                                trace_debug_loading.set(true);
+                                custom_events_debug_loading.set(true);
+                                trace_debug_error.set(None);
+                                custom_events_debug_error.set(None);
+                                spawn(async move {
+                                    match get_trace_debug_info().await {
+                                        Ok(debug) => trace_debug_info.set(Some(debug)),
+                                        Err(error) => trace_debug_error.set(Some(format!("Failed to refresh trace debug info: {error}"))),
+                                    }
+                                    trace_debug_loading.set(false);
+                                });
+                                spawn(async move {
+                                    match get_custom_events_debug().await {
+                                        Ok(events) => custom_events_debug.set(Some(events)),
+                                        Err(error) => custom_events_debug_error.set(Some(format!("Failed to refresh custom events debug data: {error}"))),
+                                    }
+                                    custom_events_debug_loading.set(false);
+                                });
+                            },
+                            if trace_debug_loading() || custom_events_debug_loading() { "Refreshing..." } else { "Refresh Debug" }
+                        }
+                    }
+                }
+                if trace_starting() && !is_trace_running {
+                    div { class: "text-[11px] text-blue-700", "{startup_status_text}" }
                 }
                 if let Some(err) = trace_error() {
                     div { class: "text-[11px] text-red-700", "{err}" }
+                }
+                if show_trace_debug() {
+                    div { class: "rounded border border-violet-200 bg-violet-50/40 p-2 space-y-2",
+                        div { class: "flex items-center justify-between gap-2",
+                            span { class: "text-xs font-medium text-violet-900", "Trace Debug" }
+                            if trace_debug_loading() {
+                                span { class: "inline-block h-3 w-3 rounded-full border-2 border-violet-300 border-t-violet-600 animate-spin" }
+                            }
+                        }
+                        if let Some(err) = trace_debug_error() {
+                            div { class: "text-[11px] text-red-700", "{err}" }
+                        }
+                        if let Some(info) = trace_debug_info() {
+                            if let Some(last_error) = info.last_error {
+                                div { class: "text-[11px] text-red-700 space-y-1",
+                                    "Last runtime error: "
+                                    pre { class: "max-h-28 overflow-auto rounded border border-red-200 bg-red-50 p-2 text-[10px] leading-4 text-red-800 font-mono whitespace-pre-wrap break-words", "{last_error}" }
+                                }
+                            }
+                            div { class: "space-y-1",
+                                span { class: "text-[11px] font-medium text-gray-700", "Steps" }
+                                div { class: "space-y-1",
+                                    {info.steps.iter().map(|step| rsx! {
+                                        div { key: "{step.step}", class: "flex items-start justify-between gap-2 rounded border border-violet-100 bg-white px-2 py-1",
+                                            div { class: "text-[11px] text-gray-800 font-mono truncate", "{step.step}" }
+                                            div { class: "shrink-0 text-[10px]",
+                                                span { class: debug_step_badge_class(&step.status), "{debug_step_badge_text(&step.status)}" }
+                                            }
+                                        }
+                                        if let Some(detail) = &step.detail {
+                                            pre { class: "max-h-40 overflow-auto rounded border border-violet-100 bg-violet-50 px-2 py-1 text-[10px] leading-4 text-gray-700 font-mono whitespace-pre-wrap break-words", "{detail}" }
+                                        }
+                                    })}
+                                }
+                            }
+                            div { class: "space-y-1",
+                                span { class: "text-[11px] font-medium text-gray-700", "Generated Rust (preview)" }
+                                pre { class: "max-h-56 overflow-auto rounded border border-violet-100 bg-white p-2 text-[10px] leading-4 text-gray-700 font-mono", "{info.generated_rust_code}" }
+                            }
+                        } else if !trace_debug_loading() {
+                            div { class: "text-[11px] text-gray-500", "No debug data yet. Start a trace or click Refresh Debug." }
+                        }
+
+                        div { class: "space-y-1 pt-1",
+                            div { class: "flex items-center justify-between gap-2",
+                                span { class: "text-[11px] font-medium text-gray-700", "Custom Events (debug)" }
+                                if custom_events_debug_loading() {
+                                    span { class: "inline-block h-3 w-3 rounded-full border-2 border-violet-300 border-t-violet-600 animate-spin" }
+                                }
+                            }
+                            if let Some(err) = custom_events_debug_error() {
+                                div { class: "text-[11px] text-red-700", "{err}" }
+                            }
+                            if let Some(events) = custom_events_debug() {
+                                div { class: "text-[11px] text-gray-600", "{events.shown} shown (limit {events.limit})" }
+                                if events.events.is_empty() {
+                                    div { class: "text-[11px] text-gray-500", "No custom events found in loaded trace." }
+                                } else {
+                                    div { class: "max-h-64 overflow-auto space-y-1 pr-1",
+                                        {events.events.iter().enumerate().map(|(idx, event)| rsx! {
+                                            div { key: "{idx}-{event.ts_ns}-{event.pid}", class: "rounded border border-violet-100 bg-white p-2 space-y-1",
+                                                div { class: "flex items-center justify-between gap-2 text-[10px] text-gray-700",
+                                                    span { class: "font-mono font-medium text-violet-700", "{event.event_type}" }
+                                                    span { class: "font-mono text-gray-500", "ts={event.ts_ns}" }
+                                                }
+                                                div { class: "flex items-center gap-2 text-[10px] text-gray-600 flex-wrap",
+                                                    span { class: "font-mono", "pid={event.pid}" }
+                                                    span { class: "font-mono", "tgid={event.tgid}" }
+                                                    span { class: "font-mono", "schema={event.schema_id}" }
+                                                    if let Some(name) = &event.process_name {
+                                                        span { class: "font-mono text-gray-500", "{name}" }
+                                                    }
+                                                }
+                                                if event.fields.is_empty() {
+                                                    div { class: "text-[10px] text-gray-500", "No recorded fields." }
+                                                } else {
+                                                    div { class: "flex items-center gap-1 flex-wrap",
+                                                        {event.fields.iter().map(|field| rsx! {
+                                                            span { key: "{field.field_id}-{field.name}", class: "inline-flex items-center gap-1 rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] text-blue-800 font-mono",
+                                                                "{field.name}="
+                                                                span { class: "text-blue-900", "{field.display_value}" }
+                                                            }
+                                                        })}
+                                                    }
+                                                }
+                                            }
+                                        })}
+                                    }
+                                }
+                            } else if !custom_events_debug_loading() {
+                                div { class: "text-[11px] text-gray-500", "Open Debug or click Refresh Debug to load custom events." }
+                            }
+                        }
+                    }
                 }
                 if let TraceRunStatus::Finished {
                     output_parquet,
@@ -624,4 +825,70 @@ fn spawn_trace_status_poller(
             }
         }
     });
+}
+
+fn debug_step_badge_class(status: &TraceDebugStepStatus) -> &'static str {
+    match status {
+        TraceDebugStepStatus::Pending => "px-1.5 py-0.5 rounded bg-gray-100 text-gray-700",
+        TraceDebugStepStatus::Running => "px-1.5 py-0.5 rounded bg-blue-100 text-blue-700",
+        TraceDebugStepStatus::Success => "px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700",
+        TraceDebugStepStatus::Failed => "px-1.5 py-0.5 rounded bg-red-100 text-red-700",
+        TraceDebugStepStatus::Skipped => "px-1.5 py-0.5 rounded bg-amber-100 text-amber-700",
+    }
+}
+
+fn debug_step_badge_text(status: &TraceDebugStepStatus) -> &'static str {
+    match status {
+        TraceDebugStepStatus::Pending => "pending",
+        TraceDebugStepStatus::Running => "running",
+        TraceDebugStepStatus::Success => "ok",
+        TraceDebugStepStatus::Failed => "failed",
+        TraceDebugStepStatus::Skipped => "skipped",
+    }
+}
+
+fn debug_step_label(step: &str) -> &'static str {
+    match step {
+        "validate_custom_probes" => "Validating probes...",
+        "generate_rust_code" => "Generating eBPF source...",
+        "build_generated_ebpf" => "Building eBPF object...",
+        "load_ebpf" => "Loading eBPF...",
+        "attach_probes" => "Attaching probes...",
+        "spawn_target" => "Starting target process...",
+        "trace_loop" => "Starting trace loop...",
+        _ => "Starting trace...",
+    }
+}
+
+fn startup_phase_text(info: Option<&TraceDebugInfo>) -> String {
+    let Some(info) = info else {
+        return "Starting trace...".to_string();
+    };
+
+    if let Some(step) = info
+        .steps
+        .iter()
+        .find(|step| matches!(step.status, TraceDebugStepStatus::Failed))
+    {
+        return format!(
+            "Failed during {}",
+            debug_step_label(&step.step).trim_end_matches("...")
+        );
+    }
+    if let Some(step) = info
+        .steps
+        .iter()
+        .find(|step| matches!(step.status, TraceDebugStepStatus::Running))
+    {
+        return debug_step_label(&step.step).to_string();
+    }
+    if let Some(step) = info
+        .steps
+        .iter()
+        .find(|step| matches!(step.status, TraceDebugStepStatus::Pending))
+    {
+        return debug_step_label(&step.step).to_string();
+    }
+
+    "Starting trace...".to_string()
 }

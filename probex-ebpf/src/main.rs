@@ -974,6 +974,9 @@ fn try_sys_exit_io_uring_register(ctx: &TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
+#[cfg(probex_generated_probes)]
+include!(env!("PROBEX_GENERATED_PROBES_RS"));
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

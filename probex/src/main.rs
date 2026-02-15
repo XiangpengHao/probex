@@ -111,6 +111,10 @@ use std::{
     sync::Arc,
 };
 
+use crate::custom_codegen::{
+    CompiledCustomPlan, CustomProbeRuntimeEvent, build_generated_ebpf_binary,
+    compile_custom_probe_plan, generate_custom_probe_source, generate_custom_probe_source_preview,
+};
 use anyhow::{Context as _, Result, anyhow};
 use arrow::{
     array::{
@@ -149,9 +153,12 @@ use probex_common::{
     ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent,
     SyscallEnterEvent, SyscallExitEvent,
 };
+use serde::Serialize;
 use tokio::{io::unix::AsyncFd, signal};
 use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
+mod custom_codegen;
+mod tracepoint_format;
 mod viewer_backend;
 mod viewer_probe_catalog;
 mod viewer_server;
@@ -161,6 +168,7 @@ mod viewer_trace_runtime;
 const BATCH_SIZE: usize = 10_000;
 const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
 const PARQUET_METADATA_STACK_TRACE_FORMAT_KEY: &str = "probex.stack_trace_format";
+const PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY: &str = "probex.custom_payload_schemas_v1";
 const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
 
 #[derive(Parser, Debug)]
@@ -204,9 +212,9 @@ struct Args {
 
 /// Flattened event structure for Parquet output.
 /// All event types share common fields, with type-specific fields being optional.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Event {
-    event_type: &'static str,
+    event_type: String,
     ts_ns: u64,
     pid: u32,
     tgid: u32,
@@ -235,6 +243,9 @@ struct Event {
     fd: Option<i64>,
     count: Option<u64>,
     ret: Option<i64>,
+    // Dynamic custom payload fields
+    custom_schema_id: Option<u32>,
+    custom_payload_json: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +286,9 @@ fn create_intermediate_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
+        // Dynamic custom payload columns (nullable)
+        Field::new("custom_schema_id", DataType::UInt32, true),
+        Field::new("custom_payload_json", DataType::Utf8, true),
     ])
 }
 
@@ -311,6 +325,9 @@ fn create_final_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
+        // Dynamic custom payload columns (nullable)
+        Field::new("custom_schema_id", DataType::UInt32, true),
+        Field::new("custom_payload_json", DataType::Utf8, true),
     ])
 }
 
@@ -325,15 +342,21 @@ struct ParquetBatchWriter {
 
 impl ParquetBatchWriter {
     /// Create a new ParquetBatchWriter that writes to the specified file
-    fn new(path: &str, sample_freq_hz: u64) -> Result<Self> {
+    fn new(path: &str, sample_freq_hz: u64, custom_payload_schemas_json: &str) -> Result<Self> {
         let schema = Arc::new(create_intermediate_schema());
         let file =
             File::create(path).with_context(|| format!("failed to create output file {}", path))?;
 
-        let key_value_metadata = vec![KeyValue::new(
-            PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY.to_string(),
-            sample_freq_hz.to_string(),
-        )];
+        let key_value_metadata = vec![
+            KeyValue::new(
+                PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY.to_string(),
+                sample_freq_hz.to_string(),
+            ),
+            KeyValue::new(
+                PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY.to_string(),
+                custom_payload_schemas_json.to_string(),
+            ),
+        ];
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .set_key_value_metadata(Some(key_value_metadata))
@@ -390,9 +413,12 @@ impl ParquetBatchWriter {
         let mut fd_builder = Int64Builder::with_capacity(batch_len);
         let mut count_builder = UInt64Builder::with_capacity(batch_len);
         let mut ret_builder = Int64Builder::with_capacity(batch_len);
+        let mut custom_schema_id_builder = UInt32Builder::with_capacity(batch_len);
+        let mut custom_payload_json_builder =
+            StringBuilder::with_capacity(batch_len, batch_len * 64);
 
         for event in self.batch.drain(..) {
-            event_type_builder.append_value(event.event_type);
+            event_type_builder.append_value(&event.event_type);
             ts_ns_builder.append_value(event.ts_ns);
             pid_builder.append_value(event.pid);
             tgid_builder.append_value(event.tgid);
@@ -414,6 +440,8 @@ impl ParquetBatchWriter {
             fd_builder.append_option(event.fd);
             count_builder.append_option(event.count);
             ret_builder.append_option(event.ret);
+            custom_schema_id_builder.append_option(event.custom_schema_id);
+            custom_payload_json_builder.append_option(event.custom_payload_json.as_deref());
         }
 
         let columns: Vec<ArrayRef> = vec![
@@ -439,6 +467,8 @@ impl ParquetBatchWriter {
             Arc::new(fd_builder.finish()),
             Arc::new(count_builder.finish()),
             Arc::new(ret_builder.finish()),
+            Arc::new(custom_schema_id_builder.finish()),
+            Arc::new(custom_payload_json_builder.finish()),
         ];
 
         let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
@@ -478,7 +508,7 @@ fn stack_kind_from_header(stack_kind: u8) -> Option<&'static str> {
 
 fn event_base(event_type: &'static str, header: EventHeader) -> Event {
     Event {
-        event_type,
+        event_type: event_type.to_string(),
         ts_ns: header.timestamp_ns,
         pid: header.pid,
         tgid: header.tgid,
@@ -699,6 +729,79 @@ fn parse_event(data: &[u8]) -> Result<Event> {
             Ok(out)
         }
     }
+}
+
+fn parse_custom_runtime_event(data: &[u8], plan: &CompiledCustomPlan) -> Result<Option<Event>> {
+    let raw = read_unaligned_from_bytes::<CustomProbeRuntimeEvent>(data)
+        .ok_or_else(|| anyhow!("custom runtime payload too short"))?;
+    let Some(probe) = plan.by_probe_id.get(&raw.probe_id) else {
+        return Ok(None);
+    };
+
+    #[derive(Serialize)]
+    struct CustomPayloadValueJson {
+        field_id: u16,
+        name: String,
+        type_kind: &'static str,
+        value_u64: u64,
+        value_i64: Option<i64>,
+    }
+
+    let mut field_by_id = BTreeMap::new();
+    for field in &probe.recorded_fields {
+        field_by_id.insert(field.field_id, field);
+    }
+
+    let value_count = usize::from(raw.value_count);
+    if value_count > raw.values.len() {
+        return Err(anyhow!(
+            "custom runtime payload declared {} values but max is {}",
+            value_count,
+            raw.values.len()
+        ));
+    }
+    let mut payload_values = Vec::with_capacity(value_count);
+    for idx in 0..value_count {
+        let value = raw.values[idx];
+        let field = field_by_id.get(&value.field_id).ok_or_else(|| {
+            anyhow!(
+                "custom runtime payload references unknown field_id {} for probe '{}'",
+                value.field_id,
+                probe.probe_display_name
+            )
+        })?;
+        let value_i64 = field.signed.then_some(value.value as i64);
+        payload_values.push(CustomPayloadValueJson {
+            field_id: value.field_id,
+            name: field.name.clone(),
+            type_kind: if field.signed { "i64" } else { "u64" },
+            value_u64: value.value,
+            value_i64,
+        });
+    }
+    let custom_payload_json = if payload_values.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&payload_values)
+                .with_context(|| "failed to encode custom payload values as json")?,
+        )
+    };
+
+    let event = Event {
+        event_type: probe.custom_event_type.clone(),
+        ts_ns: raw.header.timestamp_ns,
+        pid: raw.header.pid,
+        tgid: raw.header.tgid,
+        stack_id: (raw.header.stack_id >= 0).then_some(raw.header.stack_id),
+        kernel_stack_id: (raw.header.kernel_stack_id >= 0).then_some(raw.header.kernel_stack_id),
+        stack_kind: stack_kind_from_header(raw.header.stack_kind),
+        cpu: raw.header.cpu,
+        custom_schema_id: Some(probe.probe_id),
+        custom_payload_json,
+        ..Default::default()
+    };
+    Ok(Some(event))
 }
 
 fn read_process_name(pid: u32) -> Option<String> {
@@ -1168,6 +1271,7 @@ async fn symbolize_stack_traces_into_events_parquet(
     events_output_path: &str,
     snapshot_index: &ProcMapsSnapshotIndex,
     sample_freq_hz: u64,
+    custom_payload_schemas_json: &str,
 ) -> Result<StackTraceFinalizationStats> {
     let file = File::open(events_output_path)
         .with_context(|| format!("failed to open events file {}", events_output_path))?;
@@ -1206,6 +1310,10 @@ async fn symbolize_stack_traces_into_events_parquet(
         KeyValue::new(
             PARQUET_METADATA_STACK_TRACE_FORMAT_KEY.to_string(),
             STACK_TRACE_FORMAT_SYMBOLIZED_V1.to_string(),
+        ),
+        KeyValue::new(
+            PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY.to_string(),
+            custom_payload_schemas_json.to_string(),
         ),
     ];
     let props = WriterProperties::builder()
@@ -1706,17 +1814,48 @@ pub(crate) struct TraceCommandOutcome {
     pub output_path: String,
 }
 
+async fn resolve_custom_probe_schemas(
+    specs: &[probex_common::viewer_api::CustomProbeSpec],
+) -> Result<std::collections::HashMap<String, probex_common::viewer_api::ProbeSchema>> {
+    let mut resolved = std::collections::HashMap::with_capacity(specs.len());
+    for spec in specs {
+        let schema =
+            viewer_probe_catalog::query_probe_schema_detail(spec.probe_display_name.clone())
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "failed to resolve custom probe '{}': {error}",
+                        spec.probe_display_name
+                    )
+                })?;
+        resolved.insert(spec.probe_display_name.clone(), schema);
+    }
+    Ok(resolved)
+}
+
 pub(crate) async fn run_trace_command(
     config: TraceCommandConfig,
     mut stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
     allow_ctrl_c: bool,
 ) -> Result<TraceCommandOutcome> {
-    if !config.custom_probes.is_empty() {
+    let resolved_custom_probe_schemas =
+        resolve_custom_probe_schemas(&config.custom_probes)
+            .await
+            .with_context(|| "step=resolve_custom_probe_schemas failed")?;
+    let custom_probe_plan =
+        compile_custom_probe_plan(&config.custom_probes, &resolved_custom_probe_schemas)
+            .with_context(|| "step=compile_custom_probe_plan failed")?;
+    let custom_payload_schemas_json = custom_probe_plan
+        .payload_schemas_json()
+        .with_context(|| "step=encode_custom_payload_schemas failed")?;
+    if !custom_probe_plan.by_probe_id.is_empty() {
         info!(
-            "Received {} custom probe spec(s); runtime attachment is not wired yet and these specs are currently metadata-only",
+            "Custom probes enabled: {} generated probe(s), {} custom probe spec(s)",
+            custom_probe_plan.by_probe_id.len(),
             config.custom_probes.len()
         );
     }
+    let custom_mode = !custom_probe_plan.by_probe_id.is_empty();
     let privilege_drop_target = resolve_privilege_drop_target()?;
     // Bump the memlock rlimit
     let rlim = libc::rlimit {
@@ -1728,11 +1867,20 @@ pub(crate) async fn run_trace_command(
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // Load eBPF program
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/probex"
-    )))?;
+    // Load eBPF program (embedded by default, generated when custom probes are present).
+    let mut ebpf = if custom_mode {
+        let generated_source = generate_custom_probe_source(&custom_probe_plan)
+            .with_context(|| "step=generate_rust_code failed")?;
+        let generated_binary = build_generated_ebpf_binary(&generated_source)
+            .with_context(|| "step=build_generated_ebpf failed")?;
+        aya::Ebpf::load(&generated_binary).with_context(|| "step=load_ebpf failed")?
+    } else {
+        aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/probex"
+        )))
+        .with_context(|| "step=load_ebpf failed")?
+    };
 
     // Initialize eBPF logger (optional)
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
@@ -1740,11 +1888,12 @@ pub(crate) async fn run_trace_command(
     }
 
     // Spawn child process with SIGSTOP
-    let child_pid = spawn_child(&config.program, &config.args, privilege_drop_target)?;
+    let child_pid = spawn_child(&config.program, &config.args, privilege_drop_target)
+        .with_context(|| "step=spawn_child failed")?;
     let child_pid_u32 = child_pid.as_raw() as u32;
     info!("Spawned child process with PID {}", child_pid);
 
-    wait_for_child_stop(child_pid)?;
+    wait_for_child_stop(child_pid).with_context(|| "step=wait_child_stop failed")?;
 
     let mut child_wait = tokio::task::spawn_blocking(move || waitpid(child_pid, None));
 
@@ -1753,92 +1902,135 @@ pub(crate) async fn run_trace_command(
         let mut traced_pids: HashMap<_, u32, u8> = HashMap::try_from(
             ebpf.map_mut("TRACED_PIDS")
                 .ok_or_else(|| anyhow!("map TRACED_PIDS not found"))?,
-        )?;
-        traced_pids.insert(child_pid_u32, 1, 0)?;
+        )
+        .with_context(|| "step=open_traced_pids_map failed")?;
+        traced_pids
+            .insert(child_pid_u32, 1, 0)
+            .with_context(|| "step=insert_traced_pid failed")?;
         info!("Added PID {} to traced PIDs", child_pid_u32);
     }
 
-    // Attach all tracepoints
-    attach_tracepoint(&mut ebpf, "sched_switch", "sched", "sched_switch")?;
+    // Attach all built-in tracepoints
+    attach_tracepoint(&mut ebpf, "sched_switch", "sched", "sched_switch")
+        .with_context(|| "step=attach_tracepoint failed: sched_switch")?;
     attach_tracepoint(
         &mut ebpf,
         "sched_process_fork",
         "sched",
         "sched_process_fork",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sched_process_fork")?;
     attach_tracepoint(
         &mut ebpf,
         "sched_process_exit",
         "sched",
         "sched_process_exit",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sched_process_exit")?;
     attach_tracepoint(
         &mut ebpf,
         "page_fault_user",
         "exceptions",
         "page_fault_user",
-    )?;
-    attach_tracepoint(&mut ebpf, "sys_enter_read", "syscalls", "sys_enter_read")?;
-    attach_tracepoint(&mut ebpf, "sys_exit_read", "syscalls", "sys_exit_read")?;
-    attach_tracepoint(&mut ebpf, "sys_enter_write", "syscalls", "sys_enter_write")?;
-    attach_tracepoint(&mut ebpf, "sys_exit_write", "syscalls", "sys_exit_write")?;
-    attach_tracepoint(&mut ebpf, "sys_enter_mmap", "syscalls", "sys_enter_mmap")?;
-    attach_tracepoint(&mut ebpf, "sys_exit_mmap", "syscalls", "sys_exit_mmap")?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: page_fault_user")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_read", "syscalls", "sys_enter_read")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_read")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_read", "syscalls", "sys_exit_read")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_read")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_write", "syscalls", "sys_enter_write")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_write")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_write", "syscalls", "sys_exit_write")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_write")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_mmap", "syscalls", "sys_enter_mmap")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_mmap")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_mmap", "syscalls", "sys_exit_mmap")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_mmap")?;
     attach_tracepoint(
         &mut ebpf,
         "sys_enter_munmap",
         "syscalls",
         "sys_enter_munmap",
-    )?;
-    attach_tracepoint(&mut ebpf, "sys_exit_munmap", "syscalls", "sys_exit_munmap")?;
-    attach_tracepoint(&mut ebpf, "sys_enter_brk", "syscalls", "sys_enter_brk")?;
-    attach_tracepoint(&mut ebpf, "sys_exit_brk", "syscalls", "sys_exit_brk")?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_munmap")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_munmap", "syscalls", "sys_exit_munmap")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_munmap")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_brk", "syscalls", "sys_enter_brk")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_brk")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_brk", "syscalls", "sys_exit_brk")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_brk")?;
     attach_tracepoint(
         &mut ebpf,
         "sys_enter_io_uring_setup",
         "syscalls",
         "sys_enter_io_uring_setup",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_io_uring_setup")?;
     attach_tracepoint(
         &mut ebpf,
         "sys_exit_io_uring_setup",
         "syscalls",
         "sys_exit_io_uring_setup",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_io_uring_setup")?;
     attach_tracepoint(
         &mut ebpf,
         "sys_enter_io_uring_enter",
         "syscalls",
         "sys_enter_io_uring_enter",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_io_uring_enter")?;
     attach_tracepoint(
         &mut ebpf,
         "sys_exit_io_uring_enter",
         "syscalls",
         "sys_exit_io_uring_enter",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_io_uring_enter")?;
     attach_tracepoint(
         &mut ebpf,
         "sys_enter_io_uring_register",
         "syscalls",
         "sys_enter_io_uring_register",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_io_uring_register")?;
     attach_tracepoint(
         &mut ebpf,
         "sys_exit_io_uring_register",
         "syscalls",
         "sys_exit_io_uring_register",
-    )?;
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_io_uring_register")?;
+
+    if custom_mode {
+        let mut probes = custom_probe_plan
+            .by_probe_id
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        probes.sort_by_key(|probe| probe.probe_id);
+        for probe in probes {
+            attach_tracepoint(
+                &mut ebpf,
+                probe.program_name.as_str(),
+                probe.category.as_str(),
+                probe.probe_name.as_str(),
+            )
+            .with_context(|| format!("step=attach_tracepoint failed: {}", probe.program_name))?;
+        }
+    }
     let target_pid = u32::try_from(child_pid.as_raw())
         .context("child pid is negative and cannot be used for perf scope")?;
     attach_cpu_sampler(&mut ebpf, target_pid, config.sample_freq_hz)?;
 
-    if let Some(target) = privilege_drop_target {
+    if allow_ctrl_c && let Some(target) = privilege_drop_target {
         drop_process_privileges(target).context("failed to drop runtime privileges")?;
         debug!(
             "Dropped privileges to uid={}, gid={} after eBPF setup",
             target.uid, target.gid
         );
+    } else if !allow_ctrl_c && privilege_drop_target.is_some() {
+        debug!("Skipping runtime privilege drop for viewer-managed trace session");
     }
 
     // Resume child process
@@ -1847,7 +2039,11 @@ pub(crate) async fn run_trace_command(
     debug!("Resumed child process {}", child_pid);
 
     // Create Parquet batch writer
-    let mut writer = ParquetBatchWriter::new(&config.output, config.sample_freq_hz)?;
+    let mut writer = ParquetBatchWriter::new(
+        &config.output,
+        config.sample_freq_hz,
+        &custom_payload_schemas_json,
+    )?;
     info!("Writing events to {}", config.output);
     let mut snapshot_collector = ProcMapsSnapshotCollector::default();
 
@@ -1871,6 +2067,19 @@ pub(crate) async fn run_trace_command(
             .ok_or_else(|| anyhow!("map EVENTS not found"))?,
     )?;
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
+    let mut custom_async_ring_buf = if custom_mode {
+        let custom_ring_buf = RingBuf::try_from(
+            ebpf.take_map("CUSTOM_EVENTS")
+                .ok_or_else(|| anyhow!("map CUSTOM_EVENTS not found"))?,
+        )
+        .with_context(|| "step=open_custom_events_map failed")?;
+        Some(AsyncFd::with_interest(
+            custom_ring_buf,
+            tokio::io::Interest::READABLE,
+        )?)
+    } else {
+        None
+    };
 
     let mut child_wait_done = false;
     let mut pid_name_cache: std::collections::HashMap<u32, Option<String>> =
@@ -1891,7 +2100,8 @@ pub(crate) async fn run_trace_command(
 
         if event.tgid > 0 {
             let is_first_seen = seen_tgids.insert(event.tgid);
-            let should_refresh = is_first_seen || should_refresh_maps_for_event(event.event_type);
+            let should_refresh =
+                is_first_seen || should_refresh_maps_for_event(event.event_type.as_str());
             if should_refresh {
                 maybe_capture_proc_maps_snapshot(
                     event.tgid,
@@ -1963,6 +2173,15 @@ pub(crate) async fn run_trace_command(
                         .with_context(|| "failed to parse ring buffer event while draining")?;
                     handle_event(&mut event)?;
                 }
+                if let Some(custom_ring) = custom_async_ring_buf.as_mut() {
+                    while let Some(item) = custom_ring.get_mut().next() {
+                        if let Some(mut custom_event) =
+                            parse_custom_runtime_event(&item, &custom_probe_plan)?
+                        {
+                            handle_event(&mut custom_event)?;
+                        }
+                    }
+                }
                 info!("Child process {} exited", child_pid);
                 break;
             }
@@ -1990,6 +2209,15 @@ pub(crate) async fn run_trace_command(
                     let mut event =
                         parse_event(&item).with_context(|| "failed to parse ring buffer event")?;
                     handle_event(&mut event)?;
+                }
+                if let Some(custom_ring) = custom_async_ring_buf.as_mut() {
+                    while let Some(item) = custom_ring.get_mut().next() {
+                        if let Some(mut custom_event) =
+                            parse_custom_runtime_event(&item, &custom_probe_plan)?
+                        {
+                            handle_event(&mut custom_event)?;
+                        }
+                    }
                 }
 
                 guard.clear_ready();
@@ -2027,6 +2255,7 @@ pub(crate) async fn run_trace_command(
         &config.output,
         snapshot_collector.snapshot_index(),
         config.sample_freq_hz,
+        &custom_payload_schemas_json,
     )
     .await?;
     info!(
