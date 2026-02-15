@@ -10,13 +10,12 @@ use aya_ebpf::{
     EbpfContext,
 };
 use probex_common::{
-    CpuSampleEvent, EventHeader, EventType, IoCompleteEvent, PageFaultEvent, PendingIoKey,
-    PendingIoValue, ProcessExitEvent, ProcessForkEvent, SchedSwitchEvent, SyscallEnterEvent,
-    SyscallExitEvent, CPU_SAMPLE_STATS_LEN, CPU_SAMPLE_STAT_CALLBACK_TOTAL,
-    CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED, CPU_SAMPLE_STAT_NO_STACK,
-    CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STAT_USER_STACK, IO_TYPE_FDATASYNC, IO_TYPE_FSYNC,
-    IO_TYPE_READ, IO_TYPE_WRITE, MAX_CPU_SAMPLE_FRAMES, MAX_PENDING_IO, MAX_TRACKED_PIDS,
-    RING_BUF_SIZE, STACK_KIND_KERNEL, STACK_KIND_NONE, STACK_KIND_USER,
+    CpuSampleEvent, EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent,
+    SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent, CPU_SAMPLE_STATS_LEN,
+    CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
+    CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STAT_USER_STACK,
+    MAX_CPU_SAMPLE_FRAMES, MAX_TRACKED_PIDS, RING_BUF_SIZE, STACK_KIND_KERNEL, STACK_KIND_NONE,
+    STACK_KIND_USER,
 };
 
 /// Ring buffer for sending events to userspace
@@ -35,12 +34,6 @@ static TRACED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_TRACKED_PID
 #[map]
 static CPU_SAMPLE_STATS: PerCpuArray<[u64; CPU_SAMPLE_STATS_LEN]> =
     PerCpuArray::with_max_entries(1, 0);
-
-/// HashMap to track pending IO operations for latency measurement.
-/// Key: (pid, io_type) — a thread can only have one pending syscall at a time.
-#[map]
-static PENDING_IO: HashMap<PendingIoKey, PendingIoValue> =
-    HashMap::with_max_entries(MAX_PENDING_IO, 0);
 
 /// Check if a PID is being traced
 #[inline(always)]
@@ -429,18 +422,6 @@ fn try_sys_enter_read(ctx: &TracePointContext) -> Result<u32, i64> {
     // Read count at offset 32
     let count: u64 = unsafe { ctx.read_at(32)? };
 
-    // Track pending IO for latency measurement
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_READ,
-        _pad: [0; 3],
-    };
-    let pending_val = PendingIoValue {
-        enter_ts: unsafe { bpf_ktime_get_ns() },
-        request_bytes: count,
-    };
-    let _ = PENDING_IO.insert(&pending_key, &pending_val, 0);
-
     if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
         let event = SyscallEnterEvent {
             header: make_header(ctx, EventType::SyscallReadEnter),
@@ -477,34 +458,6 @@ fn try_sys_exit_read(ctx: &TracePointContext) -> Result<u32, i64> {
 
     // Read ret at offset 16
     let ret: i64 = unsafe { ctx.read_at(16)? };
-
-    // Emit IoCompleteEvent if we have a matching enter
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_READ,
-        _pad: [0; 3],
-    };
-    if let Some(pending) = unsafe { PENDING_IO.get(&pending_key) } {
-        let exit_ts = unsafe { bpf_ktime_get_ns() };
-        let latency_ns = exit_ts.saturating_sub(pending.enter_ts);
-        let request_bytes = pending.request_bytes;
-        if let Some(mut buf) = EVENTS.reserve::<IoCompleteEvent>(0) {
-            let event = IoCompleteEvent {
-                header: make_header_without_stack(ctx, EventType::IoComplete),
-                io_type: IO_TYPE_READ,
-                _pad: [0; 3],
-                fd: 0,
-                request_bytes,
-                actual_bytes: ret,
-                latency_ns,
-            };
-            unsafe {
-                (*buf.as_mut_ptr()) = event;
-            }
-            buf.submit(BPF_RB_FORCE_WAKEUP as u64);
-        }
-        let _ = PENDING_IO.remove(&pending_key);
-    }
 
     if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
         let event = SyscallExitEvent {
@@ -546,18 +499,6 @@ fn try_sys_enter_write(ctx: &TracePointContext) -> Result<u32, i64> {
     // Read count at offset 32
     let count: u64 = unsafe { ctx.read_at(32)? };
 
-    // Track pending IO for latency measurement
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_WRITE,
-        _pad: [0; 3],
-    };
-    let pending_val = PendingIoValue {
-        enter_ts: unsafe { bpf_ktime_get_ns() },
-        request_bytes: count,
-    };
-    let _ = PENDING_IO.insert(&pending_key, &pending_val, 0);
-
     if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
         let event = SyscallEnterEvent {
             header: make_header(ctx, EventType::SyscallWriteEnter),
@@ -594,34 +535,6 @@ fn try_sys_exit_write(ctx: &TracePointContext) -> Result<u32, i64> {
 
     // Read ret at offset 16
     let ret: i64 = unsafe { ctx.read_at(16)? };
-
-    // Emit IoCompleteEvent if we have a matching enter
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_WRITE,
-        _pad: [0; 3],
-    };
-    if let Some(pending) = unsafe { PENDING_IO.get(&pending_key) } {
-        let exit_ts = unsafe { bpf_ktime_get_ns() };
-        let latency_ns = exit_ts.saturating_sub(pending.enter_ts);
-        let request_bytes = pending.request_bytes;
-        if let Some(mut buf) = EVENTS.reserve::<IoCompleteEvent>(0) {
-            let event = IoCompleteEvent {
-                header: make_header_without_stack(ctx, EventType::IoComplete),
-                io_type: IO_TYPE_WRITE,
-                _pad: [0; 3],
-                fd: 0,
-                request_bytes,
-                actual_bytes: ret,
-                latency_ns,
-            };
-            unsafe {
-                (*buf.as_mut_ptr()) = event;
-            }
-            buf.submit(BPF_RB_FORCE_WAKEUP as u64);
-        }
-        let _ = PENDING_IO.remove(&pending_key);
-    }
 
     if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
         let event = SyscallExitEvent {
@@ -1079,16 +992,19 @@ fn try_sys_enter_fsync(ctx: &TracePointContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_FSYNC,
-        _pad: [0; 3],
-    };
-    let pending_val = PendingIoValue {
-        enter_ts: unsafe { bpf_ktime_get_ns() },
-        request_bytes: 0,
-    };
-    let _ = PENDING_IO.insert(&pending_key, &pending_val, 0);
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallFsyncEnter),
+            fd,
+            count: 0,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
 
     Ok(0)
 }
@@ -1113,30 +1029,15 @@ fn try_sys_exit_fsync(ctx: &TracePointContext) -> Result<u32, i64> {
 
     let ret: i64 = unsafe { ctx.read_at(16)? };
 
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_FSYNC,
-        _pad: [0; 3],
-    };
-    if let Some(pending) = unsafe { PENDING_IO.get(&pending_key) } {
-        let exit_ts = unsafe { bpf_ktime_get_ns() };
-        let latency_ns = exit_ts.saturating_sub(pending.enter_ts);
-        if let Some(mut buf) = EVENTS.reserve::<IoCompleteEvent>(0) {
-            let event = IoCompleteEvent {
-                header: make_header_without_stack(ctx, EventType::IoComplete),
-                io_type: IO_TYPE_FSYNC,
-                _pad: [0; 3],
-                fd: 0,
-                request_bytes: 0,
-                actual_bytes: ret,
-                latency_ns,
-            };
-            unsafe {
-                (*buf.as_mut_ptr()) = event;
-            }
-            buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallFsyncExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
         }
-        let _ = PENDING_IO.remove(&pending_key);
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
     }
 
     Ok(0)
@@ -1160,16 +1061,19 @@ fn try_sys_enter_fdatasync(ctx: &TracePointContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_FDATASYNC,
-        _pad: [0; 3],
-    };
-    let pending_val = PendingIoValue {
-        enter_ts: unsafe { bpf_ktime_get_ns() },
-        request_bytes: 0,
-    };
-    let _ = PENDING_IO.insert(&pending_key, &pending_val, 0);
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallFdatasyncEnter),
+            fd,
+            count: 0,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
 
     Ok(0)
 }
@@ -1194,30 +1098,15 @@ fn try_sys_exit_fdatasync(ctx: &TracePointContext) -> Result<u32, i64> {
 
     let ret: i64 = unsafe { ctx.read_at(16)? };
 
-    let pending_key = PendingIoKey {
-        pid: ctx.pid(),
-        io_type: IO_TYPE_FDATASYNC,
-        _pad: [0; 3],
-    };
-    if let Some(pending) = unsafe { PENDING_IO.get(&pending_key) } {
-        let exit_ts = unsafe { bpf_ktime_get_ns() };
-        let latency_ns = exit_ts.saturating_sub(pending.enter_ts);
-        if let Some(mut buf) = EVENTS.reserve::<IoCompleteEvent>(0) {
-            let event = IoCompleteEvent {
-                header: make_header_without_stack(ctx, EventType::IoComplete),
-                io_type: IO_TYPE_FDATASYNC,
-                _pad: [0; 3],
-                fd: 0,
-                request_bytes: 0,
-                actual_bytes: ret,
-                latency_ns,
-            };
-            unsafe {
-                (*buf.as_mut_ptr()) = event;
-            }
-            buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallFdatasyncExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
         }
-        let _ = PENDING_IO.remove(&pending_key);
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
     }
 
     Ok(0)

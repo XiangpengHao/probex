@@ -57,16 +57,36 @@ pub fn IoStatisticsCard(data: IoStatsCardData) -> Element {
             // Per-operation stats table
             IoSummaryTable { operations: stats.by_operation.clone() }
 
-            // Latency histograms (one per operation)
-            for op in stats.by_operation.iter() {
-                if !op.latency_histogram.is_empty() && op.total_ops > 0 {
-                    LatencyHistogram { stats: op.clone() }
+            // Latency histograms (side by side)
+            {
+                let latency_ops: Vec<_> = stats.by_operation.iter()
+                    .filter(|op| !op.latency_histogram.is_empty() && op.total_ops > 0)
+                    .collect();
+                rsx! {
+                    if !latency_ops.is_empty() {
+                        div { class: "grid grid-cols-2 gap-2",
+                            for op in latency_ops.iter() {
+                                LatencyHistogram { stats: (*op).clone() }
+                            }
+                        }
+                    }
                 }
             }
 
-            // Size distribution
-            if !stats.size_histogram.is_empty() {
-                SizeDistribution { buckets: stats.size_histogram.clone() }
+            // Size distributions (side by side)
+            {
+                let size_ops: Vec<_> = stats.by_operation.iter()
+                    .filter(|op| !op.size_histogram.is_empty() && op.total_bytes > 0)
+                    .collect();
+                rsx! {
+                    if !size_ops.is_empty() {
+                        div { class: "grid grid-cols-2 gap-2",
+                            for op in size_ops.iter() {
+                                SizeDistribution { operation: op.operation.clone(), buckets: op.size_histogram.clone() }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -136,12 +156,12 @@ fn LatencyHistogram(stats: IoTypeStats) -> Element {
 }
 
 #[component]
-fn SizeDistribution(buckets: Vec<SizeBucket>) -> Element {
+fn SizeDistribution(operation: String, buckets: Vec<SizeBucket>) -> Element {
     let max_count = buckets.iter().map(|b| b.count).max().unwrap_or(1).max(1);
 
     rsx! {
         div { class: "space-y-0.5",
-            div { class: "text-[11px] text-gray-500 font-medium", "Size distribution" }
+            div { class: "text-[11px] text-gray-500 font-medium", "{operation} size" }
             for bucket in buckets.iter() {
                 if bucket.count > 0 {
                     BarRow {

@@ -100,7 +100,10 @@
 //! | syscall_io_uring_enter_exit | syscalls:sys_exit_io_uring_enter | ret |
 //! | syscall_io_uring_register_enter | syscalls:sys_enter_io_uring_register | fd, opcode |
 //! | syscall_io_uring_register_exit | syscalls:sys_exit_io_uring_register | ret |
-//! | io_complete | syscalls:sys_exit_{read,write,fsync,fdatasync} | io_type, request_bytes, actual_bytes, latency_ns |
+//! | syscall_fsync_enter | syscalls:sys_enter_fsync | fd |
+//! | syscall_fsync_exit | syscalls:sys_exit_fsync | ret |
+//! | syscall_fdatasync_enter | syscalls:sys_enter_fdatasync | fd |
+//! | syscall_fdatasync_exit | syscalls:sys_exit_fdatasync | ret |
 //! | cpu_sample | perf_event (cpu clock) | stack sample |
 
 use std::{
@@ -147,11 +150,9 @@ use parquet::{
 use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
-    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent,
-    EventHeader, EventType, IO_TYPE_FDATASYNC, IO_TYPE_FSYNC, IO_TYPE_READ, IO_TYPE_WRITE,
-    IoCompleteEvent, MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent, ProcessForkEvent,
-    STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent,
-    SyscallExitEvent,
+    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType,
+    MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH,
+    STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
@@ -237,11 +238,6 @@ struct Event {
     fd: Option<i64>,
     count: Option<u64>,
     ret: Option<i64>,
-    // IoComplete fields
-    io_type: Option<&'static str>,
-    request_bytes: Option<u64>,
-    actual_bytes: Option<i64>,
-    latency_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -282,11 +278,6 @@ fn create_intermediate_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
-        // IoComplete fields (nullable)
-        Field::new("io_type", DataType::Utf8, true),
-        Field::new("request_bytes", DataType::UInt64, true),
-        Field::new("actual_bytes", DataType::Int64, true),
-        Field::new("latency_ns", DataType::UInt64, true),
     ])
 }
 
@@ -323,11 +314,6 @@ fn create_final_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
-        // IoComplete fields (nullable)
-        Field::new("io_type", DataType::Utf8, true),
-        Field::new("request_bytes", DataType::UInt64, true),
-        Field::new("actual_bytes", DataType::Int64, true),
-        Field::new("latency_ns", DataType::UInt64, true),
     ])
 }
 
@@ -407,10 +393,6 @@ impl ParquetBatchWriter {
         let mut fd_builder = Int64Builder::with_capacity(batch_len);
         let mut count_builder = UInt64Builder::with_capacity(batch_len);
         let mut ret_builder = Int64Builder::with_capacity(batch_len);
-        let mut io_type_builder = StringBuilder::with_capacity(batch_len, batch_len * 10);
-        let mut request_bytes_builder = UInt64Builder::with_capacity(batch_len);
-        let mut actual_bytes_builder = Int64Builder::with_capacity(batch_len);
-        let mut latency_ns_builder = UInt64Builder::with_capacity(batch_len);
 
         for event in self.batch.drain(..) {
             event_type_builder.append_value(event.event_type);
@@ -435,10 +417,6 @@ impl ParquetBatchWriter {
             fd_builder.append_option(event.fd);
             count_builder.append_option(event.count);
             ret_builder.append_option(event.ret);
-            io_type_builder.append_option(event.io_type);
-            request_bytes_builder.append_option(event.request_bytes);
-            actual_bytes_builder.append_option(event.actual_bytes);
-            latency_ns_builder.append_option(event.latency_ns);
         }
 
         let columns: Vec<ArrayRef> = vec![
@@ -464,10 +442,6 @@ impl ParquetBatchWriter {
             Arc::new(fd_builder.finish()),
             Arc::new(count_builder.finish()),
             Arc::new(ret_builder.finish()),
-            Arc::new(io_type_builder.finish()),
-            Arc::new(request_bytes_builder.finish()),
-            Arc::new(actual_bytes_builder.finish()),
-            Arc::new(latency_ns_builder.finish()),
         ];
 
         let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
@@ -727,22 +701,36 @@ fn parse_event(data: &[u8]) -> Result<Event> {
             }
             Ok(out)
         }
-        EventType::IoComplete => {
-            let event = read_unaligned_from_bytes::<IoCompleteEvent>(data)
-                .ok_or_else(|| anyhow!("payload too short for IoCompleteEvent"))?;
-            let io_type_str = match event.io_type {
-                IO_TYPE_READ => "read",
-                IO_TYPE_WRITE => "write",
-                IO_TYPE_FSYNC => "fsync",
-                IO_TYPE_FDATASYNC => "fdatasync",
-                _ => "unknown",
-            };
+        EventType::SyscallFsyncEnter => {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
             Ok(Event {
-                io_type: Some(io_type_str),
-                request_bytes: Some(event.request_bytes),
-                actual_bytes: Some(event.actual_bytes),
-                latency_ns: Some(event.latency_ns),
-                ..event_base("io_complete", event.header)
+                fd: Some(event.fd),
+                ..event_base("syscall_fsync_enter", event.header)
+            })
+        }
+        EventType::SyscallFsyncExit => {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
+                ret: Some(event.ret),
+                ..event_base("syscall_fsync_exit", event.header)
+            })
+        }
+        EventType::SyscallFdatasyncEnter => {
+            let event = read_unaligned_from_bytes::<SyscallEnterEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallEnterEvent"))?;
+            Ok(Event {
+                fd: Some(event.fd),
+                ..event_base("syscall_fdatasync_enter", event.header)
+            })
+        }
+        EventType::SyscallFdatasyncExit => {
+            let event = read_unaligned_from_bytes::<SyscallExitEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for SyscallExitEvent"))?;
+            Ok(Event {
+                ret: Some(event.ret),
+                ..event_base("syscall_fdatasync_exit", event.header)
             })
         }
     }

@@ -1117,40 +1117,114 @@ mod backend {
         }
         let ctx = get_ctx()?;
 
-        let pid_filter = pid
-            .map(|p| format!("AND pid = {}", p))
-            .unwrap_or_default();
+        let mut conditions = vec![
+            format!("ts_ns >= {start_ns}"),
+            format!("ts_ns <= {end_ns}"),
+        ];
+        if let Some(pid) = pid {
+            conditions.push(format!("pid = {pid}"));
+        }
 
         let sql = format!(
-            "SELECT io_type, latency_ns, request_bytes, actual_bytes
+            "SELECT pid, ts_ns, event_type, count, ret
              FROM events
-             WHERE event_type = 'io_complete'
-               AND ts_ns >= {start_ns}
-               AND ts_ns <= {end_ns}
-               {pid_filter}"
+             WHERE {}
+               AND event_type IN (
+                 'syscall_read_enter', 'syscall_read_exit',
+                 'syscall_write_enter', 'syscall_write_exit',
+                 'syscall_fsync_enter', 'syscall_fsync_exit',
+                 'syscall_fdatasync_enter', 'syscall_fdatasync_exit'
+               )
+             ORDER BY pid, ts_ns",
+            conditions.join(" AND ")
         );
 
         let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
 
-        // Collect (latency, actual_bytes) per io_type, plus all sizes for the combined histogram
-        let mut ops_data: std::collections::HashMap<String, Vec<(u64, u64)>> =
+        // Per-pid queues for enter events: (ts_ns, request_bytes)
+        let mut pending_read: std::collections::HashMap<u32, std::collections::VecDeque<(u64, u64)>> =
             std::collections::HashMap::new();
-        let mut all_sizes: Vec<u64> = Vec::new();
-        let mut total_ops: u64 = 0;
-        let mut total_bytes: u64 = 0;
+        let mut pending_write: std::collections::HashMap<u32, std::collections::VecDeque<(u64, u64)>> =
+            std::collections::HashMap::new();
+        let mut pending_fsync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
+        let mut pending_fdatasync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
+
+        // Collected (latency_ns, actual_bytes) per operation
+        let mut ops_data: std::collections::HashMap<&str, Vec<(u64, u64)>> =
+            std::collections::HashMap::new();
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let io_type = extract_option_string(batch, "io_type", row)?
-                    .unwrap_or_else(|| "unknown".to_string());
-                let latency = extract_option_u64(batch, "latency_ns", row)?.unwrap_or(0);
-                let actual = extract_option_u64(batch, "actual_bytes", row)?.unwrap_or(0);
+                let pid = extract_u32(batch, "pid", row)?;
+                let ts = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
 
-                ops_data
-                    .entry(io_type)
-                    .or_default()
-                    .push((latency, actual));
+                match event_type.as_str() {
+                    "syscall_read_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        pending_read.entry(pid).or_default().push_back((ts, count));
+                    }
+                    "syscall_read_exit" => {
+                        if let Some(queue) = pending_read.get_mut(&pid)
+                            && let Some((enter_ts, request_bytes)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            let actual_bytes = ret.max(0) as u64;
+                            ops_data.entry("read").or_default().push((ts - enter_ts, actual_bytes));
+                            let _ = request_bytes;
+                        }
+                    }
+                    "syscall_write_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        pending_write.entry(pid).or_default().push_back((ts, count));
+                    }
+                    "syscall_write_exit" => {
+                        if let Some(queue) = pending_write.get_mut(&pid)
+                            && let Some((enter_ts, request_bytes)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            let actual_bytes = ret.max(0) as u64;
+                            ops_data.entry("write").or_default().push((ts - enter_ts, actual_bytes));
+                            let _ = request_bytes;
+                        }
+                    }
+                    "syscall_fsync_enter" => {
+                        pending_fsync.entry(pid).or_default().push_back(ts);
+                    }
+                    "syscall_fsync_exit" => {
+                        if let Some(queue) = pending_fsync.get_mut(&pid)
+                            && let Some(enter_ts) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            ops_data.entry("fsync").or_default().push((ts - enter_ts, 0));
+                        }
+                    }
+                    "syscall_fdatasync_enter" => {
+                        pending_fdatasync.entry(pid).or_default().push_back(ts);
+                    }
+                    "syscall_fdatasync_exit" => {
+                        if let Some(queue) = pending_fdatasync.get_mut(&pid)
+                            && let Some(enter_ts) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            ops_data.entry("fdatasync").or_default().push((ts - enter_ts, 0));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut all_sizes: Vec<u64> = Vec::new();
+        let mut total_ops: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        for data in ops_data.values() {
+            for &(_, actual) in data {
                 all_sizes.push(actual);
                 total_ops += 1;
                 total_bytes = total_bytes.saturating_add(actual);
@@ -1159,7 +1233,7 @@ mod backend {
 
         let mut by_operation: Vec<IoTypeStats> = ops_data
             .into_iter()
-            .map(|(op, data)| compute_io_type_stats(op, data))
+            .map(|(op, data)| compute_io_type_stats(op.to_string(), data))
             .collect();
         by_operation.sort_by(|a, b| b.total_ops.cmp(&a.total_ops));
 
@@ -1205,6 +1279,9 @@ mod backend {
             })
             .collect();
 
+        let sizes: Vec<u64> = data.iter().map(|(_, b)| *b).collect();
+        let size_histogram = compute_size_histogram(&sizes);
+
         IoTypeStats {
             operation,
             total_ops,
@@ -1215,6 +1292,7 @@ mod backend {
             p99_ns,
             max_ns,
             latency_histogram,
+            size_histogram,
         }
     }
 

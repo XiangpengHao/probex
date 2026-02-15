@@ -25,7 +25,10 @@ pub enum EventType {
     SyscallIoUringRegisterEnter = 18,
     SyscallIoUringRegisterExit = 19,
     CpuSample = 20,
-    IoComplete = 21,
+    SyscallFsyncEnter = 21,
+    SyscallFsyncExit = 22,
+    SyscallFdatasyncEnter = 23,
+    SyscallFdatasyncExit = 24,
 }
 
 impl TryFrom<u8> for EventType {
@@ -54,7 +57,10 @@ impl TryFrom<u8> for EventType {
             18 => Ok(EventType::SyscallIoUringRegisterEnter),
             19 => Ok(EventType::SyscallIoUringRegisterExit),
             20 => Ok(EventType::CpuSample),
-            21 => Ok(EventType::IoComplete),
+            21 => Ok(EventType::SyscallFsyncEnter),
+            22 => Ok(EventType::SyscallFsyncExit),
+            23 => Ok(EventType::SyscallFdatasyncEnter),
+            24 => Ok(EventType::SyscallFdatasyncExit),
             v => Err(v),
         }
     }
@@ -81,12 +87,6 @@ pub const STACK_KIND_NONE: u8 = 0;
 pub const STACK_KIND_USER: u8 = 1;
 pub const STACK_KIND_KERNEL: u8 = 2;
 pub const STACK_KIND_BOTH: u8 = STACK_KIND_USER | STACK_KIND_KERNEL;
-
-/// IO operation type constants for IoCompleteEvent.
-pub const IO_TYPE_READ: u8 = 0;
-pub const IO_TYPE_WRITE: u8 = 1;
-pub const IO_TYPE_FSYNC: u8 = 2;
-pub const IO_TYPE_FDATASYNC: u8 = 3;
 
 /// Maximum number of frame-pointer-derived user frames emitted in each cpu sample event.
 pub const MAX_CPU_SAMPLE_FRAMES: usize = 127;
@@ -167,41 +167,6 @@ pub struct SyscallExitEvent {
     pub ret: i64,
 }
 
-/// Key for the PENDING_IO map tracking in-flight IO syscalls.
-/// Keyed by (pid, io_type) — a thread can only have one pending syscall at a time.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PendingIoKey {
-    pub pid: u32,
-    pub io_type: u8,
-    pub _pad: [u8; 3],
-}
-
-/// Value for the PENDING_IO map: enter timestamp and requested byte count.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct PendingIoValue {
-    pub enter_ts: u64,
-    pub request_bytes: u64,
-}
-
-/// Completed IO operation with in-kernel latency measurement.
-/// Emitted on syscall exit after matching the corresponding enter.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct IoCompleteEvent {
-    pub header: EventHeader,
-    pub io_type: u8,
-    pub _pad: [u8; 3],
-    pub fd: u32,
-    pub request_bytes: u64,
-    pub actual_bytes: i64,
-    pub latency_ns: u64,
-}
-
-/// Maximum number of pending IO operations tracked per CPU.
-pub const MAX_PENDING_IO: u32 = 4096;
-
 // Constants for event sizes
 pub const SCHED_SWITCH_EVENT_SIZE: usize = core::mem::size_of::<SchedSwitchEvent>();
 pub const PROCESS_FORK_EVENT_SIZE: usize = core::mem::size_of::<ProcessForkEvent>();
@@ -209,7 +174,6 @@ pub const PROCESS_EXIT_EVENT_SIZE: usize = core::mem::size_of::<ProcessExitEvent
 pub const PAGE_FAULT_EVENT_SIZE: usize = core::mem::size_of::<PageFaultEvent>();
 pub const SYSCALL_ENTER_EVENT_SIZE: usize = core::mem::size_of::<SyscallEnterEvent>();
 pub const SYSCALL_EXIT_EVENT_SIZE: usize = core::mem::size_of::<SyscallExitEvent>();
-pub const IO_COMPLETE_EVENT_SIZE: usize = core::mem::size_of::<IoCompleteEvent>();
 pub const CPU_SAMPLE_EVENT_SIZE: usize = core::mem::size_of::<CpuSampleEvent>();
 
 // Ring buffer size
@@ -333,6 +297,7 @@ pub mod viewer_api {
         pub p99_ns: u64,
         pub max_ns: u64,
         pub latency_histogram: Vec<LatencyBucket>,
+        pub size_histogram: Vec<SizeBucket>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
