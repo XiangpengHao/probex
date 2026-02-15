@@ -61,7 +61,7 @@ pub fn EventListCard(
     }
 
     let current_page = page();
-    let total_pages = (data.total_in_range + PAGE_SIZE - 1) / PAGE_SIZE;
+    let total_pages = data.total_in_range.div_ceil(PAGE_SIZE);
     let expanded = expanded_idx();
 
     rsx! {

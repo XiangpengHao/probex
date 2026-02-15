@@ -10,10 +10,10 @@ use crate::api::EventMarker;
 static EMPTY_EVENTS_MAP: LazyLock<HashMap<u32, Vec<EventMarker>>> = LazyLock::new(HashMap::new);
 static EMPTY_CPU_COUNTS_MAP: LazyLock<HashMap<u32, Vec<u16>>> = LazyLock::new(HashMap::new);
 
+use super::event_list::EventListCard;
 use super::flamegraph::{
     EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
 };
-use super::event_list::EventListCard;
 use super::io_statistics::{IoStatisticsCard, IoStatsCardData};
 use crate::api::{
     EventFlamegraphResponse, HistogramResponse, IoStatistics, ProcessEventsResponse,
@@ -30,6 +30,16 @@ pub enum AnalysisTab {
     Flamegraph,
     IoStatistics,
     Events,
+}
+
+impl AnalysisTab {
+    fn class(self, active: AnalysisTab) -> &'static str {
+        if self == active {
+            "px-2 py-0.5 text-xs font-medium text-blue-600 border-b-2 border-blue-600"
+        } else {
+            "px-2 py-0.5 text-xs font-medium text-gray-500 hover:text-gray-700"
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -743,29 +753,17 @@ pub fn ProcessTimeline(
                                     // Tab bar
                                     div { class: "flex items-center gap-0.5 border-b border-gray-200",
                                         button {
-                                            class: if analysis_tab() == AnalysisTab::Flamegraph {
-                                                "px-2 py-0.5 text-xs font-medium text-blue-600 border-b-2 border-blue-600"
-                                            } else {
-                                                "px-2 py-0.5 text-xs font-medium text-gray-500 hover:text-gray-700"
-                                            },
+                                            class: AnalysisTab::Flamegraph.class(analysis_tab()),
                                             onclick: move |_| analysis_tab.set(AnalysisTab::Flamegraph),
                                             "Flamegraph"
                                         }
                                         button {
-                                            class: if analysis_tab() == AnalysisTab::IoStatistics {
-                                                "px-2 py-0.5 text-xs font-medium text-blue-600 border-b-2 border-blue-600"
-                                            } else {
-                                                "px-2 py-0.5 text-xs font-medium text-gray-500 hover:text-gray-700"
-                                            },
+                                            class: AnalysisTab::IoStatistics.class(analysis_tab()),
                                             onclick: move |_| analysis_tab.set(AnalysisTab::IoStatistics),
                                             "IO Statistics"
                                         }
                                         button {
-                                            class: if analysis_tab() == AnalysisTab::Events {
-                                                "px-2 py-0.5 text-xs font-medium text-blue-600 border-b-2 border-blue-600"
-                                            } else {
-                                                "px-2 py-0.5 text-xs font-medium text-gray-500 hover:text-gray-700"
-                                            },
+                                            class: AnalysisTab::Events.class(analysis_tab()),
                                             onclick: move |_| analysis_tab.set(AnalysisTab::Events),
                                             "Events"
                                         }

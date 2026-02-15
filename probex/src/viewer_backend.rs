@@ -1118,10 +1118,7 @@ mod backend {
         }
         let ctx = get_ctx()?;
 
-        let mut conditions = vec![
-            format!("ts_ns >= {start_ns}"),
-            format!("ts_ns <= {end_ns}"),
-        ];
+        let mut conditions = vec![format!("ts_ns >= {start_ns}"), format!("ts_ns <= {end_ns}")];
         if let Some(pid) = pid {
             conditions.push(format!("pid = {pid}"));
         }
@@ -1144,10 +1141,14 @@ mod backend {
         let batches = df.collect().await?;
 
         // Per-pid queues for enter events: (ts_ns, request_bytes)
-        let mut pending_read: std::collections::HashMap<u32, std::collections::VecDeque<(u64, u64)>> =
-            std::collections::HashMap::new();
-        let mut pending_write: std::collections::HashMap<u32, std::collections::VecDeque<(u64, u64)>> =
-            std::collections::HashMap::new();
+        let mut pending_read: std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64)>,
+        > = std::collections::HashMap::new();
+        let mut pending_write: std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64)>,
+        > = std::collections::HashMap::new();
         let mut pending_fsync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
             std::collections::HashMap::new();
         let mut pending_fdatasync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
@@ -1175,7 +1176,10 @@ mod backend {
                         {
                             let ret = extract_i64(batch, "ret", row)?;
                             let actual_bytes = ret.max(0) as u64;
-                            ops_data.entry("read").or_default().push((ts - enter_ts, actual_bytes));
+                            ops_data
+                                .entry("read")
+                                .or_default()
+                                .push((ts - enter_ts, actual_bytes));
                             let _ = request_bytes;
                         }
                     }
@@ -1190,7 +1194,10 @@ mod backend {
                         {
                             let ret = extract_i64(batch, "ret", row)?;
                             let actual_bytes = ret.max(0) as u64;
-                            ops_data.entry("write").or_default().push((ts - enter_ts, actual_bytes));
+                            ops_data
+                                .entry("write")
+                                .or_default()
+                                .push((ts - enter_ts, actual_bytes));
                             let _ = request_bytes;
                         }
                     }
@@ -1202,7 +1209,10 @@ mod backend {
                             && let Some(enter_ts) = queue.pop_front()
                             && ts >= enter_ts
                         {
-                            ops_data.entry("fsync").or_default().push((ts - enter_ts, 0));
+                            ops_data
+                                .entry("fsync")
+                                .or_default()
+                                .push((ts - enter_ts, 0));
                         }
                     }
                     "syscall_fdatasync_enter" => {
@@ -1213,7 +1223,10 @@ mod backend {
                             && let Some(enter_ts) = queue.pop_front()
                             && ts >= enter_ts
                         {
-                            ops_data.entry("fdatasync").or_default().push((ts - enter_ts, 0));
+                            ops_data
+                                .entry("fdatasync")
+                                .or_default()
+                                .push((ts - enter_ts, 0));
                         }
                     }
                     _ => {}
@@ -1236,7 +1249,7 @@ mod backend {
             .into_iter()
             .map(|(op, data)| compute_io_type_stats(op.to_string(), data))
             .collect();
-        by_operation.sort_by(|a, b| b.total_ops.cmp(&a.total_ops));
+        by_operation.sort_by_key(|b| std::cmp::Reverse(b.total_ops));
 
         Ok(IoStatistics {
             by_operation,
@@ -1267,10 +1280,7 @@ mod backend {
         let latency_histogram = latency_bucket_ranges()
             .into_iter()
             .map(|(min, max, label)| {
-                let count = data
-                    .iter()
-                    .filter(|(l, _)| *l >= min && *l < max)
-                    .count() as u64;
+                let count = data.iter().filter(|(l, _)| *l >= min && *l < max).count() as u64;
                 LatencyBucket {
                     min_ns: min,
                     max_ns: max,
