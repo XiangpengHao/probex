@@ -308,4 +308,18 @@ pub mod viewer_api {
         pub total_bytes: u64,
         pub time_range_ns: (u64, u64),
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct EventDetail {
+        pub ts_ns: u64,
+        pub event_type: String,
+        pub pid: u32,
+        pub stack_trace: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct EventListResponse {
+        pub events: Vec<EventDetail>,
+        pub total_in_range: usize,
+    }
 }

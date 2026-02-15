@@ -69,6 +69,15 @@ struct IoStatisticsQuery {
     pid: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EventListQuery {
+    start_ns: u64,
+    end_ns: u64,
+    pid: u32,
+    limit: usize,
+    offset: usize,
+}
+
 pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
     let parquet_path = Path::new(parquet_file)
         .canonicalize()
@@ -105,7 +114,8 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/process_lifetimes", get(get_process_lifetimes))
         .route("/api/process_events", get(get_process_events))
         .route("/api/event_flamegraph", get(get_event_flamegraph))
-        .route("/api/io_statistics", get(get_io_statistics));
+        .route("/api/io_statistics", get(get_io_statistics))
+        .route("/api/event_list", get(get_event_list));
 
     let app = api_router.fallback(get(static_handler));
 
@@ -180,6 +190,19 @@ async fn get_event_flamegraph(Query(query): Query<EventFlamegraphQuery>) -> Resp
 async fn get_io_statistics(Query(query): Query<IoStatisticsQuery>) -> Response {
     into_json_response(
         viewer_backend::query_io_statistics(query.start_ns, query.end_ns, query.pid).await,
+    )
+}
+
+async fn get_event_list(Query(query): Query<EventListQuery>) -> Response {
+    into_json_response(
+        viewer_backend::query_event_list(
+            query.start_ns,
+            query.end_ns,
+            query.pid,
+            query.limit,
+            query.offset,
+        )
+        .await,
     )
 }
 

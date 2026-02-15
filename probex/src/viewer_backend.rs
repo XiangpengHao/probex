@@ -3,9 +3,10 @@
 //! Uses DataFusion to query parquet trace files.
 
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket, HistogramResponse,
-    IoStatistics, IoTypeStats, LatencyBucket, LatencySummary, ProcessEventsResponse,
-    ProcessLifetime, ProcessLifetimesResponse, SizeBucket, SyscallLatencyStats, TraceSummary,
+    EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts,
+    HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencyBucket, LatencySummary,
+    ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SizeBucket,
+    SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
@@ -1444,6 +1445,58 @@ mod backend {
             svg,
         })
     }
+
+    pub async fn query_event_list(
+        start_ns: u64,
+        end_ns: u64,
+        pid: u32,
+        limit: usize,
+        offset: usize,
+    ) -> BackendResult<EventListResponse> {
+        let ctx = get_ctx()?;
+
+        let count_sql = format!(
+            "SELECT COUNT(*) as cnt FROM events WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}"
+        );
+        let count_df = ctx.sql(&count_sql).await?;
+        let count_batches = count_df.collect().await?;
+        let total_in_range = extract_i64(
+            count_batches.first().ok_or_else(|| {
+                IoError::new(ErrorKind::InvalidData, "count query returned no rows")
+            })?,
+            "cnt",
+            0,
+        )? as usize;
+
+        let sql = format!(
+            "SELECT ts_ns, event_type, pid, stack_trace FROM events \
+             WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns} \
+             ORDER BY ts_ns LIMIT {limit} OFFSET {offset}"
+        );
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        let mut events = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let ts_ns = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+                let pid = extract_u32(batch, "pid", row)?;
+                let stack_trace = extract_option_stack_trace_labels(batch, row)?;
+                events.push(EventDetail {
+                    ts_ns,
+                    event_type,
+                    pid,
+                    stack_trace,
+                });
+            }
+        }
+
+        Ok(EventListResponse {
+            events,
+            total_in_range,
+        })
+    }
 }
 
 pub async fn initialize(
@@ -1516,4 +1569,14 @@ pub async fn query_io_statistics(
     pid: Option<u32>,
 ) -> Result<IoStatistics, Box<dyn std::error::Error + Send + Sync>> {
     backend::query_io_statistics(start_ns, end_ns, pid).await
+}
+
+pub async fn query_event_list(
+    start_ns: u64,
+    end_ns: u64,
+    pid: u32,
+    limit: usize,
+    offset: usize,
+) -> Result<EventListResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_event_list(start_ns, end_ns, pid, limit, offset).await
 }

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 
 use crate::api::EventMarker;
 
@@ -12,6 +13,7 @@ static EMPTY_CPU_COUNTS_MAP: LazyLock<HashMap<u32, Vec<u16>>> = LazyLock::new(Ha
 use super::flamegraph::{
     EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
 };
+use super::event_list::EventListCard;
 use super::io_statistics::{IoStatisticsCard, IoStatsCardData};
 use crate::api::{
     EventFlamegraphResponse, HistogramResponse, IoStatistics, ProcessEventsResponse,
@@ -27,6 +29,7 @@ use crate::app::view_model::PidEventSummary;
 pub enum AnalysisTab {
     Flamegraph,
     IoStatistics,
+    Events,
 }
 
 #[derive(Clone, PartialEq)]
@@ -704,19 +707,17 @@ pub fn ProcessTimeline(
                                         onclick: {
                                             let mut process_bar_drag_state = process_bar_drag_state;
                                             let mut process_bar_drag_preview = process_bar_drag_preview;
-                                            move |_| {
+                                            move |evt: MouseEvent| {
                                                 process_bar_drag_state.set(None);
                                                 process_bar_drag_preview.set(None);
-                                                on_select_pid.call(pid);
-                                            }
-                                        },
-                                        ondoubleclick: {
-                                            let mut process_bar_drag_state = process_bar_drag_state;
-                                            let mut process_bar_drag_preview = process_bar_drag_preview;
-                                            move |_| {
-                                                process_bar_drag_state.set(None);
-                                                process_bar_drag_preview.set(None);
-                                                on_focus_process.call((pid, process_start_ns, focus_end_ns));
+                                                if evt.data().trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
+                                                    let detail = evt.data().as_web_event().detail();
+                                                    if detail == 2 {
+                                                        on_focus_process.call((pid, process_start_ns, focus_end_ns));
+                                                    } else if detail == 1 {
+                                                        on_select_pid.call(pid);
+                                                    }
+                                                }
                                             }
                                         },
                                     }
@@ -759,6 +760,15 @@ pub fn ProcessTimeline(
                                             onclick: move |_| analysis_tab.set(AnalysisTab::IoStatistics),
                                             "IO Statistics"
                                         }
+                                        button {
+                                            class: if analysis_tab() == AnalysisTab::Events {
+                                                "px-2 py-0.5 text-xs font-medium text-blue-600 border-b-2 border-blue-600"
+                                            } else {
+                                                "px-2 py-0.5 text-xs font-medium text-gray-500 hover:text-gray-700"
+                                            },
+                                            onclick: move |_| analysis_tab.set(AnalysisTab::Events),
+                                            "Events"
+                                        }
                                     }
 
                                     // Tab content
@@ -790,6 +800,14 @@ pub fn ProcessTimeline(
                                                     stats: io_statistics_for_row,
                                                     loading: io_statistics_loading_for_row,
                                                 },
+                                            }
+                                        },
+                                        AnalysisTab::Events => rsx! {
+                                            EventListCard {
+                                                pid: proc.pid,
+                                                view_start_ns: range.view_start_ns,
+                                                view_end_ns: range.view_end_ns,
+                                                full_start_ns: range.full_start_ns,
                                             }
                                         },
                                     }

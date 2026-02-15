@@ -1,7 +1,7 @@
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse, IoStatistics,
-    IoTypeStats, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SizeBucket,
-    SyscallLatencyStats, TraceSummary,
+    EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts,
+    HistogramResponse, IoStatistics, IoTypeStats, ProcessEventsResponse, ProcessLifetime,
+    ProcessLifetimesResponse, SizeBucket, SyscallLatencyStats, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
@@ -146,6 +146,26 @@ pub async fn get_event_flamegraph(
         query.push(("pid", pid.to_string()));
     }
     get_json("/api/event_flamegraph", &query).await
+}
+
+pub async fn get_event_list(
+    start_ns: u64,
+    end_ns: u64,
+    pid: u32,
+    limit: usize,
+    offset: usize,
+) -> ApiResult<EventListResponse> {
+    get_json(
+        "/api/event_list",
+        &[
+            ("start_ns", start_ns.to_string()),
+            ("end_ns", end_ns.to_string()),
+            ("pid", pid.to_string()),
+            ("limit", limit.to_string()),
+            ("offset", offset.to_string()),
+        ],
+    )
+    .await
 }
 
 pub async fn get_io_statistics(
