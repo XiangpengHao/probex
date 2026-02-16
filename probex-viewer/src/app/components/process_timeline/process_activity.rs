@@ -47,7 +47,7 @@ pub(super) fn ProcessActivityCanvas(
             if let Some(area_path) = usage_area_path {
                 path {
                     d: "{area_path}",
-                    fill: "rgba(30, 64, 175, 0.18)",
+                    fill: "rgba(107, 114, 128, 0.12)",
                     stroke: "none",
                 }
             }
@@ -56,8 +56,8 @@ pub(super) fn ProcessActivityCanvas(
                 path {
                     d: "{line_path}",
                     fill: "none",
-                    stroke: "rgba(30, 64, 175, 0.7)",
-                    stroke_width: "0.9",
+                    stroke: "rgba(107, 114, 128, 0.35)",
+                    stroke_width: "0.8",
                     vector_effect: "non-scaling-stroke",
                 }
             }

@@ -1084,8 +1084,9 @@ mod backend {
         let mut opts = flamegraph::Options::default();
         opts.title = format!("probex · {event_type}");
         opts.count_name = "samples".to_string();
-        opts.colors = flamegraph::Palette::Basic(flamegraph::color::BasicPalette::Aqua);
-        opts.bgcolors = Some(flamegraph::color::BackgroundColor::Blue);
+        // Use Mem palette (green/blue/grey tones) as a substitute for greyish
+        opts.colors = flamegraph::Palette::Multi(flamegraph::color::MultiPalette::Rust);
+        opts.bgcolors = None;
         opts.hash = true;
         opts.deterministic = true;
 
@@ -1211,10 +1212,7 @@ mod backend {
                     }
                     "syscall_fsync_enter" => {
                         let stack = extract_option_stack_trace_labels(batch, row)?;
-                        pending_fsync
-                            .entry(pid)
-                            .or_default()
-                            .push_back((ts, stack));
+                        pending_fsync.entry(pid).or_default().push_back((ts, stack));
                     }
                     "syscall_fsync_exit" => {
                         if let Some(queue) = pending_fsync.get_mut(&pid)
@@ -1357,8 +1355,6 @@ mod backend {
             sizes_bytes,
         }
     }
-
-
 
     pub async fn query_memory_statistics(
         start_ns: u64,

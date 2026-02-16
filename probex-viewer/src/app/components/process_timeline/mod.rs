@@ -592,7 +592,7 @@ pub fn ProcessTimeline(
                     }
                 }
 
-                div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
+                div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto bg-gray-50/50 p-2 rounded" } else { "space-y-0.5 bg-gray-50/50 p-2 rounded" },
                 {tree.visible_process_rows.iter().map(|(proc, tree_pos)| {
                     let depth = tree_pos.ancestor_is_last.len();
 
@@ -617,10 +617,10 @@ pub fn ProcessTimeline(
                         0.0
                     };
 
-                    let bar_color = match proc.exit {
-                        Some(0) => "bg-emerald-50",
-                        Some(_) => "bg-rose-50",
-                        None => "bg-slate-100",
+                    let bar_class = match proc.exit {
+                        Some(0) => "bg-gray-50 border border-gray-200",
+                        Some(_) => "bg-rose-50 border border-rose-200",
+                        None => "bg-gray-50 border border-gray-200",
                     };
 
                     let has_children = tree_pos.has_children;
@@ -870,7 +870,7 @@ pub fn ProcessTimeline(
                                     },
                                     if in_view {
                                         div {
-                                            class: "absolute top-0 bottom-0 {bar_color} rounded",
+                                            class: "absolute top-0 bottom-0 {bar_class} rounded overflow-hidden",
                                             style: "left: {left_pct}%; width: {width_pct}%;",
                                         }
                                     }
