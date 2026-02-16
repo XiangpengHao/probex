@@ -32,16 +32,21 @@ use super::flamegraph::{
 use super::io_statistics::{IoMemoryCard, IoMemoryCardData};
 use crate::api::{
     EventFlamegraphResponse, HistogramResponse, IoStatistics, MemoryStatistics,
-    ProcessEventsResponse, ProcessLifetime, SyscallLatencyStats, TraceSummary,
+    ProcessEventsResponse, ProcessLifetime, TraceSummary, get_event_flamegraph,
+    get_event_type_counts, get_io_statistics, get_memory_statistics, get_pid_event_type_counts,
+    get_process_events, get_syscall_latency_stats,
 };
 use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
     get_event_marker_color,
 };
-use crate::app::view_model::PidEventSummary;
+use crate::app::view_model::{
+    ViewRange, build_flame_event_type_options, build_pid_event_summary,
+};
+use crate::app::{MAX_FLAME_STACKS, MAX_PROCESS_MARKERS_PER_PID};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AnalysisTab {
+enum AnalysisTab {
     Flamegraph,
     IoStatistics,
     Events,
@@ -57,73 +62,194 @@ impl AnalysisTab {
     }
 }
 
-#[derive(Clone, PartialEq)]
-pub struct ProcessTimelineData {
-    pub processes: Vec<ProcessLifetime>,
-    pub process_events: Option<ProcessEventsResponse>,
-    pub histogram: Option<HistogramResponse>,
-    pub summary: TraceSummary,
-    pub pid_summary: PidEventSummary,
-    pub latency_stats: Option<SyscallLatencyStats>,
-    pub selected_flame_event_type: String,
-    pub flame_event_type_options: Vec<String>,
-    pub flamegraph: Option<EventFlamegraphResponse>,
-    pub flamegraph_loading: bool,
-    pub io_statistics: Option<IoStatistics>,
-    pub io_statistics_loading: bool,
-    pub memory_statistics: Option<MemoryStatistics>,
-    pub memory_statistics_loading: bool,
-}
-
-#[derive(Clone, PartialEq)]
-pub struct ProcessTimelineSelection {
-    pub enabled_event_types: HashSet<String>,
-    pub selected_pid: Option<u32>,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct ProcessTimelineRange {
+pub(super) struct ProcessTimelineRange {
     pub full_start_ns: u64,
     pub full_end_ns: u64,
     pub view_start_ns: u64,
     pub view_end_ns: u64,
 }
 
-#[derive(Clone, PartialEq)]
-pub struct ProcessTimelineActions {
-    pub on_select_pid: EventHandler<u32>,
-    pub on_select_pid_option: EventHandler<Option<u32>>,
-    pub on_focus_process: EventHandler<(u32, u64, u64)>,
-    pub on_change_range: EventHandler<(u64, u64)>,
-    pub on_toggle_event_type: EventHandler<String>,
-    pub on_select_flame_event_type: EventHandler<String>,
-}
-
 #[component]
 pub fn ProcessTimeline(
-    data: ProcessTimelineData,
-    selection: ProcessTimelineSelection,
-    range: ProcessTimelineRange,
-    actions: ProcessTimelineActions,
+    summary: TraceSummary,
+    processes: Vec<ProcessLifetime>,
+    histogram: Option<HistogramResponse>,
+    view_range: Signal<Option<ViewRange>>,
+    selected_pid: Signal<Option<u32>>,
 ) -> Element {
+    // ── Local UI signals ─────────────────────────────────────────────────────
     let mut collapsed_nodes = use_signal(HashSet::<u32>::new);
     let process_bar_drag_state = use_signal(|| Option::<ProcessBarDragState>::None);
     let process_bar_drag_preview = use_signal(|| Option::<ProcessBarDragPreview>::None);
     let process_bar_width_px = use_signal(|| 0.0f64);
-    // Hover time for cross-hair line between timeline overview and process bars
     let mut hover_time_ns = use_signal(|| Option::<u64>::None);
     let mut analysis_tab = use_signal(|| AnalysisTab::Flamegraph);
     let mut stats_expanded = use_signal(|| false);
 
+    // ── Localized filter/selection signals ────────────────────────────────────
+    let mut enabled_event_types = use_signal(HashSet::<String>::new);
+    let mut selected_flame_event_type = use_signal(|| "cpu_sample".to_string());
+
+    // Initialize enabled_event_types from summary on first render.
+    let summary_for_init = summary.clone();
+    use_hook(move || {
+        let mut default_event_types: HashSet<String> =
+            summary_for_init.event_types.iter().cloned().collect();
+        if default_event_types.len() > 1 {
+            default_event_types.remove("cpu_sample");
+        }
+        enabled_event_types.set(default_event_types);
+    });
+
+    // ── Owned resources ──────────────────────────────────────────────────────
+
+    let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+        match get_process_events(range.start_ns, range.end_ns, MAX_PROCESS_MARKERS_PER_PID).await {
+            Ok(events) => process_events.set(Some(events)),
+            Err(e) => log::error!("Process events error: {}", e),
+        }
+    });
+
+    let mut selected_pid_event_counts = use_signal(|| None);
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+        if let Some(pid) = selected_pid() {
+            match get_pid_event_type_counts(pid, Some(range.start_ns), Some(range.end_ns)).await {
+                Ok(counts) => selected_pid_event_counts.set(Some(counts)),
+                Err(e) => log::error!("Selected PID event counts error: {}", e),
+            }
+        } else {
+            match get_event_type_counts(Some(range.start_ns), Some(range.end_ns)).await {
+                Ok(counts) => selected_pid_event_counts.set(Some(counts)),
+                Err(e) => log::error!("Event counts error: {}", e),
+            }
+        }
+    });
+
+    let mut syscall_latency_stats = use_signal(|| None);
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+        match get_syscall_latency_stats(range.start_ns, range.end_ns, selected_pid()).await {
+            Ok(stats) => syscall_latency_stats.set(Some(stats)),
+            Err(e) => log::error!("Syscall latency stats error: {}", e),
+        }
+    });
+
+    let mut event_flamegraph = use_signal(|| Option::<EventFlamegraphResponse>::None);
+    let mut flamegraph_loading = use_signal(|| false);
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+        let pid = selected_pid();
+        let event_type = selected_flame_event_type();
+
+        if let Some(pid) = pid {
+            if !event_type.is_empty() {
+                flamegraph_loading.set(true);
+                match get_event_flamegraph(
+                    range.start_ns,
+                    range.end_ns,
+                    Some(pid),
+                    event_type,
+                    MAX_FLAME_STACKS,
+                )
+                .await
+                {
+                    Ok(data) => event_flamegraph.set(Some(data)),
+                    Err(e) => log::error!("Event flamegraph error: {}", e),
+                }
+                flamegraph_loading.set(false);
+            } else {
+                flamegraph_loading.set(false);
+                event_flamegraph.set(None);
+            }
+        } else {
+            flamegraph_loading.set(false);
+            event_flamegraph.set(None);
+        }
+    });
+
+    let mut io_statistics = use_signal(|| Option::<IoStatistics>::None);
+    let mut io_statistics_loading = use_signal(|| false);
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+        io_statistics_loading.set(true);
+        match get_io_statistics(range.start_ns, range.end_ns, selected_pid()).await {
+            Ok(stats) => io_statistics.set(Some(stats)),
+            Err(e) => {
+                log::error!("IO statistics error: {}", e);
+                io_statistics.set(None);
+            }
+        }
+        io_statistics_loading.set(false);
+    });
+
+    let mut memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
+    let mut memory_statistics_loading = use_signal(|| false);
+    use_resource(move || async move {
+        let Some(range) = view_range() else {
+            return;
+        };
+        memory_statistics_loading.set(true);
+        match get_memory_statistics(range.start_ns, range.end_ns, selected_pid()).await {
+            Ok(stats) => memory_statistics.set(Some(stats)),
+            Err(e) => {
+                log::error!("Memory statistics error: {}", e);
+                memory_statistics.set(None);
+            }
+        }
+        memory_statistics_loading.set(false);
+    });
+
+    // ── Derived state ────────────────────────────────────────────────────────
+    let selected_pid_counts = selected_pid_event_counts();
+    let pid_summary = build_pid_event_summary(selected_pid_counts.as_ref());
+    let selected_pid_value = selected_pid();
+    let selected_flame_event_type_value = selected_flame_event_type();
+
+    let flame_event_type_options = build_flame_event_type_options(
+        Some(&summary),
+        selected_pid_value,
+        &pid_summary,
+        if selected_flame_event_type_value.is_empty() {
+            None
+        } else {
+            Some(selected_flame_event_type_value.as_str())
+        },
+    );
+
+    // ── Range values ─────────────────────────────────────────────────────────
+    let Some(vr) = view_range() else {
+        return rsx! {};
+    };
+    let range = ProcessTimelineRange {
+        full_start_ns: summary.min_ts_ns,
+        full_end_ns: summary.max_ts_ns,
+        view_start_ns: vr.start_ns,
+        view_end_ns: vr.end_ns,
+    };
+
     let full_duration_ns = range.full_end_ns.saturating_sub(range.full_start_ns);
     let full_duration = full_duration_ns as f64;
     let view_duration_ns = range.view_end_ns.saturating_sub(range.view_start_ns);
-    if full_duration == 0.0 || data.processes.is_empty() {
+    if full_duration == 0.0 || processes.is_empty() {
         return rsx! {};
     }
 
     let collapsed_set = collapsed_nodes();
-    let tree = build_process_tree(&data.processes, &collapsed_set, range);
+    let tree = build_process_tree(&processes, &collapsed_set, range);
     if tree.visible_process_rows.is_empty() {
         return rsx! {};
     }
@@ -138,9 +264,9 @@ pub fn ProcessTimeline(
         .iter()
         .all(|pid| collapsed_set.contains(pid));
 
-    // Extract process events data - use references where possible
-    let (events_map, cpu_sample_counts_map, cpu_sample_bucket_count) = data
-        .process_events
+    // Extract process events data
+    let pe_data = process_events();
+    let (events_map, cpu_sample_counts_map, cpu_sample_bucket_count) = pe_data
         .as_ref()
         .map(|pe| {
             (
@@ -150,26 +276,38 @@ pub fn ProcessTimeline(
             )
         })
         .unwrap_or((&EMPTY_EVENTS_MAP, &EMPTY_CPU_COUNTS_MAP, 0));
-    let sample_frequency_hz = data.summary.cpu_sample_frequency_hz;
-    let stats = data.latency_stats.clone().unwrap_or_default();
+    let sample_frequency_hz = summary.cpu_sample_frequency_hz;
+    let stats = syscall_latency_stats().unwrap_or_default();
     let has_read_stats = stats.read.count > 0;
     let has_write_stats = stats.write.count > 0;
     let has_io_uring_stats = stats.io_uring.count > 0;
     let has_mem_stats = stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0;
     let active_process_bar_drag_preview = process_bar_drag_preview();
-    let on_select_pid = actions.on_select_pid;
-    let on_select_pid_option = actions.on_select_pid_option;
-    let on_focus_process = actions.on_focus_process;
-    let on_change_range = actions.on_change_range;
-    let on_toggle_event_type = actions.on_toggle_event_type;
-    let on_select_flame_event_type = actions.on_select_flame_event_type;
+
+    // ── Local action closures ────────────────────────────────────────────────
+    let mut set_view_range = move |start: u64, end: u64| {
+        if let Some(next) = ViewRange::new(start, end) {
+            if view_range() != Some(next) {
+                view_range.set(Some(next));
+            }
+        }
+    };
+
+    let mut toggle_pid = move |pid: u32| {
+        let next = if selected_pid() == Some(pid) {
+            None
+        } else {
+            Some(pid)
+        };
+        selected_pid.set(next);
+    };
 
     rsx! {
             div { class: "mb-1.5",
                 TimelineOverview {
                     data: TimelineOverviewData {
-                        histogram: data.histogram.clone(),
-                        enabled_types: selection.enabled_event_types.clone(),
+                        histogram: histogram.clone(),
+                        enabled_types: enabled_event_types(),
                     },
                     range: TimelineOverviewRange {
                         full_start_ns: range.full_start_ns,
@@ -177,7 +315,9 @@ pub fn ProcessTimeline(
                         view_start_ns: range.view_start_ns,
                         view_end_ns: range.view_end_ns,
                     },
-                    on_change_range,
+                    on_change_range: EventHandler::new(move |(start, end)| {
+                        set_view_range(start, end);
+                    }),
                     on_hover_time: EventHandler::new(move |time: Option<u64>| {
                         hover_time_ns.set(time);
                     }),
@@ -191,20 +331,20 @@ pub fn ProcessTimeline(
                     span { class: "text-xs text-gray-500", "PID" }
                     select {
                         class: "px-1.5 py-0.5 border border-gray-200 rounded text-xs bg-white min-w-[70px]",
-                        value: selection.selected_pid.map(|p| p.to_string()).unwrap_or_default(),
+                        value: selected_pid_value.map(|p| p.to_string()).unwrap_or_default(),
                         onchange: move |evt| {
-                            on_select_pid_option.call(evt.value().parse::<u32>().ok());
+                            selected_pid.set(evt.value().parse::<u32>().ok());
                         },
                         option { value: "", "All" }
-                        {data.summary.unique_pids.iter().map(|pid| rsx! {
+                        {summary.unique_pids.iter().map(|pid| rsx! {
                             option { key: "{pid}", value: "{pid}", "{pid}" }
                         })}
                     }
                     {
-                        let ev_count = if selection.selected_pid.is_some() {
-                            data.pid_summary.total
+                        let ev_count = if selected_pid_value.is_some() {
+                            pid_summary.total
                         } else {
-                            data.summary.total_events
+                            summary.total_events
                         };
                         rsx! { span { class: "text-xs text-gray-400", "{ev_count} ev" } }
                     }
@@ -265,7 +405,7 @@ pub fn ProcessTimeline(
                                 shift_ns,
                                 true,
                             );
-                            on_change_range.call((new_start, new_end));
+                            set_view_range(new_start, new_end);
                         },
                         "\u{25C0}"
                     }
@@ -282,7 +422,7 @@ pub fn ProcessTimeline(
                                 shift_ns,
                                 false,
                             );
-                            on_change_range.call((new_start, new_end));
+                            set_view_range(new_start, new_end);
                         },
                         "\u{25B6}"
                     }
@@ -298,7 +438,7 @@ pub fn ProcessTimeline(
                                 range.view_end_ns,
                                 new_duration_ns,
                             );
-                            on_change_range.call((new_start, new_end));
+                            set_view_range(new_start, new_end);
                         },
                         "+"
                     }
@@ -314,14 +454,14 @@ pub fn ProcessTimeline(
                                 range.view_end_ns,
                                 new_duration_ns,
                             );
-                            on_change_range.call((new_start, new_end));
+                            set_view_range(new_start, new_end);
                         },
                         "\u{2212}"
                     }
                     button {
                         class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded",
                         onclick: move |_| {
-                            on_change_range.call((range.full_start_ns, range.full_end_ns))
+                            set_view_range(range.full_start_ns, range.full_end_ns);
                         },
                         "Reset"
                     }
@@ -330,9 +470,9 @@ pub fn ProcessTimeline(
 
             // Event type badges row (always rendered to avoid layout flicker)
             div { class: "flex flex-wrap items-center gap-1 mb-1.5 min-h-[1.5rem]",
-                if !data.pid_summary.breakdown.is_empty() {
-                    {data.pid_summary.breakdown.iter().map(|(event_type, count)| {
-                        let enabled = selection.enabled_event_types.contains(event_type);
+                if !pid_summary.breakdown.is_empty() {
+                    {pid_summary.breakdown.iter().map(|(event_type, count)| {
+                        let enabled = enabled_event_types().contains(event_type);
                         let event_type_clone = event_type.clone();
                         let badge_class = event_badge_class(enabled, event_type);
                         rsx! {
@@ -340,7 +480,14 @@ pub fn ProcessTimeline(
                                 key: "{event_type}",
                                 class: badge_class,
                                 onclick: move |_| {
-                                    on_toggle_event_type.call(event_type_clone.clone());
+                                    let mut types = enabled_event_types();
+                                    let et = event_type_clone.clone();
+                                    if types.contains(&et) {
+                                        types.remove(&et);
+                                    } else {
+                                        types.insert(et);
+                                    }
+                                    enabled_event_types.set(types);
                                 },
                                 "{event_type}"
                                 span { class: if enabled { "opacity-70" } else { "text-gray-400" }, " {count}" }
@@ -407,8 +554,8 @@ pub fn ProcessTimeline(
                 div { class: "mb-1.5",
                     IoMemoryCard {
                         data: IoMemoryCardData {
-                            io_stats: data.io_statistics.clone(),
-                            mem_stats: data.memory_statistics.clone(),
+                            io_stats: io_statistics(),
+                            mem_stats: memory_statistics(),
                         },
                     }
                 }
@@ -489,7 +636,7 @@ pub fn ProcessTimeline(
                     let collapsed_count = tree_pos.descendant_count;
                     let pid = proc.pid;
                     let process_name = proc.process_name.as_deref().unwrap_or("unknown");
-                    let is_selected = selection.selected_pid == Some(proc.pid);
+                    let is_selected = selected_pid_value == Some(proc.pid);
                     let row_class = if is_selected {
                         "flex items-center gap-2 h-7 group bg-blue-50 border border-blue-200 rounded"
                     } else {
@@ -510,7 +657,7 @@ pub fn ProcessTimeline(
                             events
                                 .iter()
                                 .filter(|e| {
-                                    selection.enabled_event_types.contains(&e.event_type)
+                                    enabled_event_types().contains(&e.event_type)
                                         && e.ts_ns >= range.view_start_ns
                                         && e.ts_ns <= range.view_end_ns
                                 })
@@ -564,12 +711,12 @@ pub fn ProcessTimeline(
                     // Build tree line prefixes
                     let tree_pos_clone = tree_pos.clone();
                     let row_is_selected = is_selected;
-                    let flame_event_type_options_for_row = data.flame_event_type_options.clone();
-                    let selected_flame_event_type_for_row = data.selected_flame_event_type.clone();
-                    let flamegraph_for_row = data.flamegraph.clone();
-                    let flamegraph_loading_for_row = data.flamegraph_loading;
-                    let io_statistics_for_row = data.io_statistics.clone();
-                    let memory_statistics_for_row = data.memory_statistics.clone();
+                    let flame_event_type_options_for_row = flame_event_type_options.clone();
+                    let selected_flame_event_type_for_row = selected_flame_event_type_value.clone();
+                    let flamegraph_for_row = event_flamegraph();
+                    let flamegraph_loading_for_row = flamegraph_loading();
+                    let io_statistics_for_row = io_statistics();
+                    let memory_statistics_for_row = memory_statistics();
 
                     rsx! {
                         div {
@@ -629,7 +776,7 @@ pub fn ProcessTimeline(
                                     // Process info
                                     div {
                                         class: process_label_class,
-                                        onclick: move |_| on_select_pid.call(pid),
+                                        onclick: move |_| toggle_pid(pid),
                                         div { class: "flex items-center gap-1",
                                             if is_selected {
                                                 span { class: "inline-block w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0" }
@@ -767,9 +914,10 @@ pub fn ProcessTimeline(
                                                 if evt.data().trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
                                                     let detail = evt.data().as_web_event().detail();
                                                     if detail == 2 {
-                                                        on_focus_process.call((pid, process_start_ns, focus_end_ns));
+                                                        selected_pid.set(Some(pid));
+                                                        set_view_range(process_start_ns, focus_end_ns);
                                                     } else if detail == 1 {
-                                                        on_select_pid.call(pid);
+                                                        toggle_pid(pid);
                                                     }
                                                 }
                                             }
@@ -831,8 +979,8 @@ pub fn ProcessTimeline(
                                                     flamegraph: flamegraph_for_row,
                                                     loading: flamegraph_loading_for_row,
                                                 },
-                                                on_select_event_type: move |event_type| {
-                                                    on_select_flame_event_type.call(event_type);
+                                                on_select_event_type: move |event_type: String| {
+                                                    selected_flame_event_type.set(event_type);
                                                 },
                                             }
                                         },
@@ -850,7 +998,7 @@ pub fn ProcessTimeline(
                                                 view_start_ns: range.view_start_ns,
                                                 view_end_ns: range.view_end_ns,
                                                 full_start_ns: range.full_start_ns,
-                                                event_types: selection.enabled_event_types.iter().cloned().collect::<Vec<String>>(),
+                                                event_types: enabled_event_types().iter().cloned().collect::<Vec<String>>(),
                                             }
                                         },
                                     }
@@ -889,8 +1037,8 @@ pub fn ProcessTimeline(
                         let mut process_bar_drag_preview = process_bar_drag_preview;
                         move |_| {
                             if let Some(preview) = process_bar_drag_preview() {
-                                on_select_pid_option.call(Some(preview.pid));
-                                on_change_range.call((preview.start_ns, preview.end_ns));
+                                selected_pid.set(Some(preview.pid));
+                                set_view_range(preview.start_ns, preview.end_ns);
                             }
                             process_bar_drag_state.set(None);
                             process_bar_drag_preview.set(None);

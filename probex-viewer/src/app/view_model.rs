@@ -60,15 +60,6 @@ pub fn build_pid_event_summary(counts: Option<&EventTypeCounts>) -> PidEventSumm
     }
 }
 
-pub fn next_view_range(
-    current_range: Option<ViewRange>,
-    next_start_ns: u64,
-    next_end_ns: u64,
-) -> Option<ViewRange> {
-    let next_range = ViewRange::new(next_start_ns, next_end_ns)?;
-    (current_range != Some(next_range)).then_some(next_range)
-}
-
 pub fn build_flame_event_type_options(
     summary: Option<&TraceSummary>,
     selected_pid: Option<u32>,

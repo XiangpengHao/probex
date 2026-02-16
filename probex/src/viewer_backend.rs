@@ -1715,6 +1715,7 @@ mod backend {
                 let stack_trace = extract_option_stack_trace_labels(batch, row)?;
                 events.push(EventDetail {
                     ts_ns,
+                    latency_ns: None,
                     event_type,
                     pid,
                     stack_trace,
