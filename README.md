@@ -35,9 +35,7 @@ sudo ./probex -- sleep 1
 ```
 
 ## What it looks like
-![](doc/screenshots/screenshot-0.png)
-![](doc/screenshots/screenshot-1.png)
-
+<video src="doc/screenshots/probex-demo.mp4" controls="controls"></video>
 
 #### Frame pointers
 

@@ -27,7 +27,7 @@ pub struct Args {
     pub view: Option<String>,
 
     /// Perf-style CPU clock sampling frequency (Hz)
-    #[arg(long, value_name = "HZ", default_value_t = 999)]
+    #[arg(long, value_name = "HZ", default_value_t = 1999)]
     pub sample_freq: u64,
 
     /// Command to run
