@@ -565,7 +565,7 @@ fn IoSummaryTable(operations: Vec<IoTypeStats>) -> Element {
                                             let event = event.clone();
                                             let label = format!("P50 for {}", op.operation);
                                             move |_| {
-                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                if selected_event().as_ref().is_some_and(|(l, _)| l == &label) {
                                                     selected_event.set(None);
                                                 } else {
                                                     selected_event.set(Some((label.clone(), event.clone())));
@@ -588,7 +588,7 @@ fn IoSummaryTable(operations: Vec<IoTypeStats>) -> Element {
                                             let event = event.clone();
                                             let label = format!("P95 for {}", op.operation);
                                             move |_| {
-                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                if selected_event().as_ref().is_some_and(|(l, _)| l == &label) {
                                                     selected_event.set(None);
                                                 } else {
                                                     selected_event.set(Some((label.clone(), event.clone())));
@@ -611,7 +611,7 @@ fn IoSummaryTable(operations: Vec<IoTypeStats>) -> Element {
                                             let event = event.clone();
                                             let label = format!("P99 for {}", op.operation);
                                             move |_| {
-                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                if selected_event().as_ref().is_some_and(|(l, _)| l == &label) {
                                                     selected_event.set(None);
                                                 } else {
                                                     selected_event.set(Some((label.clone(), event.clone())));
@@ -634,7 +634,7 @@ fn IoSummaryTable(operations: Vec<IoTypeStats>) -> Element {
                                             let event = event.clone();
                                             let label = format!("Max for {}", op.operation);
                                             move |_| {
-                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                if selected_event().as_ref().is_some_and(|(l, _)| l == &label) {
                                                     selected_event.set(None);
                                                 } else {
                                                     selected_event.set(Some((label.clone(), event.clone())));

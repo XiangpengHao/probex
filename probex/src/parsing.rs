@@ -1,9 +1,10 @@
-use crate::event::{stack_kind_from_header, Event};
+use crate::event::{Event, stack_kind_from_header};
 use crate::stacks::format_stack_frames_hex;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use probex_common::{
-    CpuSampleEvent, EventHeader, EventType, IoUringCompleteEvent, PageFaultEvent, ProcessExitEvent,
-    ProcessForkEvent, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent, MAX_CPU_SAMPLE_FRAMES,
+    CpuSampleEvent, EventHeader, EventType, IoUringCompleteEvent, MAX_CPU_SAMPLE_FRAMES,
+    PageFaultEvent, ProcessExitEvent, ProcessForkEvent, SchedSwitchEvent, SyscallEnterEvent,
+    SyscallExitEvent,
 };
 
 pub fn read_unaligned_from_bytes<T: Copy>(data: &[u8]) -> Option<T> {

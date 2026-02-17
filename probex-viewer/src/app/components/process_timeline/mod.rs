@@ -3,14 +3,14 @@ mod process_tree;
 mod timeline_overview;
 
 use process_activity::{
-    build_cpu_usage_points, build_process_bar_drag_preview, CanvasEventMarker,
-    ProcessActivityCanvas, ProcessBarDragPreview, ProcessBarDragState,
-    PROCESS_BAR_SELECTION_THRESHOLD_PX,
+    CanvasEventMarker, PROCESS_BAR_SELECTION_THRESHOLD_PX, ProcessActivityCanvas,
+    ProcessBarDragPreview, ProcessBarDragState, build_cpu_usage_points,
+    build_process_bar_drag_preview,
 };
 use process_tree::{build_process_tree, event_badge_class};
 use timeline_overview::{
-    shift_window, zoom_window_to_duration, TimelineOverview, TimelineOverviewData,
-    TimelineOverviewRange,
+    TimelineOverview, TimelineOverviewData, TimelineOverviewRange, shift_window,
+    zoom_window_to_duration,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -45,9 +45,7 @@ use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
     get_event_marker_color,
 };
-use crate::app::view_model::{
-    ViewRange, build_flame_event_type_options, build_pid_event_summary,
-};
+use crate::app::view_model::{ViewRange, build_flame_event_type_options, build_pid_event_summary};
 use crate::app::{MAX_FLAME_STACKS, MAX_PROCESS_MARKERS_PER_PID};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,7 +121,10 @@ pub fn ProcessTimeline(
             sleep(std::time::Duration::from_millis(FETCH_DEBOUNCE_MS as u64)).await;
             // After the debounce period, check if values are still current.
             // If another change happened, a newer effect will have been queued.
-            if view_range() == vr && selected_pid() == pid && selected_flame_event_type() == flame_type {
+            if view_range() == vr
+                && selected_pid() == pid
+                && selected_flame_event_type() == flame_type
+            {
                 fetch_range.set(vr);
                 fetch_pid.set(pid);
                 fetch_flame_type.set(flame_type);
@@ -158,7 +159,8 @@ pub fn ProcessTimeline(
         memory_statistics_loading.set(true);
 
         // 1. Process events (always fetched)
-        let events_fut = get_process_events(range.start_ns, range.end_ns, MAX_PROCESS_MARKERS_PER_PID);
+        let events_fut =
+            get_process_events(range.start_ns, range.end_ns, MAX_PROCESS_MARKERS_PER_PID);
 
         // 2. Event type counts (per-pid or global)
         let counts_fut = async {
@@ -174,13 +176,18 @@ pub fn ProcessTimeline(
 
         // 4. Flamegraph (only when a pid + event type are selected)
         let flamegraph_fut = async {
-            if let Some(pid) = pid {
-                if !flame_type.is_empty() {
-                    return get_event_flamegraph(
-                        range.start_ns, range.end_ns,
-                        Some(pid), flame_type, MAX_FLAME_STACKS,
-                    ).await.ok();
-                }
+            if let Some(pid) = pid
+                && !flame_type.is_empty()
+            {
+                return get_event_flamegraph(
+                    range.start_ns,
+                    range.end_ns,
+                    Some(pid),
+                    flame_type,
+                    MAX_FLAME_STACKS,
+                )
+                .await
+                .ok();
             }
             None
         };
@@ -327,10 +334,10 @@ pub fn ProcessTimeline(
 
     // ── Local action closures ────────────────────────────────────────────────
     let mut set_view_range = move |start: u64, end: u64| {
-        if let Some(next) = ViewRange::new(start, end) {
-            if view_range() != Some(next) {
-                view_range.set(Some(next));
-            }
+        if let Some(next) = ViewRange::new(start, end)
+            && view_range() != Some(next)
+        {
+            view_range.set(Some(next));
         }
     };
 

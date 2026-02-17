@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use aya::{
     maps::{MapData, PerCpuArray},
     programs::{
-        perf_event::{perf_sw_ids, PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy},
         TracePoint,
+        perf_event::{PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy, perf_sw_ids},
     },
 };
 use log::debug;

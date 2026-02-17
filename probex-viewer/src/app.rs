@@ -9,8 +9,8 @@ use dioxus::prelude::*;
 use view_model::ViewRange;
 
 use crate::api::{
-    HistogramResponse, ProcessLifetimesResponse, TraceSummary,
-    get_histogram, get_process_lifetimes, get_summary,
+    HistogramResponse, ProcessLifetimesResponse, TraceSummary, get_histogram,
+    get_process_lifetimes, get_summary,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");

@@ -2,20 +2,20 @@
 #![no_main]
 
 use aya_ebpf::{
-    bindings::{bpf_perf_event_data, BPF_F_USER_STACK, BPF_RB_FORCE_WAKEUP},
+    EbpfContext,
+    bindings::{BPF_F_USER_STACK, BPF_RB_FORCE_WAKEUP, bpf_perf_event_data},
     helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_probe_read_user},
     macros::{map, perf_event, tracepoint},
     maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
     programs::{PerfEventContext, TracePointContext},
-    EbpfContext,
 };
 use probex_common::{
-    CpuSampleEvent, EventHeader, EventType, IoUringCompleteEvent, PageFaultEvent, ProcessExitEvent,
-    ProcessForkEvent, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent, CPU_SAMPLE_STATS_LEN,
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STAT_USER_STACK,
-    MAX_CPU_SAMPLE_FRAMES, MAX_IO_URING_INFLIGHT, MAX_TRACKED_PIDS, RING_BUF_SIZE,
-    STACK_KIND_KERNEL, STACK_KIND_NONE, STACK_KIND_USER,
+    CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType, IoUringCompleteEvent,
+    MAX_CPU_SAMPLE_FRAMES, MAX_IO_URING_INFLIGHT, MAX_TRACKED_PIDS, PageFaultEvent,
+    ProcessExitEvent, ProcessForkEvent, RING_BUF_SIZE, STACK_KIND_KERNEL, STACK_KIND_NONE,
+    STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 
 /// Ring buffer for sending events to userspace

@@ -373,11 +373,7 @@ impl ExportUserSymbolizer {
     async fn resolve_batch(&mut self, requests: HashMap<String, Vec<u64>>) {
         for (path, addrs) in requests {
             self.ensure_symbol_map_loaded(&path).await;
-            if let Some(symbol_map) = self
-                .symbol_map_cache
-                .get(&path)
-                .and_then(|m| m.as_ref())
-            {
+            if let Some(symbol_map) = self.symbol_map_cache.get(&path).and_then(|m| m.as_ref()) {
                 // Filter already cached
                 let unresolved: Vec<u64> = addrs
                     .iter()
@@ -395,7 +391,9 @@ impl ExportUserSymbolizer {
             } else {
                 // If failed to load map, cache None
                 for addr in addrs {
-                    self.symbol_cache.entry((path.clone(), addr)).or_insert(None);
+                    self.symbol_cache
+                        .entry((path.clone(), addr))
+                        .or_insert(None);
                 }
             }
         }
@@ -652,13 +650,14 @@ pub async fn symbolize_stack_traces_into_events_parquet(
         let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let chunk_size = (requests.len() + parallelism - 1) / parallelism;
+        let chunk_size = requests.len().div_ceil(parallelism);
         let mut tasks = Vec::with_capacity(parallelism);
 
         for chunk in requests.chunks(chunk_size) {
             // Move chunk and Arc clone to task
-            let chunk_requests: Vec<RowAnalysisRequest> =
-                chunk.iter().map(|r| RowAnalysisRequest {
+            let chunk_requests: Vec<RowAnalysisRequest> = chunk
+                .iter()
+                .map(|r| RowAnalysisRequest {
                     stack_type: match r.stack_type {
                         StackType::User => StackType::User,
                         StackType::Both => StackType::Both,
@@ -668,8 +667,9 @@ pub async fn symbolize_stack_traces_into_events_parquet(
                     tgid: r.tgid,
                     ts_ns: r.ts_ns,
                     current_stack_trace: r.current_stack_trace.clone(),
-                }).collect();
-            
+                })
+                .collect();
+
             let snapshot_index_ref = snapshot_index_arc.clone();
 
             tasks.push(tokio::spawn(async move {
@@ -693,7 +693,11 @@ pub async fn symbolize_stack_traces_into_events_parquet(
                                 let snapshot = if req.tgid == 0 {
                                     None
                                 } else {
-                                    find_inline_segments_for_event(&snapshot_index_ref, req.tgid, req.ts_ns)
+                                    find_inline_segments_for_event(
+                                        &snapshot_index_ref,
+                                        req.tgid,
+                                        req.ts_ns,
+                                    )
                                 };
 
                                 let mut mapped_frames = Vec::with_capacity(frames.len());
@@ -709,7 +713,10 @@ pub async fn symbolize_stack_traces_into_events_parquet(
                                                 path: segment.path.clone(),
                                                 offset,
                                             });
-                                            needed_symbols.entry(segment.path.clone()).or_default().push(offset);
+                                            needed_symbols
+                                                .entry(segment.path.clone())
+                                                .or_default()
+                                                .push(offset);
                                         } else {
                                             mapped_frames.push(MappedFrame::Raw { ip });
                                         }
@@ -754,7 +761,10 @@ pub async fn symbolize_stack_traces_into_events_parquet(
             let (chunk_analyzed, chunk_symbols) = task.await?;
             all_analyzed_rows.extend(chunk_analyzed);
             for (path, offsets) in chunk_symbols {
-                global_needed_symbols.entry(path).or_default().extend(offsets);
+                global_needed_symbols
+                    .entry(path)
+                    .or_default()
+                    .extend(offsets);
             }
         }
 
@@ -764,7 +774,7 @@ pub async fn symbolize_stack_traces_into_events_parquet(
         // 4. Construct Output
         let mut stack_trace_builder = ListBuilder::new(StringViewBuilder::new());
 
-        for (_row_idx, analyzed) in all_analyzed_rows.into_iter().enumerate() {
+        for analyzed in all_analyzed_rows.into_iter() {
             stats.rewritten_rows += 1;
 
             if let Some(fallback) = analyzed.fallback_stack_trace {
@@ -799,12 +809,16 @@ pub async fn symbolize_stack_traces_into_events_parquet(
                                 }
                             } else {
                                 stats.mapped_fallback_frames += 1;
-                                stack_trace_builder.values().append_value(mapped_frame_fallback_label(&path, offset));
+                                stack_trace_builder
+                                    .values()
+                                    .append_value(mapped_frame_fallback_label(&path, offset));
                             }
                         }
                         MappedFrame::Raw { ip } => {
                             stats.raw_fallback_frames += 1;
-                            stack_trace_builder.values().append_value(format!("0x{ip:x}"));
+                            stack_trace_builder
+                                .values()
+                                .append_value(format!("0x{ip:x}"));
                         }
                     }
                 }
@@ -823,11 +837,11 @@ pub async fn symbolize_stack_traces_into_events_parquet(
                         // symbolized_user_rows was inc above, dec it to avoid double counting row types?
                         // Actually logic above is simple counters.
                         if has_user_frames {
-                             stats.symbolized_user_rows -= 1; // It's mixed, not just user
+                            stats.symbolized_user_rows -= 1; // It's mixed, not just user
                         }
                     }
                 }
-                
+
                 stack_trace_builder.append(has_items);
             }
         }

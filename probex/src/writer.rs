@@ -3,8 +3,8 @@ use crate::schema::create_intermediate_schema;
 use anyhow::{Context as _, Result};
 use arrow::{
     array::{
-        ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt32Builder, UInt64Builder,
-        UInt8Builder,
+        ArrayRef, Int32Builder, Int64Builder, StringBuilder, UInt8Builder, UInt32Builder,
+        UInt64Builder,
     },
     datatypes::Schema,
     record_batch::RecordBatch,

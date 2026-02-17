@@ -1130,28 +1130,28 @@ mod backend {
         let batches = df.collect().await?;
 
         // Per-pid queues for enter events: (ts_ns, request_bytes, stack_trace)
-        let mut pending_read: std::collections::HashMap<
+        type PendingRead = std::collections::HashMap<
             u32,
             std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
-        let mut pending_write: std::collections::HashMap<
+        >;
+        type PendingWrite = std::collections::HashMap<
             u32,
             std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
-        let mut pending_fsync: std::collections::HashMap<
-            u32,
-            std::collections::VecDeque<(u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
-        let mut pending_fdatasync: std::collections::HashMap<
-            u32,
-            std::collections::VecDeque<(u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
+        >;
+        type PendingFsync =
+            std::collections::HashMap<u32, std::collections::VecDeque<(u64, Option<Vec<String>>)>>;
+        type PendingFdatasync =
+            std::collections::HashMap<u32, std::collections::VecDeque<(u64, Option<Vec<String>>)>>;
+        type OpsData<'a> =
+            std::collections::HashMap<&'a str, Vec<(u64, u64, u32, u64, Option<Vec<String>>)>>;
+
+        let mut pending_read: PendingRead = std::collections::HashMap::new();
+        let mut pending_write: PendingWrite = std::collections::HashMap::new();
+        let mut pending_fsync: PendingFsync = std::collections::HashMap::new();
+        let mut pending_fdatasync: PendingFdatasync = std::collections::HashMap::new();
 
         // Collected (latency_ns, actual_bytes, pid, end_ts, stack_trace) per operation
-        let mut ops_data: std::collections::HashMap<
-            &str,
-            Vec<(u64, u64, u32, u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
+        let mut ops_data: OpsData = std::collections::HashMap::new();
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
@@ -1297,10 +1297,9 @@ mod backend {
         })
     }
 
-    fn compute_io_type_stats(
-        operation: String,
-        mut data: Vec<(u64, u64, u32, u64, Option<Vec<String>>)>,
-    ) -> IoTypeStats {
+    type BackendIoOpData = Vec<(u64, u64, u32, u64, Option<Vec<String>>)>;
+
+    fn compute_io_type_stats(operation: String, mut data: BackendIoOpData) -> IoTypeStats {
         data.sort_by_key(|(lat, _, _, _, _)| *lat);
 
         let total_ops = data.len() as u64;
@@ -1387,27 +1386,33 @@ mod backend {
         let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
 
+        type PendingMmap = std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
+        >;
+        type PendingMunmap = std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
+        >;
+        type PendingBrk =
+            std::collections::HashMap<u32, std::collections::VecDeque<(u64, Option<Vec<String>>)>>;
+
+        type MemOpsData = Vec<(u64, u64, u32, u64, Option<Vec<String>>)>;
+        type OpsData<'a> =
+            std::collections::HashMap<&'a str, Vec<(u64, u64, u32, u64, Option<Vec<String>>)>>;
+
         // Per-pid pending queues: mmap/munmap store (ts_ns, count, stack), brk stores (ts_ns, stack)
-        let mut pending_mmap: std::collections::HashMap<
-            u32,
-            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
-        let mut pending_munmap: std::collections::HashMap<
-            u32,
-            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
-        let mut pending_brk: std::collections::HashMap<
-            u32,
-            std::collections::VecDeque<(u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
+        let mut pending_mmap: PendingMmap = std::collections::HashMap::new();
+        let mut pending_munmap: PendingMunmap = std::collections::HashMap::new();
+        let mut pending_brk: PendingBrk = std::collections::HashMap::new();
 
         // Per-pid last known brk address for delta computation
         let mut last_brk: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
 
         // Collected (latency_ns, bytes, pid, end_ts, stack) per operation
-        let mut mmap_data: Vec<(u64, u64, u32, u64, Option<Vec<String>>)> = Vec::new();
-        let mut munmap_data: Vec<(u64, u64, u32, u64, Option<Vec<String>>)> = Vec::new();
-        let mut brk_data: Vec<(u64, u64, u32, u64, Option<Vec<String>>)> = Vec::new();
+        let mut mmap_data: MemOpsData = Vec::new();
+        let mut munmap_data: MemOpsData = Vec::new();
+        let mut brk_data: MemOpsData = Vec::new();
 
         // Cumulative memory events: (ts_ns, signed_delta_bytes)
         let mut cumulative_events: Vec<(u64, i64)> = Vec::new();
@@ -1506,10 +1511,7 @@ mod backend {
         }
 
         // Build per-operation stats using same helper as IO
-        let mut ops_data: std::collections::HashMap<
-            &str,
-            Vec<(u64, u64, u32, u64, Option<Vec<String>>)>,
-        > = std::collections::HashMap::new();
+        let mut ops_data: OpsData = std::collections::HashMap::new();
         if !mmap_data.is_empty() {
             ops_data.insert("mmap", mmap_data);
         }

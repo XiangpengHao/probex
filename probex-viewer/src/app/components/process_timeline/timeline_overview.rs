@@ -470,9 +470,7 @@ pub(super) fn TimelineOverview(
                 div {
                     class: if is_dragging && drag_kind == Some(DragKind::LeftEdge) {
                         "w-full h-full rounded-l-md bg-blue-600 shadow-md flex items-center justify-center"
-                    } else {
-                        "w-full h-full rounded-l-md bg-blue-500 hover:bg-blue-600 shadow-sm hover:shadow-md flex items-center justify-center transition-colors duration-100"
-                    },
+                    } else { "w-full h-full rounded-l-md bg-blue-500 hover:bg-blue-600 shadow-sm hover:shadow-md flex items-center justify-center transition-colors duration-100" },
                     div { class: "flex flex-col gap-[3px] items-center",
                         div { class: "w-[3px] h-[3px] rounded-full bg-white/80" }
                         div { class: "w-[3px] h-[3px] rounded-full bg-white/80" }
@@ -488,9 +486,7 @@ pub(super) fn TimelineOverview(
                 div {
                     class: if is_dragging && drag_kind == Some(DragKind::RightEdge) {
                         "w-full h-full rounded-r-md bg-blue-600 shadow-md flex items-center justify-center"
-                    } else {
-                        "w-full h-full rounded-r-md bg-blue-500 hover:bg-blue-600 shadow-sm hover:shadow-md flex items-center justify-center transition-colors duration-100"
-                    },
+                    } else { "w-full h-full rounded-r-md bg-blue-500 hover:bg-blue-600 shadow-sm hover:shadow-md flex items-center justify-center transition-colors duration-100" },
                     div { class: "flex flex-col gap-[3px] items-center",
                         div { class: "w-[3px] h-[3px] rounded-full bg-white/80" }
                         div { class: "w-[3px] h-[3px] rounded-full bg-white/80" }

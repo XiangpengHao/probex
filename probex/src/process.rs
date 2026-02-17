@@ -1,9 +1,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use log::debug;
 use nix::{
-    sys::{
-        wait::{WaitPidFlag, WaitStatus, waitpid},
-    },
+    sys::wait::{WaitPidFlag, WaitStatus, waitpid},
     unistd::{ForkResult, Pid, fork},
 };
 use std::{env, ffi::CString};

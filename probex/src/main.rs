@@ -9,11 +9,9 @@ use aya::{
 };
 use clap::Parser;
 use log::{debug, info};
-use nix::{
-    sys::{
-        signal::{Signal, kill},
-        wait::{WaitStatus, waitpid},
-    },
+use nix::sys::{
+    signal::{Signal, kill},
+    wait::{WaitStatus, waitpid},
 };
 use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
@@ -38,11 +36,13 @@ use args::Args;
 use ebpf::{attach_cpu_sampler, attach_tracepoint, read_cpu_sample_stats};
 use event::Event;
 use parsing::parse_event;
-use process::{drop_process_privileges, resolve_privilege_drop_target, spawn_child, wait_for_child_stop};
+use process::{
+    drop_process_privileges, resolve_privilege_drop_target, spawn_child, wait_for_child_stop,
+};
 use stacks::{
-    enrich_process_name, enrich_stack_data, maybe_capture_proc_maps_snapshot,
-    should_refresh_maps_for_event, symbolize_stack_traces_into_events_parquet, ProcMapEntry,
-    ProcMapsSnapshotCollector, StackTraceCache,
+    ProcMapEntry, ProcMapsSnapshotCollector, StackTraceCache, enrich_process_name,
+    enrich_stack_data, maybe_capture_proc_maps_snapshot, should_refresh_maps_for_event,
+    symbolize_stack_traces_into_events_parquet,
 };
 use writer::ParquetBatchWriter;
 
@@ -216,13 +216,10 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to resume child process {}", child_pid))?;
     debug!("Resumed child process {}", child_pid);
 
-    let output_file = args
-        .output
-        .clone()
-        .unwrap_or_else(|| {
-            let now = chrono::Local::now();
-            format!("probex-{}.parquet", now.format("%Y%m%d-%H%M%S"))
-        });
+    let output_file = args.output.clone().unwrap_or_else(|| {
+        let now = chrono::Local::now();
+        format!("probex-{}.parquet", now.format("%Y%m%d-%H%M%S"))
+    });
 
     // Create Parquet batch writer
     let mut writer = ParquetBatchWriter::new(&output_file, args.sample_freq)?;
@@ -246,7 +243,7 @@ async fn main() -> Result<()> {
     // Get ring buffer
     let ring_buf = RingBuf::try_from(
         ebpf.take_map("EVENTS")
-        .ok_or_else(|| anyhow!("map EVENTS not found"))?,
+            .ok_or_else(|| anyhow!("map EVENTS not found"))?,
     )?;
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
 

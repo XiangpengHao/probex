@@ -77,7 +77,9 @@ pub fn build_flame_event_type_options(
     };
 
     if !selected_event_type.is_empty()
-        && !options.iter().any(|candidate| candidate == selected_event_type)
+        && !options
+            .iter()
+            .any(|candidate| candidate == selected_event_type)
     {
         options.push(selected_event_type.to_string());
     }
