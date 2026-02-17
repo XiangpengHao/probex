@@ -1,119 +1,6 @@
 //! # Probex - eBPF Process Tracing Tool
 //!
-//! ## Flow Overview
-//!
-//! ```text
-//! 1. STARTUP
-//!    probex -- sleep 1
-//!         │
-//!         ▼
-//!    ┌─────────────────────────────────────┐
-//!    │  Load eBPF bytecode into kernel     │
-//!    │  (embedded at compile time)         │
-//!    └─────────────────────────────────────┘
-//!         │
-//!         ▼
-//! 2. SPAWN TARGET PROCESS
-//!    ┌─────────────────────────────────────┐
-//!    │  fork() child with pre_exec hook    │
-//!    │  that calls raise(SIGSTOP)          │
-//!    │  Child stops before exec()          │
-//!    └─────────────────────────────────────┘
-//!         │
-//!         ▼
-//! 3. SETUP TRACING
-//!    ┌─────────────────────────────────────┐
-//!    │  Insert child PID into TRACED_PIDS  │
-//!    │  HashMap in kernel                  │
-//!    └─────────────────────────────────────┘
-//!         │
-//!         ▼
-//!    ┌─────────────────────────────────────┐
-//!    │  Attach tracepoint handlers:        │
-//!    │  - sched:sched_switch               │
-//!    │  - sched:sched_process_fork         │
-//!    │  - sched:sched_process_exit         │
-//!    │  - exceptions:page_fault_user       │
-//!    │  - syscalls:sys_enter/exit_read     │
-//!    │  - syscalls:sys_enter/exit_write    │
-//!    └─────────────────────────────────────┘
-//!         │
-//!         ▼
-//!    ┌─────────────────────────────────────┐
-//!    │  Send SIGCONT to resume child       │
-//!    │  Child now exec()s target program   │
-//!    └─────────────────────────────────────┘
-//!         │
-//!         ▼
-//! 4. EVENT LOOP
-//!    ┌──────────────────────────────────────────────────────────┐
-//!    │  KERNEL (eBPF)              │   USERSPACE (probex)       │
-//!    │                             │                            │
-//!    │  Tracepoint fires ──────────┼──► Ring buffer poll        │
-//!    │       │                     │         │                  │
-//!    │       ▼                     │         ▼                  │
-//!    │  Check TRACED_PIDS map      │    Parse event struct      │
-//!    │       │                     │         │                  │
-//!    │       ▼                     │         ▼                  │
-//!    │  If PID tracked:            │    Buffer events in batch  │
-//!    │  Write event to ring buffer │         │                  │
-//!    │                             │         ▼                  │
-//!    │  (Fork events also add      │    Write batch to Parquet  │
-//!    │   child PID to map)         │    when batch is full      │
-//!    └──────────────────────────────────────────────────────────┘
-//!         │
-//!         ▼
-//! 5. TERMINATION
-//!    ┌─────────────────────────────────────┐
-//!    │  On process_exit for target PID     │
-//!    │  or Ctrl-C: exit event loop         │
-//!    └─────────────────────────────────────┘
-//! ```
-//!
-//! ## Key Components
-//!
-//! - **TRACED_PIDS**: HashMap<u32, u8> in kernel - tracks which PIDs to trace
-//! - **EVENTS**: RingBuf (2MB) - kernel→userspace event transfer
-//! - **SIGSTOP/SIGCONT**: Ensures probes attach before target executes
-//!
-//! ## Event Types
-//!
-//! | Event | Tracepoint | Data |
-//! |-------|------------|------|
-//! | sched_switch | sched:sched_switch | prev_pid, next_pid, prev_state |
-//! | process_fork | sched:sched_process_fork | parent_pid, child_pid |
-//! | process_exit | sched:sched_process_exit | exit_code |
-//! | page_fault | exceptions:page_fault_user | address, error_code |
-//! | syscall_read_enter | syscalls:sys_enter_read | fd, count |
-//! | syscall_read_exit | syscalls:sys_exit_read | ret |
-//! | syscall_write_enter | syscalls:sys_enter_write | fd, count |
-//! | syscall_write_exit | syscalls:sys_exit_write | ret |
-//! | syscall_mmap_enter | syscalls:sys_enter_mmap | address, count(len) |
-//! | syscall_mmap_exit | syscalls:sys_exit_mmap | ret |
-//! | syscall_munmap_enter | syscalls:sys_enter_munmap | address, count(len) |
-//! | syscall_munmap_exit | syscalls:sys_exit_munmap | ret |
-//! | syscall_brk_enter | syscalls:sys_enter_brk | address |
-//! | syscall_brk_exit | syscalls:sys_exit_brk | ret |
-//! | syscall_io_uring_setup_enter | syscalls:sys_enter_io_uring_setup | entries, params_ptr |
-//! | syscall_io_uring_setup_exit | syscalls:sys_exit_io_uring_setup | ret |
-//! | syscall_io_uring_enter_enter | syscalls:sys_enter_io_uring_enter | fd, to_submit |
-//! | syscall_io_uring_enter_exit | syscalls:sys_exit_io_uring_enter | ret |
-//! | syscall_io_uring_register_enter | syscalls:sys_enter_io_uring_register | fd, opcode |
-//! | syscall_io_uring_register_exit | syscalls:sys_exit_io_uring_register | ret |
-//! | syscall_fsync_enter | syscalls:sys_enter_fsync | fd |
-//! | syscall_fsync_exit | syscalls:sys_exit_fsync | ret |
-//! | syscall_fdatasync_enter | syscalls:sys_enter_fdatasync | fd |
-//! | syscall_fdatasync_exit | syscalls:sys_exit_fdatasync | ret |
-//! | cpu_sample | perf_event (cpu clock) | stack sample |
-
-use std::{
-    collections::{BTreeMap, HashSet},
-    env,
-    ffi::CString,
-    fs::File,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+//! (Flow diagram omitted for brevity - see README)
 
 use crate::custom_codegen::{
     CompiledCustomPlan, CustomProbeRuntimeEvent, build_generated_ebpf_binary,
@@ -130,7 +17,7 @@ use arrow::{
     record_batch::{RecordBatch, RecordBatchReader},
 };
 use aya::{
-    maps::{HashMap, MapData, PerCpuArray, RingBuf, StackTraceMap},
+    maps::{HashMap as AyaHashMap, MapData, PerCpuArray, RingBuf, StackTraceMap},
     programs::{
         TracePoint,
         perf_event::{PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy, perf_sw_ids},
@@ -155,10 +42,19 @@ use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
     CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType,
-    MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH,
-    STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    IoUringCompleteEvent, MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent,
+    ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent,
+    SyscallEnterEvent, SyscallExitEvent,
 };
 use serde::Serialize;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    env,
+    ffi::CString,
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::{io::unix::AsyncFd, signal};
 use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
@@ -713,6 +609,16 @@ fn parse_event(data: &[u8]) -> Result<Event> {
             Ok(Event {
                 ret: Some(event.ret),
                 ..event_base("syscall_io_uring_register_exit", event.header)
+            })
+        }
+        EventType::IoUringComplete => {
+            let event = read_unaligned_from_bytes::<IoUringCompleteEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for IoUringCompleteEvent"))?;
+            Ok(Event {
+                fd: Some(i64::from(event.opcode)),
+                count: Some(event.submit_ts_ns),
+                ret: Some(i64::from(event.res)),
+                ..event_base("io_uring_complete", event.header)
             })
         }
         EventType::CpuSample => {
@@ -1936,7 +1842,7 @@ pub(crate) async fn run_trace_command(
 
     // Insert child PID into TRACED_PIDS map
     {
-        let mut traced_pids: HashMap<_, u32, u8> = HashMap::try_from(
+        let mut traced_pids: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
             ebpf.map_mut("TRACED_PIDS")
                 .ok_or_else(|| anyhow!("map TRACED_PIDS not found"))?,
         )
@@ -2057,6 +1963,21 @@ pub(crate) async fn run_trace_command(
     )
     .with_context(|| "step=attach_tracepoint failed: sys_exit_fdatasync")?;
 
+    attach_tracepoint(
+        &mut ebpf,
+        "io_uring_submit_req",
+        "io_uring",
+        "io_uring_submit_req",
+    )
+    .with_context(|| "step=attach_tracepoint failed: io_uring_submit_req")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "io_uring_complete",
+        "io_uring",
+        "io_uring_complete",
+    )
+    .with_context(|| "step=attach_tracepoint failed: io_uring_complete")?;
+
     if custom_mode {
         let mut probes = custom_probe_plan
             .by_probe_id
@@ -2137,11 +2058,9 @@ pub(crate) async fn run_trace_command(
     };
 
     let mut child_wait_done = false;
-    let mut pid_name_cache: std::collections::HashMap<u32, Option<String>> =
-        std::collections::HashMap::new();
-    let mut stack_trace_cache: StackTraceCache = std::collections::HashMap::new();
-    let mut proc_map_snapshot_cache: std::collections::HashMap<u32, Vec<ProcMapEntry>> =
-        std::collections::HashMap::new();
+    let mut pid_name_cache: HashMap<u32, Option<String>> = HashMap::new();
+    let mut stack_trace_cache: StackTraceCache = HashMap::new();
+    let mut proc_map_snapshot_cache: HashMap<u32, Vec<ProcMapEntry>> = HashMap::new();
     let mut seen_tgids: HashSet<u32> = HashSet::new();
 
     let mut handle_event = |event: &mut Event| -> Result<()> {

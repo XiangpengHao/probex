@@ -1,12 +1,13 @@
 [package]
 name = "probex"
-version = "0.1.15"
+version = "0.1.17"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../README.md"
 documentation = "https://docs.rs/probex"
-description = "Low-friction Linux eBPF profiler with integrated web viewer"
+description = "The missing Linux profiler — low-friction, easy to use, works out of the box"
 include = [
     "Cargo.toml",
     "build.rs",
@@ -17,7 +18,7 @@ include = [
 ]
 
 [dependencies]
-probex-common = { path = "../probex-common", version = "0.1.15", features = ["user"] }
+probex-common = { path = "../probex-common", version = "0.1.17", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
@@ -44,6 +45,7 @@ axum = "0.8"
 serde_json = "1"
 serde = { workspace = true, features = ["derive"] }
 rust-embed = { version = "8.11.0", features = ["mime-guess"] }
+chrono = "0.4.43"
 
 [dev-dependencies]
 parquet = { workspace = true }
@@ -63,7 +65,7 @@ cargo_metadata = { workspace = true }
 # Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
-probex-ebpf = { path = "../probex-ebpf", version = "0.1.15" }
+probex-ebpf = { path = "../probex-ebpf", version = "0.1.17" }
 
 [[bin]]
 name = "probex"

@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
 documentation = "https://docs.rs/probex-viewer"
-description = "Web-based visualization for probex trace files"
+description = "Web-based trace viewer for probex"
 
 [[bin]]
 name = "probex-viewer"
@@ -25,6 +26,9 @@ dioxus = { workspace = true, features = [
     "html",
     "document",
 ] }
+charming = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 log.workspace = true
 gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+futures-util = "0.3"

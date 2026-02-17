@@ -14,3 +14,4 @@ trace.maps.parquet
 probex/assets/viewer/
 .vscode/
 .zed/
+*.parquet

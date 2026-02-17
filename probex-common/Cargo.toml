@@ -1,12 +1,13 @@
 [package]
 name = "probex-common"
-version = "0.1.15"
+version = "0.1.17"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
 documentation = "https://docs.rs/probex-common"
-description = "Shared event types for probex user and eBPF components"
+description = "Shared type definitions between eBPF and userspace components of probex"
 
 [features]
 default = []

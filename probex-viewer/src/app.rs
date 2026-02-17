@@ -1,39 +1,31 @@
 //! UI entry point for probex-viewer.
-//!
-//! Keeps reactive state + server querying in one place and delegates rendering
-//! to focused components.
 
 mod components;
 mod formatting;
-mod view_model;
+pub(crate) mod view_model;
 
 use std::collections::HashSet;
 
-use components::{
-    ProcessTimeline, ProcessTimelineActions, ProcessTimelineData, ProcessTimelineRange,
-    ProcessTimelineSelection, ViewerHeader,
-};
+use components::{ProcessTimeline, ViewerHeader};
 use dioxus::prelude::*;
-use view_model::{
-    ViewRange, build_flame_event_type_options, build_pid_event_summary, next_view_range,
-};
+use view_model::{ViewRange, build_flame_event_type_options, build_pid_event_summary};
 
 use crate::api::{
     CustomEventsDebugResponse, CustomProbeSpec, EventFlamegraphResponse, EventTypeCounts,
-    HistogramResponse, IoStatistics, ProcessEventsResponse, ProcessLifetimesResponse, StartTraceRequest,
-    TraceDebugInfo, TraceDebugStepStatus, TraceRunStatus, TraceSummary, get_custom_events_debug,
-    get_event_flamegraph, get_event_type_counts, get_histogram, get_pid_event_type_counts,
-    get_io_statistics,
-    get_process_events, get_process_lifetimes, get_summary, get_syscall_latency_stats,
-    get_trace_debug_info, get_trace_run_status, load_trace_file, start_trace_run, stop_trace_run,
+    HistogramResponse, IoStatistics, ProcessEventsResponse, ProcessLifetimesResponse,
+    StartTraceRequest, TraceDebugInfo, TraceDebugStepStatus, TraceRunStatus, TraceSummary,
+    get_custom_events_debug, get_event_flamegraph, get_event_type_counts, get_histogram,
+    get_io_statistics, get_pid_event_type_counts, get_process_events, get_process_lifetimes,
+    get_summary, get_syscall_latency_stats, get_trace_debug_info, get_trace_run_status,
+    load_trace_file, start_trace_run, stop_trace_run,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
 const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
-const HISTOGRAM_BUCKETS: usize = 80;
-const MAX_FLAME_STACKS: usize = 5000;
-const MAX_PROCESS_MARKERS_PER_PID: usize = 500;
+pub(crate) const HISTOGRAM_BUCKETS: usize = 80;
+pub(crate) const MAX_FLAME_STACKS: usize = 5000;
+pub(crate) const MAX_PROCESS_MARKERS_PER_PID: usize = 500;
 
 #[component]
 pub fn App() -> Element {
@@ -58,11 +50,10 @@ fn TraceViewer() -> Element {
     let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
     let mut io_statistics = use_signal(|| Option::<IoStatistics>::None);
     let mut io_statistics_loading = use_signal(|| false);
-
     let mut error_msg = use_signal(|| Option::<String>::None);
 
+    // Non-optional after initialization — only render children once set.
     let mut view_range = use_signal(|| Option::<ViewRange>::None);
-
     let mut enabled_event_types = use_signal(HashSet::<String>::new);
     let mut selected_pid = use_signal(|| Option::<u32>::None);
     let mut selected_flame_event_type = use_signal(|| "cpu_sample".to_string());
@@ -260,16 +251,17 @@ fn TraceViewer() -> Element {
     let selected_pid_value = selected_pid();
     let selected_flame_event_type_value = selected_flame_event_type();
 
-    let flame_event_type_options = build_flame_event_type_options(
-        summary_data.as_ref(),
-        selected_pid_value,
-        &pid_summary,
-        if selected_flame_event_type_value.is_empty() {
-            None
-        } else {
-            Some(selected_flame_event_type_value.as_str())
-        },
-    );
+    let flame_event_type_options = summary_data
+        .as_ref()
+        .map(|summary| {
+            build_flame_event_type_options(
+                summary,
+                selected_pid_value,
+                &pid_summary,
+                selected_flame_event_type_value.as_str(),
+            )
+        })
+        .unwrap_or_default();
     let trace_debug_snapshot = trace_debug_info();
     let startup_status_text = startup_phase_text(trace_debug_snapshot.as_ref());
     let trace_status_text = match trace_run_status() {
@@ -307,7 +299,6 @@ fn TraceViewer() -> Element {
     } else {
         "px-2 py-1 rounded border border-gray-200 bg-gray-100 text-gray-400 text-xs cursor-not-allowed"
     };
-
     rsx! {
         ViewerHeader {
             summary: summary_data.clone(),
@@ -713,75 +704,15 @@ fn TraceViewer() -> Element {
                 }
             }
 
-            if let (Some(summary), Some(lifetimes), Some(range)) =
-                (summary_data.clone(), process_lifetimes(), view_range())
+            if let (Some(summary), Some(lifetimes), Some(_)) =
+                (summary_data, process_lifetimes(), view_range())
             {
                 ProcessTimeline {
-                    data: ProcessTimelineData {
-                        processes: lifetimes.processes,
-                        process_events: process_events(),
-                        histogram: hist_data,
-                        summary: summary.clone(),
-                        pid_summary: pid_summary.clone(),
-                        latency_stats: syscall_latency_stats(),
-                        selected_flame_event_type: selected_flame_event_type_value.clone(),
-                        flame_event_type_options,
-                        flamegraph: event_flamegraph(),
-                        flamegraph_loading: flamegraph_loading(),
-                        io_statistics: io_statistics(),
-                        io_statistics_loading: io_statistics_loading(),
-                    },
-                    selection: ProcessTimelineSelection {
-                        enabled_event_types: enabled_event_types(),
-                        selected_pid: selected_pid_value,
-                    },
-                    range: ProcessTimelineRange {
-                        full_start_ns: summary.min_ts_ns,
-                        full_end_ns: summary.max_ts_ns,
-                        view_start_ns: range.start_ns,
-                        view_end_ns: range.end_ns,
-                    },
-                    actions: ProcessTimelineActions {
-                        on_select_pid: EventHandler::new(move |pid: u32| {
-                            let next_pid = if selected_pid() == Some(pid) {
-                                None
-                            } else {
-                                Some(pid)
-                            };
-                            selected_pid.set(next_pid);
-                        }),
-                        on_select_pid_option: EventHandler::new(move |pid: Option<u32>| {
-                            selected_pid.set(pid);
-                        }),
-                        on_focus_process: EventHandler::new(
-                            move |(pid, start, end): (u32, u64, u64)| {
-                                selected_pid.set(Some(pid));
-                                if let Some(next_range) = next_view_range(view_range(), start, end)
-                                {
-                                    view_range.set(Some(next_range));
-                                }
-                            },
-                        ),
-                        on_change_range: EventHandler::new(move |(start, end): (u64, u64)| {
-                            if let Some(next_range) = next_view_range(view_range(), start, end) {
-                                view_range.set(Some(next_range));
-                            }
-                        }),
-                        on_toggle_event_type: EventHandler::new(move |event_type: String| {
-                            let mut types = enabled_event_types();
-                            if types.contains(&event_type) {
-                                types.remove(&event_type);
-                            } else {
-                                types.insert(event_type);
-                            }
-                            enabled_event_types.set(types);
-                        }),
-                        on_select_flame_event_type: EventHandler::new(
-                            move |event_type: String| {
-                                selected_flame_event_type.set(event_type);
-                            },
-                        ),
-                    },
+                    summary,
+                    processes: lifetimes.processes,
+                    histogram: hist_data,
+                    view_range,
+                    selected_pid,
                 }
             }
         }

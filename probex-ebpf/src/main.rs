@@ -12,10 +12,10 @@ use aya_ebpf::{
 use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STAT_USER_STACK,
-    CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType, MAX_CPU_SAMPLE_FRAMES,
-    MAX_TRACKED_PIDS, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, RING_BUF_SIZE,
-    STACK_KIND_KERNEL, STACK_KIND_NONE, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent,
-    SyscallExitEvent,
+    CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType, IoUringCompleteEvent,
+    MAX_CPU_SAMPLE_FRAMES, MAX_IO_URING_INFLIGHT, MAX_TRACKED_PIDS, PageFaultEvent,
+    ProcessExitEvent, ProcessForkEvent, RING_BUF_SIZE, STACK_KIND_KERNEL, STACK_KIND_NONE,
+    STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 
 /// Ring buffer for sending events to userspace
@@ -34,6 +34,22 @@ static TRACED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_TRACKED_PID
 #[map]
 static CPU_SAMPLE_STATS: PerCpuArray<[u64; CPU_SAMPLE_STATS_LEN]> =
     PerCpuArray::with_max_entries(1, 0);
+
+/// In-flight io_uring request tracking: req pointer -> (submit_ts, tgid, pid, opcode).
+/// Populated on io_uring:io_uring_submit_req, consumed on io_uring:io_uring_complete.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IoUringInflight {
+    submit_ts: u64,
+    tgid: u32,
+    pid: u32,
+    opcode: u8,
+    _pad: [u8; 7],
+}
+
+#[map]
+static IO_URING_INFLIGHT: HashMap<u64, IoUringInflight> =
+    HashMap::with_max_entries(MAX_IO_URING_INFLIGHT, 0);
 
 /// Check if a PID is being traced
 #[inline(always)]
@@ -970,6 +986,98 @@ fn try_sys_exit_io_uring_register(ctx: &TracePointContext) -> Result<u32, i64> {
         }
         buf.submit(BPF_RB_FORCE_WAKEUP as u64);
     }
+
+    Ok(0)
+}
+
+/// io_uring:io_uring_submit_req tracepoint handler
+/// Fires when a SQE is submitted for processing inside the kernel.
+/// Tracepoint struct fields (from include/trace/events/io_uring.h):
+///   ctx (void *):       offset 8
+///   req (void *):       offset 16
+///   user_data (u64):    offset 24
+///   opcode (u8):        offset 32
+///   flags (u64):        offset 40
+///   sq_thread (bool):   offset 48
+///   op_str (__data_loc): offset 52
+#[tracepoint]
+pub fn io_uring_submit_req(ctx: TracePointContext) -> u32 {
+    match try_io_uring_submit_req(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_io_uring_submit_req(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let req_ptr: u64 = unsafe { ctx.read_at(16)? };
+    let opcode: u8 = unsafe { ctx.read_at(32)? };
+
+    let inflight = IoUringInflight {
+        submit_ts: unsafe { bpf_ktime_get_ns() },
+        tgid,
+        pid: ctx.pid(),
+        opcode,
+        _pad: [0; 7],
+    };
+    let _ = IO_URING_INFLIGHT.insert(&req_ptr, &inflight, 0);
+
+    Ok(0)
+}
+
+/// io_uring:io_uring_complete tracepoint handler
+/// Fires when a CQE is posted (IO completed).
+/// Tracepoint struct fields (from include/trace/events/io_uring.h):
+///   ctx (void *):       offset 8
+///   req (void *):       offset 16
+///   user_data (u64):    offset 24
+///   res (int / s32):    offset 32
+///   cflags (unsigned):  offset 36
+///   extra1 (u64):       offset 40
+///   extra2 (u64):       offset 48
+#[tracepoint]
+pub fn io_uring_complete(ctx: TracePointContext) -> u32 {
+    match try_io_uring_complete(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_io_uring_complete(ctx: &TracePointContext) -> Result<u32, i64> {
+    let req_ptr: u64 = unsafe { ctx.read_at(16)? };
+
+    // Look up the in-flight entry; if missing we didn't track submission (not our pid).
+    let inflight = match unsafe { IO_URING_INFLIGHT.get(&req_ptr) } {
+        Some(v) => *v,
+        None => return Ok(0),
+    };
+
+    let res: i32 = unsafe { ctx.read_at(32)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<IoUringCompleteEvent>(0) {
+        let mut header = make_header(ctx, EventType::IoUringComplete);
+        // Use the original submitter's pid/tgid, not the completer's (may be io-wq worker).
+        header.pid = inflight.pid;
+        header.tgid = inflight.tgid;
+
+        let event = IoUringCompleteEvent {
+            header,
+            submit_ts_ns: inflight.submit_ts,
+            opcode: inflight.opcode,
+            _padding: [0; 3],
+            res,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    let _ = IO_URING_INFLIGHT.remove(&req_ptr);
 
     Ok(0)
 }

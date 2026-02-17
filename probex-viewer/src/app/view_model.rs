@@ -60,20 +60,11 @@ pub fn build_pid_event_summary(counts: Option<&EventTypeCounts>) -> PidEventSumm
     }
 }
 
-pub fn next_view_range(
-    current_range: Option<ViewRange>,
-    next_start_ns: u64,
-    next_end_ns: u64,
-) -> Option<ViewRange> {
-    let next_range = ViewRange::new(next_start_ns, next_end_ns)?;
-    (current_range != Some(next_range)).then_some(next_range)
-}
-
 pub fn build_flame_event_type_options(
-    summary: Option<&TraceSummary>,
+    summary: &TraceSummary,
     selected_pid: Option<u32>,
     pid_summary: &PidEventSummary,
-    selected_event_type: Option<&str>,
+    selected_event_type: &str,
 ) -> Vec<String> {
     let mut options: Vec<String> = if selected_pid.is_some() && !pid_summary.breakdown.is_empty() {
         pid_summary
@@ -82,13 +73,15 @@ pub fn build_flame_event_type_options(
             .map(|(event_type, _)| event_type.clone())
             .collect()
     } else {
-        summary.map(|s| s.event_types.clone()).unwrap_or_default()
+        summary.event_types.clone()
     };
 
-    if let Some(event_type) = selected_event_type
-        && !options.iter().any(|candidate| candidate == event_type)
+    if !selected_event_type.is_empty()
+        && !options
+            .iter()
+            .any(|candidate| candidate == selected_event_type)
     {
-        options.push(event_type.to_string());
+        options.push(selected_event_type.to_string());
     }
 
     options.sort();

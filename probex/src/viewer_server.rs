@@ -100,6 +100,8 @@ struct EventListQuery {
     pid: u32,
     limit: usize,
     offset: usize,
+    #[serde(default)]
+    event_types: Option<String>,
 }
 
 pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
@@ -149,6 +151,7 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/event_flamegraph", get(get_event_flamegraph))
         .route("/api/custom_events_debug", get(get_custom_events_debug))
         .route("/api/io_statistics", get(get_io_statistics))
+        .route("/api/memory_statistics", get(get_memory_statistics))
         .route("/api/event_list", get(get_event_list));
 
     let app = api_router.fallback(get(static_handler));
@@ -341,7 +344,19 @@ async fn get_io_statistics(Query(query): Query<IoStatisticsQuery>) -> Response {
     )
 }
 
+async fn get_memory_statistics(Query(query): Query<IoStatisticsQuery>) -> Response {
+    into_json_response(
+        viewer_backend::query_memory_statistics(query.start_ns, query.end_ns, query.pid).await,
+    )
+}
+
 async fn get_event_list(Query(query): Query<EventListQuery>) -> Response {
+    let event_types: Vec<String> = query
+        .event_types
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').map(|t| t.to_string()).collect())
+        .unwrap_or_default();
     into_json_response(
         viewer_backend::query_event_list(
             query.start_ns,
@@ -349,6 +364,7 @@ async fn get_event_list(Query(query): Query<EventListQuery>) -> Response {
             query.pid,
             query.limit,
             query.offset,
+            &event_types,
         )
         .await,
     )

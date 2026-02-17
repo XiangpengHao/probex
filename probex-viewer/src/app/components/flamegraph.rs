@@ -11,7 +11,7 @@ pub struct FlamegraphCardSelection {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FlamegraphCardScope {
-    pub selected_pid: Option<u32>,
+    pub selected_pid: u32,
     pub full_start_ns: u64,
     pub view_start_ns: u64,
     pub view_end_ns: u64,
@@ -55,9 +55,7 @@ pub fn EventFlamegraphCard(
     let range_width = view_end_ns.saturating_sub(view_start_ns);
     let start_offset = view_start_ns.saturating_sub(full_start_ns);
     let end_offset = view_end_ns.saturating_sub(full_start_ns);
-    let pid_scope = selected_pid
-        .map(|pid| format!("PID {pid}"))
-        .unwrap_or_else(|| "All PIDs".to_string());
+    let pid_scope = format!("PID {selected_pid}");
     let sample_label = if total > 0 {
         format!("{total} samples")
     } else {

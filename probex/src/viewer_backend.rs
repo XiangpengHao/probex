@@ -3,11 +3,12 @@
 //! Uses DataFusion to query parquet trace files.
 
 pub use probex_common::viewer_api::{
-    CustomEventDebugField, CustomEventDebugRow, CustomEventsDebugResponse, CustomPayloadSchema,
-    CustomPayloadTypeKind, EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket,
-    HistogramResponse, IoStatistics, IoTypeStats, LatencyBucket, LatencySummary, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource,
-    ProbeSchemasPageResponse, ProbeSchemasResponse, ProcessEventsResponse, ProcessLifetime,
-    ProcessLifetimesResponse, SizeBucket, SyscallLatencyStats, TraceSummary, EventDetail, EventListResponse,
+    CumulativeMemoryPoint, CustomEventDebugField, CustomEventDebugRow, CustomEventsDebugResponse,
+    CustomPayloadSchema, CustomPayloadTypeKind, EventDetail, EventFlamegraphResponse,
+    EventListResponse, EventMarker, EventTypeCounts, HistogramBucket, HistogramResponse,
+    IoStatistics, IoTypeStats, LatencySummary, MemoryStatistics, ProbeSchema, ProbeSchemaKind,
+    ProbeSchemaSource, ProbeSchemasPageResponse, ProbeSchemasResponse, ProcessEventsResponse,
+    ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
@@ -760,13 +761,13 @@ mod backend {
         }
 
         let sql = format!(
-            "SELECT pid, ts_ns, event_type, count
+            "SELECT pid, ts_ns, event_type, count, submit_ts_ns, io_uring_res
              FROM events
              WHERE {}
                AND event_type IN (
                  'syscall_read_enter', 'syscall_read_exit',
                  'syscall_write_enter', 'syscall_write_exit',
-                 'syscall_io_uring_enter_enter', 'syscall_io_uring_enter_exit',
+                 'io_uring_complete',
                  'syscall_mmap_enter', 'syscall_munmap_enter'
                )
              ORDER BY pid, ts_ns",
@@ -780,11 +781,9 @@ mod backend {
             std::collections::HashMap::new();
         let mut pending_write: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
             std::collections::HashMap::new();
-        let mut pending_io_uring: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
-            std::collections::HashMap::new();
         let mut read_latencies: Vec<u64> = Vec::new();
         let mut write_latencies: Vec<u64> = Vec::new();
-        let mut io_uring_enter_latencies: Vec<u64> = Vec::new();
+        let mut io_uring_latencies: Vec<u64> = Vec::new();
         let mut mmap_alloc_bytes: u64 = 0;
         let mut munmap_free_bytes: u64 = 0;
 
@@ -812,15 +811,11 @@ mod backend {
                             write_latencies.push(ts - start_ts);
                         }
                     }
-                    "syscall_io_uring_enter_enter" => {
-                        pending_io_uring.entry(pid).or_default().push_back(ts)
-                    }
-                    "syscall_io_uring_enter_exit" => {
-                        if let Some(queue) = pending_io_uring.get_mut(&pid)
-                            && let Some(start_ts) = queue.pop_front()
-                            && ts >= start_ts
-                        {
-                            io_uring_enter_latencies.push(ts - start_ts);
+                    "io_uring_complete" => {
+                        let submit_ts =
+                            extract_option_u64(batch, "submit_ts_ns", row)?.unwrap_or(0);
+                        if submit_ts > 0 && ts >= submit_ts {
+                            io_uring_latencies.push(ts - submit_ts);
                         }
                     }
                     "syscall_mmap_enter" => {
@@ -846,16 +841,10 @@ mod backend {
             }
         }
 
-        // io_uring_enter can represent read or write style I/O submissions.
-        // Without SQE opcode tracing, attribute these latencies to both aggregates.
-        if !io_uring_enter_latencies.is_empty() {
-            read_latencies.extend(io_uring_enter_latencies.iter().copied());
-            write_latencies.extend(io_uring_enter_latencies.iter().copied());
-        }
-
         Ok(SyscallLatencyStats {
             read: summarize_latencies(&read_latencies),
             write: summarize_latencies(&write_latencies),
+            io_uring: summarize_latencies(&io_uring_latencies),
             mmap_alloc_bytes,
             munmap_free_bytes,
         })
@@ -1039,10 +1028,10 @@ mod backend {
                     (None, *first_seen, false)
                 };
 
-            let (end_ns, exit_code, did_exit) = if let Some((code, exit_ts)) = exit_info.get(pid) {
-                (Some(*exit_ts), Some(*code), true)
+            let (end_ns, exit) = if let Some((code, exit_ts)) = exit_info.get(pid) {
+                (*exit_ts, Some(*code))
             } else {
-                (Some(*last_seen), None, false)
+                (*last_seen, None)
             };
 
             processes.push(ProcessLifetime {
@@ -1051,9 +1040,8 @@ mod backend {
                 parent_pid,
                 start_ns,
                 end_ns,
-                exit_code,
+                exit,
                 was_forked,
-                did_exit,
             });
         }
 
@@ -1068,8 +1056,8 @@ mod backend {
         end_ns: u64,
         max_events_per_pid: usize,
     ) -> BackendResult<ProcessEventsResponse> {
-        const CPU_SAMPLE_BUCKETS_MAX: usize = 600;
-        const CPU_SAMPLE_TARGET_SAMPLES_PER_BUCKET: f64 = 3.0;
+        const CPU_SAMPLE_BUCKETS_MAX: usize = 2000;
+        const CPU_SAMPLE_TARGET_SAMPLES_PER_BUCKET: f64 = 1.0;
 
         if end_ns < start_ns {
             return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
@@ -1203,8 +1191,9 @@ mod backend {
         let mut opts = flamegraph::Options::default();
         opts.title = format!("probex · {event_type}");
         opts.count_name = "samples".to_string();
-        opts.colors = flamegraph::Palette::Basic(flamegraph::color::BasicPalette::Aqua);
-        opts.bgcolors = Some(flamegraph::color::BackgroundColor::Blue);
+        // Use Mem palette (green/blue/grey tones) as a substitute for greyish
+        opts.colors = flamegraph::Palette::Multi(flamegraph::color::MultiPalette::Rust);
+        opts.bgcolors = None;
         opts.hash = true;
         opts.deterministic = true;
 
@@ -1230,14 +1219,15 @@ mod backend {
         }
 
         let sql = format!(
-            "SELECT pid, ts_ns, event_type, count, ret
+            "SELECT pid, ts_ns, event_type, count, ret, submit_ts_ns, io_uring_res, stack_trace
              FROM events
              WHERE {}
                AND event_type IN (
                  'syscall_read_enter', 'syscall_read_exit',
                  'syscall_write_enter', 'syscall_write_exit',
                  'syscall_fsync_enter', 'syscall_fsync_exit',
-                 'syscall_fdatasync_enter', 'syscall_fdatasync_exit'
+                 'syscall_fdatasync_enter', 'syscall_fdatasync_exit',
+                 'io_uring_complete'
                )
              ORDER BY pid, ts_ns",
             conditions.join(" AND ")
@@ -1246,23 +1236,29 @@ mod backend {
         let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
 
-        // Per-pid queues for enter events: (ts_ns, request_bytes)
-        let mut pending_read: std::collections::HashMap<
+        // Per-pid queues for enter events: (ts_ns, request_bytes, stack_trace)
+        type PendingRead = std::collections::HashMap<
             u32,
-            std::collections::VecDeque<(u64, u64)>,
-        > = std::collections::HashMap::new();
-        let mut pending_write: std::collections::HashMap<
+            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
+        >;
+        type PendingWrite = std::collections::HashMap<
             u32,
-            std::collections::VecDeque<(u64, u64)>,
-        > = std::collections::HashMap::new();
-        let mut pending_fsync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
-            std::collections::HashMap::new();
-        let mut pending_fdatasync: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
-            std::collections::HashMap::new();
+            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
+        >;
+        type PendingFsync =
+            std::collections::HashMap<u32, std::collections::VecDeque<(u64, Option<Vec<String>>)>>;
+        type PendingFdatasync =
+            std::collections::HashMap<u32, std::collections::VecDeque<(u64, Option<Vec<String>>)>>;
+        type OpsData<'a> =
+            std::collections::HashMap<&'a str, Vec<(u64, u64, u32, u64, Option<Vec<String>>)>>;
 
-        // Collected (latency_ns, actual_bytes) per operation
-        let mut ops_data: std::collections::HashMap<&str, Vec<(u64, u64)>> =
-            std::collections::HashMap::new();
+        let mut pending_read: PendingRead = std::collections::HashMap::new();
+        let mut pending_write: PendingWrite = std::collections::HashMap::new();
+        let mut pending_fsync: PendingFsync = std::collections::HashMap::new();
+        let mut pending_fdatasync: PendingFdatasync = std::collections::HashMap::new();
+
+        // Collected (latency_ns, actual_bytes, pid, end_ts, stack_trace) per operation
+        let mut ops_data: OpsData = std::collections::HashMap::new();
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
@@ -1273,66 +1269,111 @@ mod backend {
                 match event_type.as_str() {
                     "syscall_read_enter" => {
                         let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
-                        pending_read.entry(pid).or_default().push_back((ts, count));
+                        let stack = extract_option_stack_trace_labels(batch, row)?;
+                        pending_read
+                            .entry(pid)
+                            .or_default()
+                            .push_back((ts, count, stack));
                     }
                     "syscall_read_exit" => {
                         if let Some(queue) = pending_read.get_mut(&pid)
-                            && let Some((enter_ts, request_bytes)) = queue.pop_front()
+                            && let Some((enter_ts, request_bytes, stack)) = queue.pop_front()
                             && ts >= enter_ts
                         {
                             let ret = extract_i64(batch, "ret", row)?;
                             let actual_bytes = ret.max(0) as u64;
-                            ops_data
-                                .entry("read")
-                                .or_default()
-                                .push((ts - enter_ts, actual_bytes));
+                            ops_data.entry("read").or_default().push((
+                                ts - enter_ts,
+                                actual_bytes,
+                                pid,
+                                ts,
+                                stack,
+                            ));
                             let _ = request_bytes;
                         }
                     }
                     "syscall_write_enter" => {
                         let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
-                        pending_write.entry(pid).or_default().push_back((ts, count));
+                        let stack = extract_option_stack_trace_labels(batch, row)?;
+                        pending_write
+                            .entry(pid)
+                            .or_default()
+                            .push_back((ts, count, stack));
                     }
                     "syscall_write_exit" => {
                         if let Some(queue) = pending_write.get_mut(&pid)
-                            && let Some((enter_ts, request_bytes)) = queue.pop_front()
+                            && let Some((enter_ts, request_bytes, stack)) = queue.pop_front()
                             && ts >= enter_ts
                         {
                             let ret = extract_i64(batch, "ret", row)?;
                             let actual_bytes = ret.max(0) as u64;
-                            ops_data
-                                .entry("write")
-                                .or_default()
-                                .push((ts - enter_ts, actual_bytes));
+                            ops_data.entry("write").or_default().push((
+                                ts - enter_ts,
+                                actual_bytes,
+                                pid,
+                                ts,
+                                stack,
+                            ));
                             let _ = request_bytes;
                         }
                     }
                     "syscall_fsync_enter" => {
-                        pending_fsync.entry(pid).or_default().push_back(ts);
+                        let stack = extract_option_stack_trace_labels(batch, row)?;
+                        pending_fsync.entry(pid).or_default().push_back((ts, stack));
                     }
                     "syscall_fsync_exit" => {
                         if let Some(queue) = pending_fsync.get_mut(&pid)
-                            && let Some(enter_ts) = queue.pop_front()
+                            && let Some((enter_ts, stack)) = queue.pop_front()
                             && ts >= enter_ts
                         {
-                            ops_data
-                                .entry("fsync")
-                                .or_default()
-                                .push((ts - enter_ts, 0));
+                            ops_data.entry("fsync").or_default().push((
+                                ts - enter_ts,
+                                0,
+                                pid,
+                                ts,
+                                stack,
+                            ));
                         }
                     }
                     "syscall_fdatasync_enter" => {
-                        pending_fdatasync.entry(pid).or_default().push_back(ts);
+                        let stack = extract_option_stack_trace_labels(batch, row)?;
+                        pending_fdatasync
+                            .entry(pid)
+                            .or_default()
+                            .push_back((ts, stack));
                     }
                     "syscall_fdatasync_exit" => {
                         if let Some(queue) = pending_fdatasync.get_mut(&pid)
-                            && let Some(enter_ts) = queue.pop_front()
+                            && let Some((enter_ts, stack)) = queue.pop_front()
                             && ts >= enter_ts
                         {
-                            ops_data
-                                .entry("fdatasync")
-                                .or_default()
-                                .push((ts - enter_ts, 0));
+                            ops_data.entry("fdatasync").or_default().push((
+                                ts - enter_ts,
+                                0,
+                                pid,
+                                ts,
+                                stack,
+                            ));
+                        }
+                    }
+                    "io_uring_complete" => {
+                        let submit_ts =
+                            extract_option_u64(batch, "submit_ts_ns", row)?.unwrap_or(0);
+                        let res = extract_option_i32(batch, "io_uring_res", row)?.unwrap_or(0);
+                        if submit_ts > 0 && ts >= submit_ts {
+                            let actual_bytes = res.max(0) as u64;
+                            // io_uring_complete usually has the stack of the completion, not submission.
+                            // Ideally we'd want the submission stack, but we don't have it here easily.
+                            // We'll use the completion stack as a proxy or just None if not useful.
+                            // The user might be interested in who processed the completion.
+                            let stack = extract_option_stack_trace_labels(batch, row)?;
+                            ops_data.entry("io_uring").or_default().push((
+                                ts - submit_ts,
+                                actual_bytes,
+                                pid,
+                                ts,
+                                stack,
+                            ));
                         }
                     }
                     _ => {}
@@ -1340,12 +1381,10 @@ mod backend {
             }
         }
 
-        let mut all_sizes: Vec<u64> = Vec::new();
         let mut total_ops: u64 = 0;
         let mut total_bytes: u64 = 0;
         for data in ops_data.values() {
-            for &(_, actual) in data {
-                all_sizes.push(actual);
+            for &(_, actual, _, _, _) in data {
                 total_ops += 1;
                 total_bytes = total_bytes.saturating_add(actual);
             }
@@ -1359,103 +1398,274 @@ mod backend {
 
         Ok(IoStatistics {
             by_operation,
-            size_histogram: compute_size_histogram(&all_sizes),
             total_ops,
             total_bytes,
             time_range_ns: (start_ns, end_ns),
         })
     }
 
-    fn compute_io_type_stats(operation: String, mut data: Vec<(u64, u64)>) -> IoTypeStats {
-        data.sort_by_key(|(lat, _)| *lat);
+    type BackendIoOpData = Vec<(u64, u64, u32, u64, Option<Vec<String>>)>;
+
+    fn compute_io_type_stats(operation: String, mut data: BackendIoOpData) -> IoTypeStats {
+        data.sort_by_key(|(lat, _, _, _, _)| *lat);
 
         let total_ops = data.len() as u64;
-        let total_bytes: u64 = data.iter().map(|(_, b)| *b).sum();
-        let total_latency: u128 = data.iter().map(|(l, _)| *l as u128).sum();
+        let total_bytes: u64 = data.iter().map(|(_, b, _, _, _)| *b).sum();
+        let total_latency: u128 = data.iter().map(|(l, _, _, _, _)| *l as u128).sum();
 
         let avg_latency_ns = if total_ops > 0 {
             (total_latency / total_ops as u128) as u64
         } else {
             0
         };
-        let p50_ns = percentile_latency(&data, 50);
-        let p95_ns = percentile_latency(&data, 95);
-        let p99_ns = percentile_latency(&data, 99);
-        let max_ns = data.last().map(|(l, _)| *l).unwrap_or(0);
 
-        let latency_histogram = latency_bucket_ranges()
-            .into_iter()
-            .map(|(min, max, label)| {
-                let count = data.iter().filter(|(l, _)| *l >= min && *l < max).count() as u64;
-                LatencyBucket {
-                    min_ns: min,
-                    max_ns: max,
-                    count,
-                    label: label.to_string(),
-                }
+        let get_sample = |pct: usize| -> Option<EventDetail> {
+            if data.is_empty() {
+                return None;
+            }
+            let idx = if pct == 100 {
+                data.len() - 1
+            } else {
+                ((data.len() * pct) / 100).min(data.len() - 1)
+            };
+            let (lat, _, pid, ts, ref stack) = data[idx];
+            Some(EventDetail {
+                ts_ns: ts,
+                latency_ns: Some(lat),
+                event_type: operation.clone(),
+                pid,
+                stack_trace: stack.clone(),
             })
-            .collect();
+        };
 
-        let sizes: Vec<u64> = data.iter().map(|(_, b)| *b).collect();
-        let size_histogram = compute_size_histogram(&sizes);
+        let p50_event = get_sample(50);
+        let p95_event = get_sample(95);
+        let p99_event = get_sample(99);
+        let max_event = get_sample(100);
+
+        let latencies_ns: Vec<u64> = data.iter().map(|(l, _, _, _, _)| *l).collect();
+
+        let mut sizes_bytes: Vec<u64> = data.iter().map(|(_, b, _, _, _)| *b).collect();
+        sizes_bytes.sort_unstable();
 
         IoTypeStats {
             operation,
             total_ops,
             total_bytes,
             avg_latency_ns,
-            p50_ns,
-            p95_ns,
-            p99_ns,
-            max_ns,
-            latency_histogram,
-            size_histogram,
+            p50_event,
+            p95_event,
+            p99_event,
+            max_event,
+            latencies_ns,
+            sizes_bytes,
         }
     }
 
-    fn percentile_latency(sorted_data: &[(u64, u64)], pct: usize) -> u64 {
-        if sorted_data.is_empty() {
-            return 0;
+    pub async fn query_memory_statistics(
+        start_ns: u64,
+        end_ns: u64,
+        pid: Option<u32>,
+    ) -> BackendResult<MemoryStatistics> {
+        if end_ns < start_ns {
+            return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
         }
-        let idx = (sorted_data.len() * pct / 100).min(sorted_data.len() - 1);
-        sorted_data[idx].0
-    }
+        let ctx = get_ctx()?;
 
-    fn latency_bucket_ranges() -> Vec<(u64, u64, &'static str)> {
-        vec![
-            (0, 1_000, "<1us"),
-            (1_000, 10_000, "1-10us"),
-            (10_000, 100_000, "10-100us"),
-            (100_000, 1_000_000, "100us-1ms"),
-            (1_000_000, 10_000_000, "1-10ms"),
-            (10_000_000, 100_000_000, "10-100ms"),
-            (100_000_000, 1_000_000_000, "100ms-1s"),
-            (1_000_000_000, u64::MAX, ">1s"),
-        ]
-    }
+        let mut conditions = vec![format!("ts_ns >= {start_ns}"), format!("ts_ns <= {end_ns}")];
+        if let Some(pid) = pid {
+            conditions.push(format!("pid = {pid}"));
+        }
 
-    fn compute_size_histogram(sizes: &[u64]) -> Vec<SizeBucket> {
-        let ranges: Vec<(u64, u64, &str)> = vec![
-            (0, 64, "<64B"),
-            (64, 512, "64-512B"),
-            (512, 4_096, "512B-4KB"),
-            (4_096, 65_536, "4-64KB"),
-            (65_536, 1_048_576, "64KB-1MB"),
-            (1_048_576, 16_777_216, "1-16MB"),
-            (16_777_216, u64::MAX, ">16MB"),
-        ];
-        ranges
-            .into_iter()
-            .map(|(min, max, label)| {
-                let count = sizes.iter().filter(|&&s| s >= min && s < max).count() as u64;
-                SizeBucket {
-                    min_bytes: min,
-                    max_bytes: max,
-                    count,
-                    label: label.to_string(),
+        let sql = format!(
+            "SELECT pid, ts_ns, event_type, count, ret, stack_trace
+             FROM events
+             WHERE {}
+               AND event_type IN (
+                 'syscall_mmap_enter', 'syscall_mmap_exit',
+                 'syscall_munmap_enter', 'syscall_munmap_exit',
+                 'syscall_brk_enter', 'syscall_brk_exit'
+               )
+             ORDER BY pid, ts_ns",
+            conditions.join(" AND ")
+        );
+
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        type PendingMmap = std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
+        >;
+        type PendingMunmap = std::collections::HashMap<
+            u32,
+            std::collections::VecDeque<(u64, u64, Option<Vec<String>>)>,
+        >;
+        type PendingBrk =
+            std::collections::HashMap<u32, std::collections::VecDeque<(u64, Option<Vec<String>>)>>;
+
+        type MemOpsData = Vec<(u64, u64, u32, u64, Option<Vec<String>>)>;
+        type OpsData<'a> =
+            std::collections::HashMap<&'a str, Vec<(u64, u64, u32, u64, Option<Vec<String>>)>>;
+
+        // Per-pid pending queues: mmap/munmap store (ts_ns, count, stack), brk stores (ts_ns, stack)
+        let mut pending_mmap: PendingMmap = std::collections::HashMap::new();
+        let mut pending_munmap: PendingMunmap = std::collections::HashMap::new();
+        let mut pending_brk: PendingBrk = std::collections::HashMap::new();
+
+        // Per-pid last known brk address for delta computation
+        let mut last_brk: std::collections::HashMap<u32, i64> = std::collections::HashMap::new();
+
+        // Collected (latency_ns, bytes, pid, end_ts, stack) per operation
+        let mut mmap_data: MemOpsData = Vec::new();
+        let mut munmap_data: MemOpsData = Vec::new();
+        let mut brk_data: MemOpsData = Vec::new();
+
+        // Cumulative memory events: (ts_ns, signed_delta_bytes)
+        let mut cumulative_events: Vec<(u64, i64)> = Vec::new();
+
+        // Track brk alloc vs free separately for summary
+        let mut brk_grow_ops: u64 = 0;
+        let mut brk_grow_bytes: u64 = 0;
+        let mut brk_shrink_ops: u64 = 0;
+        let mut brk_shrink_bytes: u64 = 0;
+
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let pid = extract_u32(batch, "pid", row)?;
+                let ts = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+
+                match event_type.as_str() {
+                    "syscall_mmap_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        let stack = extract_option_stack_trace_labels(batch, row)?;
+                        pending_mmap
+                            .entry(pid)
+                            .or_default()
+                            .push_back((ts, count, stack));
+                    }
+                    "syscall_mmap_exit" => {
+                        if let Some(queue) = pending_mmap.get_mut(&pid)
+                            && let Some((enter_ts, requested_bytes, stack)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            // ret >= 0 means success (valid mapped address)
+                            if ret >= 0 {
+                                let latency = ts - enter_ts;
+                                mmap_data.push((latency, requested_bytes, pid, ts, stack));
+                                cumulative_events.push((ts, requested_bytes as i64));
+                            }
+                        }
+                    }
+                    "syscall_munmap_enter" => {
+                        let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
+                        let stack = extract_option_stack_trace_labels(batch, row)?;
+                        pending_munmap
+                            .entry(pid)
+                            .or_default()
+                            .push_back((ts, count, stack));
+                    }
+                    "syscall_munmap_exit" => {
+                        if let Some(queue) = pending_munmap.get_mut(&pid)
+                            && let Some((enter_ts, freed_bytes, stack)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            // ret == 0 means success
+                            if ret == 0 {
+                                let latency = ts - enter_ts;
+                                munmap_data.push((latency, freed_bytes, pid, ts, stack));
+                                cumulative_events.push((ts, -(freed_bytes as i64)));
+                            }
+                        }
+                    }
+                    "syscall_brk_enter" => {
+                        let stack = extract_option_stack_trace_labels(batch, row)?;
+                        pending_brk.entry(pid).or_default().push_back((ts, stack));
+                    }
+                    "syscall_brk_exit" => {
+                        if let Some(queue) = pending_brk.get_mut(&pid)
+                            && let Some((enter_ts, stack)) = queue.pop_front()
+                            && ts >= enter_ts
+                        {
+                            let ret = extract_i64(batch, "ret", row)?;
+                            if ret > 0 {
+                                if let Some(&prev_brk) = last_brk.get(&pid) {
+                                    let delta = ret - prev_brk;
+                                    if delta != 0 {
+                                        let latency = ts - enter_ts;
+                                        let abs_delta = delta.unsigned_abs();
+                                        brk_data.push((latency, abs_delta, pid, ts, stack));
+                                        cumulative_events.push((ts, delta));
+                                        if delta > 0 {
+                                            brk_grow_ops += 1;
+                                            brk_grow_bytes += abs_delta;
+                                        } else {
+                                            brk_shrink_ops += 1;
+                                            brk_shrink_bytes += abs_delta;
+                                        }
+                                    }
+                                }
+                                last_brk.insert(pid, ret);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-            })
-            .collect()
+            }
+        }
+
+        // Build per-operation stats using same helper as IO
+        let mut ops_data: OpsData = std::collections::HashMap::new();
+        if !mmap_data.is_empty() {
+            ops_data.insert("mmap", mmap_data);
+        }
+        if !munmap_data.is_empty() {
+            ops_data.insert("munmap", munmap_data);
+        }
+        if !brk_data.is_empty() {
+            ops_data.insert("brk", brk_data);
+        }
+
+        let mut by_operation: Vec<IoTypeStats> = ops_data
+            .into_iter()
+            .map(|(op, data)| compute_io_type_stats(op.to_string(), data))
+            .collect();
+        by_operation.sort_by_key(|b| std::cmp::Reverse(b.total_ops));
+
+        // Compute alloc/free totals
+        let mmap_stats = by_operation.iter().find(|s| s.operation == "mmap");
+        let munmap_stats = by_operation.iter().find(|s| s.operation == "munmap");
+
+        let total_alloc_ops = mmap_stats.map_or(0, |s| s.total_ops) + brk_grow_ops;
+        let total_alloc_bytes = mmap_stats.map_or(0, |s| s.total_bytes) + brk_grow_bytes;
+        let total_free_ops = munmap_stats.map_or(0, |s| s.total_ops) + brk_shrink_ops;
+        let total_free_bytes = munmap_stats.map_or(0, |s| s.total_bytes) + brk_shrink_bytes;
+
+        // Build cumulative memory usage timeline
+        cumulative_events.sort_by_key(|(ts, _)| *ts);
+        let mut cumulative_usage: Vec<CumulativeMemoryPoint> =
+            Vec::with_capacity(cumulative_events.len());
+        let mut running_sum: i64 = 0;
+        for (ts, delta) in &cumulative_events {
+            running_sum += delta;
+            cumulative_usage.push(CumulativeMemoryPoint {
+                ts_ns: *ts,
+                cumulative_bytes: running_sum,
+            });
+        }
+
+        Ok(MemoryStatistics {
+            by_operation,
+            total_alloc_ops,
+            total_alloc_bytes,
+            total_free_ops,
+            total_free_bytes,
+            cumulative_usage,
+            time_range_ns: (start_ns, end_ns),
+        })
     }
 
     pub async fn query_event_flamegraph(
@@ -1667,11 +1877,19 @@ mod backend {
         pid: u32,
         limit: usize,
         offset: usize,
+        event_types: &[String],
     ) -> BackendResult<EventListResponse> {
         let ctx = get_ctx()?;
 
+        let type_filter = if event_types.is_empty() {
+            String::new()
+        } else {
+            let quoted: Vec<String> = event_types.iter().map(|t| format!("'{t}'")).collect();
+            format!(" AND event_type IN ({})", quoted.join(","))
+        };
+
         let count_sql = format!(
-            "SELECT COUNT(*) as cnt FROM events WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}"
+            "SELECT COUNT(*) as cnt FROM events WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter}"
         );
         let count_df = ctx.sql(&count_sql).await?;
         let count_batches = count_df.collect().await?;
@@ -1685,7 +1903,7 @@ mod backend {
 
         let sql = format!(
             "SELECT ts_ns, event_type, pid, stack_trace FROM events \
-             WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns} \
+             WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter} \
              ORDER BY ts_ns LIMIT {limit} OFFSET {offset}"
         );
         let df = ctx.sql(&sql).await?;
@@ -1700,6 +1918,7 @@ mod backend {
                 let stack_trace = extract_option_stack_trace_labels(batch, row)?;
                 events.push(EventDetail {
                     ts_ns,
+                    latency_ns: None,
                     event_type,
                     pid,
                     stack_trace,
@@ -1816,12 +2035,21 @@ pub async fn query_io_statistics(
     backend::query_io_statistics(start_ns, end_ns, pid).await
 }
 
+pub async fn query_memory_statistics(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+) -> Result<MemoryStatistics, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_memory_statistics(start_ns, end_ns, pid).await
+}
+
 pub async fn query_event_list(
     start_ns: u64,
     end_ns: u64,
     pid: u32,
     limit: usize,
     offset: usize,
+    event_types: &[String],
 ) -> Result<EventListResponse, Box<dyn std::error::Error + Send + Sync>> {
-    backend::query_event_list(start_ns, end_ns, pid, limit, offset).await
+    backend::query_event_list(start_ns, end_ns, pid, limit, offset, event_types).await
 }

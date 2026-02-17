@@ -1,7 +1,7 @@
-# probex
+# probex 
 
-`probex` is a low-friction Linux profiler.
-It runs a command, collects everything you need, and visualizes it.
+`probex` is the missing Linux profiler you've been waiting for.
+It is low-friction, easy to use, and works out of the box.
 
 ## Usage
 
@@ -34,9 +34,8 @@ tar -xzf probex.tar.gz
 sudo ./probex -- sleep 1
 ```
 
-## What it looks like
-![](doc/screenshots/screenshot.png)
-
+## Demo 
+<video src="https://github.com/user-attachments/assets/5d66ac40-fefc-4cbb-9edc-2fa31e358ae7" controls="controls"></video>
 
 #### Frame pointers
 

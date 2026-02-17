@@ -29,6 +29,7 @@ pub enum EventType {
     SyscallFsyncExit = 22,
     SyscallFdatasyncEnter = 23,
     SyscallFdatasyncExit = 24,
+    IoUringComplete = 25,
 }
 
 impl TryFrom<u8> for EventType {
@@ -61,6 +62,7 @@ impl TryFrom<u8> for EventType {
             22 => Ok(EventType::SyscallFsyncExit),
             23 => Ok(EventType::SyscallFdatasyncEnter),
             24 => Ok(EventType::SyscallFdatasyncExit),
+            25 => Ok(EventType::IoUringComplete),
             v => Err(v),
         }
     }
@@ -167,6 +169,21 @@ pub struct SyscallExitEvent {
     pub ret: i64,
 }
 
+/// io_uring completion event — emitted when a CQE is posted.
+/// Latency = header.timestamp_ns - submit_ts_ns.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct IoUringCompleteEvent {
+    pub header: EventHeader,
+    /// Timestamp (ktime_get_ns) when the SQE was submitted via io_uring_submit_req.
+    pub submit_ts_ns: u64,
+    /// io_uring opcode (IORING_OP_*).
+    pub opcode: u8,
+    pub _padding: [u8; 3],
+    /// CQE result — bytes transferred for read/write, or negative errno.
+    pub res: i32,
+}
+
 // Constants for event sizes
 pub const SCHED_SWITCH_EVENT_SIZE: usize = core::mem::size_of::<SchedSwitchEvent>();
 pub const PROCESS_FORK_EVENT_SIZE: usize = core::mem::size_of::<ProcessForkEvent>();
@@ -174,6 +191,7 @@ pub const PROCESS_EXIT_EVENT_SIZE: usize = core::mem::size_of::<ProcessExitEvent
 pub const PAGE_FAULT_EVENT_SIZE: usize = core::mem::size_of::<PageFaultEvent>();
 pub const SYSCALL_ENTER_EVENT_SIZE: usize = core::mem::size_of::<SyscallEnterEvent>();
 pub const SYSCALL_EXIT_EVENT_SIZE: usize = core::mem::size_of::<SyscallExitEvent>();
+pub const IO_URING_COMPLETE_EVENT_SIZE: usize = core::mem::size_of::<IoUringCompleteEvent>();
 pub const CPU_SAMPLE_EVENT_SIZE: usize = core::mem::size_of::<CpuSampleEvent>();
 
 // Ring buffer size
@@ -181,6 +199,9 @@ pub const RING_BUF_SIZE: u32 = 64 * 1024 * 1024;
 
 // Maximum number of tracked PIDs
 pub const MAX_TRACKED_PIDS: u32 = 8192;
+
+// Maximum number of in-flight io_uring requests tracked for latency
+pub const MAX_IO_URING_INFLIGHT: u32 = 16384;
 
 #[cfg(feature = "viewer-api")]
 pub mod viewer_api {
@@ -219,6 +240,7 @@ pub mod viewer_api {
     pub struct SyscallLatencyStats {
         pub read: LatencySummary,
         pub write: LatencySummary,
+        pub io_uring: LatencySummary,
         pub mmap_alloc_bytes: u64,
         pub munmap_free_bytes: u64,
     }
@@ -239,10 +261,9 @@ pub mod viewer_api {
         pub process_name: Option<String>,
         pub parent_pid: Option<u32>,
         pub start_ns: u64,
-        pub end_ns: Option<u64>,
-        pub exit_code: Option<i32>,
+        pub end_ns: u64,
+        pub exit: Option<i32>,
         pub was_forked: bool,
-        pub did_exit: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -481,47 +502,51 @@ pub mod viewer_api {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct LatencyBucket {
-        pub min_ns: u64,
-        pub max_ns: u64,
-        pub count: u64,
-        pub label: String,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct SizeBucket {
-        pub min_bytes: u64,
-        pub max_bytes: u64,
-        pub count: u64,
-        pub label: String,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct IoTypeStats {
         pub operation: String,
         pub total_ops: u64,
         pub total_bytes: u64,
         pub avg_latency_ns: u64,
-        pub p50_ns: u64,
-        pub p95_ns: u64,
-        pub p99_ns: u64,
-        pub max_ns: u64,
-        pub latency_histogram: Vec<LatencyBucket>,
-        pub size_histogram: Vec<SizeBucket>,
+        /// Representative events for percentiles
+        pub p50_event: Option<EventDetail>,
+        pub p95_event: Option<EventDetail>,
+        pub p99_event: Option<EventDetail>,
+        pub max_event: Option<EventDetail>,
+        /// Sorted raw latency values in nanoseconds.
+        pub latencies_ns: Vec<u64>,
+        /// Sorted raw size values in bytes.
+        pub sizes_bytes: Vec<u64>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct IoStatistics {
         pub by_operation: Vec<IoTypeStats>,
-        pub size_histogram: Vec<SizeBucket>,
         pub total_ops: u64,
         pub total_bytes: u64,
         pub time_range_ns: (u64, u64),
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct CumulativeMemoryPoint {
+        pub ts_ns: u64,
+        pub cumulative_bytes: i64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct MemoryStatistics {
+        pub by_operation: Vec<IoTypeStats>,
+        pub total_alloc_ops: u64,
+        pub total_alloc_bytes: u64,
+        pub total_free_ops: u64,
+        pub total_free_bytes: u64,
+        pub cumulative_usage: Vec<CumulativeMemoryPoint>,
+        pub time_range_ns: (u64, u64),
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct EventDetail {
         pub ts_ns: u64,
+        pub latency_ns: Option<u64>,
         pub event_type: String,
         pub pid: u32,
         pub stack_trace: Option<Vec<String>>,

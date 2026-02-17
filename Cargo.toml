@@ -36,6 +36,7 @@ tokio = { version = "1.40.0", default-features = false }
 arrow = { version = "57", default-features = false }
 parquet = { version = "57", default-features = false, features = ["arrow", "snap"] }
 which = { version = "6.0.0", default-features = false }
+charming = { version = "0.6", default-features = false, features = ["wasm"] }
 dioxus = { version = "0.7", default-features = false }
 datafusion = { version = "52", default-features = false, features = ["parquet", "sql"] }
 
