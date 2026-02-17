@@ -17,6 +17,22 @@ use std::{
 };
 
 const MAX_CUSTOM_VALUES: usize = 8;
+const EMBEDDED_EBPF_CARGO_TOML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../probex-ebpf/Cargo.toml"
+));
+const EMBEDDED_EBPF_BUILD_RS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../probex-ebpf/build.rs"
+));
+const EMBEDDED_EBPF_LIB_RS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../probex-ebpf/src/lib.rs"
+));
+const EMBEDDED_EBPF_MAIN_RS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../probex-ebpf/src/main.rs"
+));
 
 #[derive(Clone, Debug)]
 struct TracepointField {
@@ -629,6 +645,101 @@ fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<()> {
     Ok(())
 }
 
+fn write_embedded_ebpf_scaffold(scaffold_root: &Path, probex_common_root: &Path) -> Result<()> {
+    fs::create_dir_all(scaffold_root.join("src")).with_context(|| {
+        format!(
+            "failed to create embedded scaffold src dir '{}'",
+            scaffold_root.join("src").display()
+        )
+    })?;
+
+    let probex_common_path = probex_common_root
+        .to_str()
+        .ok_or_else(|| anyhow!("probex-common path is not valid UTF-8"))?;
+    let mut cargo_toml = EMBEDDED_EBPF_CARGO_TOML.to_string();
+    let old_dep = "path = \"../probex-common\"";
+    let new_dep = format!("path = \"{}\"", probex_common_path.replace('\\', "\\\\"));
+    let replacements = [
+        ("edition.workspace = true", "edition = \"2024\""),
+        (
+            "license.workspace = true",
+            "license = \"MIT OR Apache-2.0\"",
+        ),
+        (
+            "repository.workspace = true",
+            "repository = \"https://github.com/XiangpengHao/probex\"",
+        ),
+        (
+            "homepage.workspace = true",
+            "homepage = \"https://github.com/XiangpengHao/probex\"",
+        ),
+        (
+            "aya-ebpf = { workspace = true }",
+            "aya-ebpf = { version = \"0.1.1\", default-features = false }",
+        ),
+        (
+            "aya-log-ebpf = { workspace = true }",
+            "aya-log-ebpf = { version = \"0.1.0\", default-features = false }",
+        ),
+        (
+            "which = { workspace = true }",
+            "which = { version = \"6.0.0\", default-features = false }",
+        ),
+    ];
+
+    if !cargo_toml.contains(old_dep) {
+        return Err(anyhow!(
+            "embedded probex-ebpf Cargo.toml missing expected dependency marker '{}'",
+            old_dep
+        ));
+    }
+    cargo_toml = cargo_toml.replace(old_dep, &new_dep);
+    for (from, to) in replacements {
+        if !cargo_toml.contains(from) {
+            return Err(anyhow!(
+                "embedded probex-ebpf Cargo.toml missing expected marker '{}'",
+                from
+            ));
+        }
+        cargo_toml = cargo_toml.replace(from, to);
+    }
+
+    fs::write(scaffold_root.join("Cargo.toml"), cargo_toml).with_context(|| {
+        format!(
+            "failed to write embedded scaffold file '{}'",
+            scaffold_root.join("Cargo.toml").display()
+        )
+    })?;
+    fs::write(scaffold_root.join("build.rs"), EMBEDDED_EBPF_BUILD_RS).with_context(|| {
+        format!(
+            "failed to write embedded scaffold file '{}'",
+            scaffold_root.join("build.rs").display()
+        )
+    })?;
+    fs::write(
+        scaffold_root.join("src").join("lib.rs"),
+        EMBEDDED_EBPF_LIB_RS,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write embedded scaffold file '{}'",
+            scaffold_root.join("src").join("lib.rs").display()
+        )
+    })?;
+    fs::write(
+        scaffold_root.join("src").join("main.rs"),
+        EMBEDDED_EBPF_MAIN_RS,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write embedded scaffold file '{}'",
+            scaffold_root.join("src").join("main.rs").display()
+        )
+    })?;
+
+    Ok(())
+}
+
 pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
@@ -637,11 +748,26 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     let build_root = std::env::temp_dir()
         .join("probex-generated")
         .join(format!("{key:016x}"));
+    let target = bpf_target_triple_runtime();
+    let built_binary = build_root
+        .join("target")
+        .join(&target)
+        .join("release")
+        .join("probex");
+    if built_binary.is_file() {
+        return fs::read(&built_binary).with_context(|| {
+            format!(
+                "failed to read cached generated ebpf binary '{}'",
+                built_binary.display()
+            )
+        });
+    }
+
     let drop_target = resolve_cargo_drop_target()?;
-    if drop_target.is_some() && build_root.exists() {
+    if build_root.exists() {
         fs::remove_dir_all(&build_root).with_context(|| {
             format!(
-                "failed to clear generated build directory before privilege drop '{}'",
+                "failed to clear generated build directory '{}'",
                 build_root.display()
             )
         })?;
@@ -664,7 +790,10 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     let workspace_root = probex_manifest_dir
         .parent()
         .ok_or_else(|| anyhow!("failed to resolve workspace root"))?;
-    let ebpf_root = workspace_root.join("probex-ebpf");
+    let probex_common_root = workspace_root.join("probex-common");
+    let ebpf_root = build_root.join("probex-ebpf");
+    write_embedded_ebpf_scaffold(&ebpf_root, &probex_common_root)?;
+
     let target_dir = build_root.join("target");
     fs::create_dir_all(&target_dir).with_context(|| {
         format!(
@@ -672,7 +801,6 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
             target_dir.display()
         )
     })?;
-    let target = bpf_target_triple_runtime();
     let arch = bpf_target_arch_runtime();
     let mut rustflags = OsString::from("--cfg=bpf_target_arch=\"");
     rustflags.push(&arch);
@@ -682,6 +810,7 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     let mut cmd = Command::new(&cargo_bin);
     if let Some((uid, gid)) = drop_target {
         chown_path(&build_root, uid, gid)?;
+        chown_path(&ebpf_root, uid, gid)?;
         chown_path(&generated_path, uid, gid)?;
         chown_path(&target_dir, uid, gid)?;
         cmd.uid(uid).gid(gid);
@@ -736,7 +865,6 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
         return Err(anyhow!(message));
     }
 
-    let built_binary = target_dir.join(target).join("release").join("probex");
     fs::read(&built_binary).with_context(|| {
         format!(
             "failed to read generated ebpf binary '{}'",
