@@ -10,6 +10,7 @@ fn ensure_ebpf_binary() -> anyhow::Result<()> {
     println!("cargo:rerun-if-changed=assets/ebpf");
     println!("cargo:rerun-if-env-changed=PROBEX_SKIP_EBPF_BUILD");
     println!("cargo:rerun-if-env-changed=PROBEX_FORCE_EBPF_BUILD");
+    println!("cargo:rerun-if-env-changed=PROBEX_NO_BUILD_STD");
 
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR")
@@ -76,18 +77,14 @@ fn build_ebpf_from_source(output_binary: &Path) -> anyhow::Result<()> {
     let mut cmd = Command::new(&cargo_bin);
     cmd.current_dir(root_dir)
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
-        .args([
-            "build",
-            "--package",
-            "probex-ebpf",
-            "-Z",
-            "build-std=core",
-            "--bins",
-            "--release",
-            "--target",
-            target.as_str(),
-            "--target-dir",
-        ])
+        .args(["build", "--package", "probex-ebpf"]);
+
+    // Skip -Z build-std=core when using a toolchain with precompiled BPF targets (e.g. nixpkgs rustc).
+    if std::env::var("PROBEX_NO_BUILD_STD").as_deref() != Ok("1") {
+        cmd.args(["-Z", "build-std=core"]);
+    }
+
+    cmd.args(["--bins", "--release", "--target", target.as_str(), "--target-dir"])
         .arg(&target_dir);
 
     let status = cmd
