@@ -308,6 +308,8 @@ pub mod viewer_api {
     pub struct ProbeSchemaArg {
         pub name: String,
         pub arg_type: String,
+        pub is_supported: bool,
+        pub unsupported_reason: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +321,8 @@ pub mod viewer_api {
         pub size: u32,
         pub is_signed: bool,
         pub is_common: bool,
+        pub is_supported: bool,
+        pub unsupported_reason: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,6 +335,8 @@ pub mod viewer_api {
         pub kind: ProbeSchemaKind,
         pub source: ProbeSchemaSource,
         pub return_type: Option<String>,
+        pub return_supported: bool,
+        pub return_unsupported_reason: Option<String>,
         pub args: Vec<ProbeSchemaArg>,
         pub fields: Vec<ProbeSchemaField>,
     }

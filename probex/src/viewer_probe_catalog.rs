@@ -40,6 +40,74 @@ struct FunctionSignature {
     args: Vec<ProbeSchemaArg>,
 }
 
+fn supported_integer_type_reason(field_type: &str) -> Option<String> {
+    let normalized = field_type
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "const" | "volatile" | "restrict" | "__user" | "__rcu" | "__iomem"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let supported = matches!(
+        normalized.as_str(),
+        "u8" | "u16"
+            | "u32"
+            | "u64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "__u8"
+            | "__u16"
+            | "__u32"
+            | "__u64"
+            | "__s8"
+            | "__s16"
+            | "__s32"
+            | "__s64"
+            | "bool"
+            | "_bool"
+            | "char"
+            | "signed char"
+            | "unsigned char"
+            | "short"
+            | "short int"
+            | "signed short"
+            | "signed short int"
+            | "unsigned short"
+            | "unsigned short int"
+            | "int"
+            | "signed"
+            | "signed int"
+            | "unsigned"
+            | "unsigned int"
+            | "long"
+            | "long int"
+            | "signed long"
+            | "signed long int"
+            | "unsigned long"
+            | "unsigned long int"
+            | "long long"
+            | "long long int"
+            | "signed long long"
+            | "signed long long int"
+            | "unsigned long long"
+            | "unsigned long long int"
+    );
+    if supported {
+        None
+    } else {
+        Some(format!(
+            "unsupported type '{}'; only integer/bool scalar types are supported",
+            field_type
+        ))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProbeSchemasQuery {
     pub search: Option<String>,
@@ -176,13 +244,18 @@ fn build_function_signatures_from_btf(
         let args = params
             .into_iter()
             .enumerate()
-            .map(|(idx, (name, arg_type))| ProbeSchemaArg {
-                name: if name.is_empty() {
-                    format!("arg{idx}")
-                } else {
-                    name
-                },
-                arg_type,
+            .map(|(idx, (name, arg_type))| {
+                let unsupported_reason = supported_integer_type_reason(&arg_type);
+                ProbeSchemaArg {
+                    name: if name.is_empty() {
+                        format!("arg{idx}")
+                    } else {
+                        name
+                    },
+                    arg_type,
+                    is_supported: unsupported_reason.is_none(),
+                    unsupported_reason,
+                }
             })
             .collect::<Vec<_>>();
         by_name.insert(
@@ -208,6 +281,10 @@ fn build_function_probe_schemas(
             (ProbeSchemaKind::Fentry, "fentry"),
             (ProbeSchemaKind::Fexit, "fexit"),
         ] {
+            let return_unsupported_reason = signature
+                .return_type
+                .as_ref()
+                .and_then(|ty| supported_integer_type_reason(ty));
             probes.push(ProbeSchema {
                 display_name: format!("{provider}:{symbol}"),
                 provider: provider.to_string(),
@@ -217,6 +294,8 @@ fn build_function_probe_schemas(
                 kind: kind.clone(),
                 source: ProbeSchemaSource::KernelBtf,
                 return_type: signature.return_type.clone(),
+                return_supported: return_unsupported_reason.is_none(),
+                return_unsupported_reason,
                 args: signature.args.clone(),
                 fields: Vec::new(),
             });
@@ -276,6 +355,8 @@ fn ensure_probe_index_loading() {
                     kind: ProbeSchemaKind::Tracepoint,
                     source: ProbeSchemaSource::TraceFsFormat,
                     return_type: None,
+                    return_supported: true,
+                    return_unsupported_reason: None,
                     args: Vec::new(),
                     fields: Vec::new(),
                 });
@@ -341,14 +422,33 @@ fn load_tracepoint_fields(schema: &ProbeSchema) -> ProbeCatalogResult<Vec<ProbeS
 
     let fields = tracepoint_format::load_tracepoint_fields(&schema.target, &schema.probe)?
         .into_iter()
-        .map(|field| ProbeSchemaField {
-            declaration: field.declaration,
-            name: field.name,
-            field_type: field.field_type,
-            offset: field.offset,
-            size: field.size,
-            is_signed: field.is_signed,
-            is_common: field.is_common,
+        .map(|field| {
+            let field_type_lower = field.field_type.to_ascii_lowercase();
+            let unsupported_reason = if field_type_lower.contains("void") {
+                Some(format!(
+                    "unsupported type '{}'; void-typed fields are not supported",
+                    field.field_type
+                ))
+            } else {
+                match field.size {
+                    1 | 2 | 4 | 8 => None,
+                    _ => Some(format!(
+                        "unsupported field size {}; only 1/2/4/8-byte scalar fields are supported",
+                        field.size
+                    )),
+                }
+            };
+            ProbeSchemaField {
+                declaration: field.declaration,
+                name: field.name,
+                field_type: field.field_type,
+                offset: field.offset,
+                size: field.size,
+                is_signed: field.is_signed,
+                is_common: field.is_common,
+                is_supported: unsupported_reason.is_none(),
+                unsupported_reason,
+            }
         })
         .collect::<Vec<_>>();
     cache

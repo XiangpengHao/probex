@@ -50,12 +50,15 @@ fn parse_field_declaration(declaration: &str) -> TracepointFormatResult<(String,
     })?;
     let stars = raw_var_token.chars().take_while(|ch| *ch == '*').count();
     let var_without_stars = &raw_var_token[stars..];
-    let name = var_without_stars
-        .split('[')
-        .next()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
+    let (name_token, array_suffix) = if let Some(array_pos) = var_without_stars.find('[') {
+        (
+            &var_without_stars[..array_pos],
+            &var_without_stars[array_pos..],
+        )
+    } else {
+        (var_without_stars, "")
+    };
+    let name = name_token.trim().to_string();
     if name.is_empty() {
         return Err(IoError::new(
             ErrorKind::InvalidData,
@@ -76,6 +79,9 @@ fn parse_field_declaration(declaration: &str) -> TracepointFormatResult<(String,
             field_type.push(' ');
         }
         field_type.push_str(&"*".repeat(stars));
+    }
+    if !array_suffix.is_empty() {
+        field_type.push_str(array_suffix);
     }
     if field_type.is_empty() {
         return Err(IoError::new(

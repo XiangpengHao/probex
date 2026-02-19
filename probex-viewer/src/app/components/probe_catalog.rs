@@ -550,16 +550,26 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
                                             } else {
                                                 div { class: "space-y-1",
                                                     {options.iter().map(|opt| {
-                                                        let disabled = is_fentry_ret_option(&schema, &opt.key);
+                                                        let disabled_reason =
+                                                            unsupported_option_reason(&schema, &options, &opt.key);
+                                                        let disabled = disabled_reason.is_some();
+                                                        let is_ret_forbidden = is_fentry_ret_option(&schema, &opt.key);
+                                                        let disabled_reason_text = disabled_reason
+                                                            .clone()
+                                                            .unwrap_or_else(|| "unsupported field".to_string());
                                                         let checked = !disabled
                                                             && config.record_fields.iter().any(|key| key == &opt.key);
                                                         rsx! {
                                                             label {
                                                                 key: "{active_id}:record:{opt.key}",
                                                                 class: if disabled {
-                                                                    "flex items-center gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-400 cursor-not-allowed line-through"
+                                                                    if is_ret_forbidden {
+                                                                        "flex items-center justify-between gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-400 cursor-not-allowed line-through"
+                                                                    } else {
+                                                                        "flex items-center justify-between gap-2 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-[10px] text-amber-800 cursor-not-allowed"
+                                                                    }
                                                                 } else {
-                                                                    "flex items-center gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-700 cursor-pointer"
+                                                                    "flex items-center justify-between gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-700 cursor-pointer"
                                                                 },
                                                                 input {
                                                                     r#type: "checkbox",
@@ -584,7 +594,16 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
                                                                         }
                                                                     },
                                                                 }
-                                                                span { class: "font-mono truncate", "{opt.label} [{opt.field_type}]" }
+                                                                div { class: "min-w-0 flex items-center gap-1",
+                                                                    span { class: "font-mono truncate", "{opt.label} [{opt.field_type}]" }
+                                                                    if disabled {
+                                                                        span {
+                                                                            class: "inline-flex items-center rounded-full bg-amber-200 text-amber-900 px-1 py-0.5 text-[9px] font-semibold",
+                                                                            title: "{disabled_reason_text}",
+                                                                            "!"
+                                                                        }
+                                                                    }
+                                                                }
                                                             }
                                                         }
                                                     })}
@@ -604,9 +623,9 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
                                                     {config.filters.iter().enumerate().map(|(idx, rule)| {
                                                         let selected_ty = options
                                                             .iter()
-                                                            .find(|opt| opt.key == rule.field_key)
+                                                            .find(|opt| opt.key == rule.field_key && opt.is_supported)
                                                             .map(|opt| opt.field_type.clone())
-                                                            .unwrap_or_default();
+                                                            .unwrap_or_else(|| "u64".to_string());
                                                         let kind = infer_filter_kind(&selected_ty);
                                                         let operators = filter_operators(kind);
                                                         let active_op = if operators.iter().any(|op| *op == rule.operator.as_str()) {
@@ -633,7 +652,7 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
                                                                                     filter.field_key = next_key.clone();
                                                                                     let next_kind = options
                                                                                         .iter()
-                                                                                        .find(|opt| opt.key == next_key)
+                                                                                        .find(|opt| opt.key == next_key && opt.is_supported)
                                                                                         .map(|opt| infer_filter_kind(&opt.field_type))
                                                                                         .unwrap_or(MockFilterKind::Integer);
                                                                                     filter.operator = filter_operators(next_kind)[0].to_string();
@@ -642,7 +661,12 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
                                                                             }
                                                                         },
                                                                         {options.iter().map(|opt| rsx! {
-                                                                            option { key: "{active_id}:filter-opt:{idx}:{opt.key}", value: "{opt.key}", "{opt.label} [{opt.field_type}]" }
+                                                                            option {
+                                                                                key: "{active_id}:filter-opt:{idx}:{opt.key}",
+                                                                                value: "{opt.key}",
+                                                                                disabled: !opt.is_supported,
+                                                                                "{opt.label} [{opt.field_type}]"
+                                                                            }
                                                                         })}
                                                                     }
                                                                     div { class: "flex items-center gap-1",
@@ -710,15 +734,14 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
                                             }
                                             button {
                                                 class: "px-2 py-1 text-[11px] rounded border border-gray-200 bg-white text-gray-700 cursor-pointer",
-                                                disabled: options.is_empty(),
+                                                disabled: !options.iter().any(|opt| opt.is_supported),
                                                 onclick: {
                                                     let active_id = active_id.clone();
                                                     let options = options.clone();
                                                     move |_| {
-                                                        if options.is_empty() {
+                                                        let Some(first) = options.iter().find(|opt| opt.is_supported).cloned() else {
                                                             return;
-                                                        }
-                                                        let first = options[0].clone();
+                                                        };
                                                         let kind = infer_filter_kind(&first.field_type);
                                                         let mut all = probe_configs();
                                                         let cfg = all.entry(active_id.clone()).or_default();
@@ -814,6 +837,8 @@ struct MockFieldOption {
     key: String,
     label: String,
     field_type: String,
+    is_supported: bool,
+    unsupported_reason: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -831,6 +856,8 @@ fn mock_filter_field_options(probe: &ProbeSchema) -> Vec<MockFieldOption> {
             key: format!("field:{}", field.name),
             label: format!("field {}", field.name),
             field_type: field.field_type.clone(),
+            is_supported: field.is_supported,
+            unsupported_reason: field.unsupported_reason.clone(),
         });
     }
     for arg in &probe.args {
@@ -838,13 +865,18 @@ fn mock_filter_field_options(probe: &ProbeSchema) -> Vec<MockFieldOption> {
             key: format!("arg:{}", arg.name),
             label: format!("arg {}", arg.name),
             field_type: arg.arg_type.clone(),
+            is_supported: arg.is_supported,
+            unsupported_reason: arg.unsupported_reason.clone(),
         });
     }
     if let Some(ret) = &probe.return_type {
+        let unsupported_reason = probe.return_unsupported_reason.clone();
         options.push(MockFieldOption {
             key: "ret".to_string(),
             label: "ret".to_string(),
             field_type: ret.clone(),
+            is_supported: probe.return_supported,
+            unsupported_reason,
         });
     }
     options
@@ -852,6 +884,23 @@ fn mock_filter_field_options(probe: &ProbeSchema) -> Vec<MockFieldOption> {
 
 fn is_fentry_ret_option(schema: &ProbeSchema, key: &str) -> bool {
     schema.kind == ProbeSchemaKind::Fentry && key == "ret"
+}
+
+fn unsupported_option_reason(
+    schema: &ProbeSchema,
+    options: &[MockFieldOption],
+    key: &str,
+) -> Option<String> {
+    if is_fentry_ret_option(schema, key) {
+        return Some("fentry probes cannot use return value".to_string());
+    }
+    options.iter().find(|opt| opt.key == key).and_then(|opt| {
+        (!opt.is_supported).then(|| {
+            opt.unsupported_reason
+                .clone()
+                .unwrap_or_else(|| "unsupported field type".to_string())
+        })
+    })
 }
 
 fn infer_filter_kind(ty: &str) -> MockFilterKind {
@@ -929,10 +978,11 @@ fn build_custom_probe_specs(
             continue;
         };
         let cfg = configs.get(probe_display_name).cloned().unwrap_or_default();
+        let options = mock_filter_field_options(schema);
 
         let mut record_fields = Vec::new();
         for key in &cfg.record_fields {
-            if is_fentry_ret_option(schema, key) {
+            if unsupported_option_reason(schema, &options, key).is_some() {
                 continue;
             }
             if let Some(field_ref) = parse_field_ref(key) {
@@ -942,7 +992,7 @@ fn build_custom_probe_specs(
 
         let mut filters = Vec::new();
         for rule in &cfg.filters {
-            if is_fentry_ret_option(schema, &rule.field_key) {
+            if unsupported_option_reason(schema, &options, &rule.field_key).is_some() {
                 continue;
             }
             let Some(field) = parse_field_ref(&rule.field_key) else {
