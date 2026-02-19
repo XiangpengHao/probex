@@ -175,6 +175,8 @@ fn apply_runtime_step_error(state: &mut TraceRuntimeState, error_text: &str) {
         Some("spawn_target")
     } else if error_text.contains("step=insert_traced_pid")
         || error_text.contains("step=attach_tracepoint")
+        || error_text.contains("step=attach_fentry")
+        || error_text.contains("step=attach_fexit")
     {
         Some("attach_probes")
     } else {
@@ -433,16 +435,6 @@ async fn validate_custom_probes(
                     ),
                 )
             })?;
-        if schema.kind != ProbeSchemaKind::Tracepoint {
-            return Err(IoError::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "custom probe '{}' is kind '{:?}', but runtime custom probes currently support tracepoint only",
-                    spec.probe_display_name, schema.kind
-                ),
-            )
-            .into());
-        }
         resolved_schemas.insert(spec.probe_display_name.clone(), schema.clone());
 
         for field_ref in &spec.record_fields {
@@ -454,6 +446,38 @@ async fn validate_custom_probes(
                     format!(
                         "custom probe '{}' cannot record 'ret' for fentry probes",
                         spec.probe_display_name
+                    ),
+                )
+                .into());
+            }
+            if let CustomProbeFieldRef::Arg { name } = field_ref {
+                if let Some(arg) = schema.args.iter().find(|arg| &arg.name == name)
+                    && !arg.is_supported
+                {
+                    let reason = arg
+                        .unsupported_reason
+                        .clone()
+                        .unwrap_or_else(|| "unsupported argument type".to_string());
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "custom probe '{}' cannot record arg '{}' ({})",
+                            spec.probe_display_name, name, reason
+                        ),
+                    )
+                    .into());
+                }
+            }
+            if matches!(field_ref, CustomProbeFieldRef::Return) && !schema.return_supported {
+                let reason = schema
+                    .return_unsupported_reason
+                    .clone()
+                    .unwrap_or_else(|| "unsupported return type".to_string());
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "custom probe '{}' cannot record return value ({})",
+                        spec.probe_display_name, reason
                     ),
                 )
                 .into());
@@ -480,6 +504,38 @@ async fn validate_custom_probes(
                     format!(
                         "custom probe '{}' cannot filter on 'ret' for fentry probes",
                         spec.probe_display_name
+                    ),
+                )
+                .into());
+            }
+            if let CustomProbeFieldRef::Arg { name } = &filter.field {
+                if let Some(arg) = schema.args.iter().find(|arg| &arg.name == name)
+                    && !arg.is_supported
+                {
+                    let reason = arg
+                        .unsupported_reason
+                        .clone()
+                        .unwrap_or_else(|| "unsupported argument type".to_string());
+                    return Err(IoError::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "custom probe '{}' cannot filter on arg '{}' ({})",
+                            spec.probe_display_name, name, reason
+                        ),
+                    )
+                    .into());
+                }
+            }
+            if matches!(filter.field, CustomProbeFieldRef::Return) && !schema.return_supported {
+                let reason = schema
+                    .return_unsupported_reason
+                    .clone()
+                    .unwrap_or_else(|| "unsupported return type".to_string());
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "custom probe '{}' cannot filter on return value ({})",
+                        spec.probe_display_name, reason
                     ),
                 )
                 .into());

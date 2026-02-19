@@ -9,6 +9,11 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
     programs::{PerfEventContext, TracePointContext},
 };
+#[cfg(probex_generated_probes)]
+use aya_ebpf::{
+    macros::{fentry, fexit},
+    programs::{FEntryContext, FExitContext},
+};
 use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STAT_USER_STACK,

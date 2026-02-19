@@ -3,8 +3,9 @@
 //! (Flow diagram omitted for brevity - see README)
 
 use crate::custom_codegen::{
-    CompiledCustomPlan, CustomProbeRuntimeEvent, build_generated_ebpf_binary,
-    compile_custom_probe_plan, generate_custom_probe_source, generate_custom_probe_source_preview,
+    CompiledCustomPlan, CompiledCustomProbeKind, CustomProbeRuntimeEvent,
+    build_generated_ebpf_binary, compile_custom_probe_plan, generate_custom_probe_source,
+    generate_custom_probe_source_preview,
 };
 use anyhow::{Context as _, Result, anyhow};
 use arrow::{
@@ -17,9 +18,10 @@ use arrow::{
     record_batch::{RecordBatch, RecordBatchReader},
 };
 use aya::{
+    Btf,
     maps::{HashMap as AyaHashMap, MapData, PerCpuArray, RingBuf, StackTraceMap},
     programs::{
-        TracePoint,
+        FEntry, FExit, TracePoint,
         perf_event::{PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy, perf_sw_ids},
     },
     util::kernel_symbols,
@@ -98,10 +100,7 @@ struct Args {
     sample_freq: u64,
 
     /// Command to run
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
@@ -1564,6 +1563,33 @@ fn attach_tracepoint(
     Ok(())
 }
 
+fn attach_fentry(
+    ebpf: &mut aya::Ebpf,
+    btf: &Btf,
+    program_name: &str,
+    function: &str,
+) -> Result<()> {
+    let program: &mut FEntry = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {} not found", program_name))?
+        .try_into()?;
+    program.load(function, btf)?;
+    program.attach()?;
+    debug!("Attached fentry {}", function);
+    Ok(())
+}
+
+fn attach_fexit(ebpf: &mut aya::Ebpf, btf: &Btf, program_name: &str, function: &str) -> Result<()> {
+    let program: &mut FExit = ebpf
+        .program_mut(program_name)
+        .ok_or_else(|| anyhow!("program {} not found", program_name))?
+        .try_into()?;
+    program.load(function, btf)?;
+    program.attach()?;
+    debug!("Attached fexit {}", function);
+    Ok(())
+}
+
 fn attach_cpu_sampler(ebpf: &mut aya::Ebpf, target_pid: u32, frequency_hz: u64) -> Result<()> {
     if frequency_hz == 0 {
         return Err(anyhow!("--sample-freq must be greater than 0"));
@@ -1982,14 +2008,57 @@ pub(crate) async fn run_trace_command(
             .cloned()
             .collect::<Vec<_>>();
         probes.sort_by_key(|probe| probe.probe_id);
+        let mut kernel_btf = None;
         for probe in probes {
-            attach_tracepoint(
-                &mut ebpf,
-                probe.program_name.as_str(),
-                probe.category.as_str(),
-                probe.probe_name.as_str(),
-            )
-            .with_context(|| format!("step=attach_tracepoint failed: {}", probe.program_name))?;
+            match probe.kind {
+                CompiledCustomProbeKind::Tracepoint => {
+                    attach_tracepoint(
+                        &mut ebpf,
+                        probe.program_name.as_str(),
+                        probe.category.as_str(),
+                        probe.probe_name.as_str(),
+                    )
+                    .with_context(|| {
+                        format!("step=attach_tracepoint failed: {}", probe.program_name)
+                    })?;
+                }
+                CompiledCustomProbeKind::Fentry => {
+                    if kernel_btf.is_none() {
+                        kernel_btf = Some(Btf::from_sys_fs().with_context(
+                            || "step=load_kernel_btf failed for fentry/fexit custom probes",
+                        )?);
+                    }
+                    let btf = kernel_btf
+                        .as_ref()
+                        .expect("kernel_btf should be initialized before fentry attach");
+                    attach_fentry(
+                        &mut ebpf,
+                        btf,
+                        probe.program_name.as_str(),
+                        probe.probe_name.as_str(),
+                    )
+                    .with_context(|| {
+                        format!("step=attach_fentry failed: {}", probe.program_name)
+                    })?;
+                }
+                CompiledCustomProbeKind::Fexit => {
+                    if kernel_btf.is_none() {
+                        kernel_btf = Some(Btf::from_sys_fs().with_context(
+                            || "step=load_kernel_btf failed for fentry/fexit custom probes",
+                        )?);
+                    }
+                    let btf = kernel_btf
+                        .as_ref()
+                        .expect("kernel_btf should be initialized before fexit attach");
+                    attach_fexit(
+                        &mut ebpf,
+                        btf,
+                        probe.program_name.as_str(),
+                        probe.probe_name.as_str(),
+                    )
+                    .with_context(|| format!("step=attach_fexit failed: {}", probe.program_name))?;
+                }
+            }
         }
     }
     let target_pid = u32::try_from(child_pid.as_raw())

@@ -38,11 +38,17 @@ const EMBEDDED_EBPF_MAIN_RS: &str = include_str!(concat!(
 ));
 
 #[derive(Clone, Debug)]
-struct TracepointField {
-    name: String,
-    offset: u32,
-    size: u32,
-    signed: bool,
+pub(crate) enum CompiledCustomProbeKind {
+    Tracepoint,
+    Fentry,
+    Fexit,
+}
+
+#[derive(Clone, Debug)]
+enum CompiledFieldSource {
+    TracepointOffset(u32),
+    FunctionArg(usize),
+    FunctionReturn(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -57,9 +63,10 @@ pub(crate) struct CompiledCustomFilter {
 pub(crate) struct CompiledCustomField {
     pub(crate) field_id: u16,
     pub(crate) name: String,
-    pub(crate) offset: u32,
+    pub(crate) key: String,
     pub(crate) size: u32,
     pub(crate) signed: bool,
+    source: CompiledFieldSource,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +76,7 @@ pub(crate) struct CompiledCustomProbe {
     pub(crate) custom_event_type: String,
     pub(crate) category: String,
     pub(crate) probe_name: String,
+    pub(crate) kind: CompiledCustomProbeKind,
     pub(crate) program_name: String,
     pub(crate) record_stack_trace: bool,
     pub(crate) recorded_fields: Vec<CompiledCustomField>,
@@ -107,17 +115,69 @@ pub(crate) struct CustomProbeRuntimeEvent {
     pub(crate) values: [CustomProbeRuntimeValue; MAX_CUSTOM_VALUES],
 }
 
-fn canonical_tracepoint_field_ref(field_ref: &CustomProbeFieldRef) -> Result<&str> {
+fn field_ref_key(field_ref: &CustomProbeFieldRef) -> String {
     match field_ref {
-        CustomProbeFieldRef::Field { name } => Ok(name.as_str()),
-        CustomProbeFieldRef::Arg { name } => Err(anyhow!(
-            "tracepoint custom probes do not support arg references ('{}'); use field references",
-            name
-        )),
-        CustomProbeFieldRef::Return => Err(anyhow!(
-            "tracepoint custom probes do not support return value references"
-        )),
+        CustomProbeFieldRef::Field { name } => format!("field:{name}"),
+        CustomProbeFieldRef::Arg { name } => format!("arg:{name}"),
+        CustomProbeFieldRef::Return => "ret".to_string(),
     }
+}
+
+fn field_ref_display_name(field_ref: &CustomProbeFieldRef) -> String {
+    match field_ref {
+        CustomProbeFieldRef::Field { name } => name.clone(),
+        CustomProbeFieldRef::Arg { name } => name.clone(),
+        CustomProbeFieldRef::Return => "ret".to_string(),
+    }
+}
+
+fn normalize_scalar_type_tokens(field_type: &str) -> String {
+    field_type
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "const" | "volatile" | "restrict" | "__user" | "__rcu" | "__iomem"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn scalar_layout_from_type(field_type: &str) -> Result<(u32, bool)> {
+    let normalized = normalize_scalar_type_tokens(field_type);
+    let layout = match normalized.as_str() {
+        "u8" | "__u8" | "unsigned char" | "bool" | "_bool" | "char" => (1, false),
+        "i8" | "__s8" | "signed char" => (1, true),
+        "u16" | "__u16" | "unsigned short" | "unsigned short int" => (2, false),
+        "i16" | "__s16" | "short" | "short int" | "signed short" | "signed short int" => (2, true),
+        "u32" | "__u32" | "unsigned" | "unsigned int" => (4, false),
+        "i32" | "__s32" | "int" | "signed" | "signed int" => (4, true),
+        "u64"
+        | "__u64"
+        | "unsigned long"
+        | "unsigned long int"
+        | "unsigned long long"
+        | "unsigned long long int" => (8, false),
+        "i64"
+        | "__s64"
+        | "long"
+        | "long int"
+        | "signed long"
+        | "signed long int"
+        | "long long"
+        | "long long int"
+        | "signed long long"
+        | "signed long long int" => (8, true),
+        _ => {
+            return Err(anyhow!(
+                "unsupported scalar type '{}' for runtime custom probes",
+                field_type
+            ));
+        }
+    };
+    Ok(layout)
 }
 
 fn read_type_for_field(field: &CompiledCustomField) -> Result<&'static str> {
@@ -136,6 +196,20 @@ fn read_type_for_field(field: &CompiledCustomField) -> Result<&'static str> {
             field.size,
             field.signed
         )),
+    }
+}
+
+fn compiled_field_read_expr(field: &CompiledCustomField, rust_ty: &str) -> String {
+    match field.source {
+        CompiledFieldSource::TracepointOffset(offset) => {
+            format!("unsafe {{ ctx.read_at::<{rust_ty}>({offset}usize)? }}")
+        }
+        CompiledFieldSource::FunctionArg(index) => {
+            format!("unsafe {{ ctx.arg::<{rust_ty}>({index}usize) }}")
+        }
+        CompiledFieldSource::FunctionReturn(index) => {
+            format!("unsafe {{ ctx.arg::<{rust_ty}>({index}usize) }}")
+        }
     }
 }
 
@@ -291,11 +365,9 @@ fn render_generated_custom_probe(probe: &CompiledCustomProbe) -> Result<String> 
     let mut prelude = String::new();
     for field in &probe.read_fields {
         let read_ty = read_type_for_field(field)?;
-        let var = format!("field_{}", sanitize_ident(&field.name));
-        prelude.push_str(&format!(
-            "    let {var}: {read_ty} = unsafe {{ ctx.read_at({}usize)? }};\n",
-            field.offset
-        ));
+        let var = format!("field_{}", sanitize_ident(&field.key));
+        let read_expr = compiled_field_read_expr(field, read_ty);
+        prelude.push_str(&format!("    let {var}: {read_ty} = {read_expr};\n"));
     }
 
     let mut filters = String::new();
@@ -314,7 +386,7 @@ fn render_generated_custom_probe(probe: &CompiledCustomProbe) -> Result<String> 
 
     let mut value_assignments = String::new();
     for (idx, field) in probe.recorded_fields.iter().enumerate() {
-        let var = format!("field_{}", sanitize_ident(&field.name));
+        let var = format!("field_{}", sanitize_ident(&field.key));
         let encoded_value = if field.signed {
             format!("({var} as i64) as u64")
         } else {
@@ -326,17 +398,31 @@ fn render_generated_custom_probe(probe: &CompiledCustomProbe) -> Result<String> 
         ));
     }
 
+    let (attr, context): (String, String) = match probe.kind {
+        CompiledCustomProbeKind::Tracepoint => {
+            ("#[tracepoint]".to_string(), "TracePointContext".to_string())
+        }
+        CompiledCustomProbeKind::Fentry => (
+            format!("#[fentry(function = \"{}\")]", probe.probe_name),
+            "FEntryContext".to_string(),
+        ),
+        CompiledCustomProbeKind::Fexit => (
+            format!("#[fexit(function = \"{}\")]", probe.probe_name),
+            "FExitContext".to_string(),
+        ),
+    };
+
     Ok(format!(
         r#"
-#[tracepoint]
-pub fn {program_name}(ctx: TracePointContext) -> u32 {{
+{attr}
+pub fn {program_name}(ctx: {context}) -> u32 {{
     match try_{program_name}(&ctx) {{
         Ok(ret) => ret,
         Err(_) => 1,
     }}
 }}
 
-fn try_{program_name}(ctx: &TracePointContext) -> Result<u32, i64> {{
+fn try_{program_name}(ctx: &{context}) -> Result<u32, i64> {{
 {prelude}    if !is_traced(ctx.tgid()) {{
         return Ok(0);
     }}
@@ -361,6 +447,8 @@ fn try_{program_name}(ctx: &TracePointContext) -> Result<u32, i64> {{
     Ok(0)
 }}
 "#,
+        attr = attr,
+        context = context,
         program_name = probe.program_name,
         prelude = prelude,
         filters = filters,
@@ -387,15 +475,12 @@ pub(crate) fn compile_custom_probe_plan(
                     spec.probe_display_name
                 )
             })?;
-        if schema.kind != ProbeSchemaKind::Tracepoint {
-            return Err(anyhow!(
-                "custom probe[{}] '{}' has unsupported kind {:?}",
-                idx,
-                spec.probe_display_name,
-                schema.kind
-            ));
-        }
-        if schema.fields.is_empty() {
+        let kind = match schema.kind {
+            ProbeSchemaKind::Tracepoint => CompiledCustomProbeKind::Tracepoint,
+            ProbeSchemaKind::Fentry => CompiledCustomProbeKind::Fentry,
+            ProbeSchemaKind::Fexit => CompiledCustomProbeKind::Fexit,
+        };
+        if matches!(kind, CompiledCustomProbeKind::Tracepoint) && schema.fields.is_empty() {
             return Err(anyhow!(
                 "custom probe[{}] '{}': resolved schema has no tracepoint fields",
                 idx,
@@ -406,47 +491,129 @@ pub(crate) fn compile_custom_probe_plan(
         let category = schema.target.clone();
         let probe_name = schema.probe.clone();
 
-        let field_by_name = schema
-            .fields
-            .iter()
-            .cloned()
-            .into_iter()
-            .map(|field| {
-                (
-                    field.name.clone(),
-                    TracepointField {
-                        name: field.name,
-                        offset: field.offset,
-                        size: field.size,
-                        signed: field.is_signed,
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-
         let mut seen_record_names = HashSet::new();
         let mut recorded_fields = Vec::new();
 
         for record_ref in &spec.record_fields {
-            let field_name = canonical_tracepoint_field_ref(record_ref)?;
-            if !seen_record_names.insert(field_name.to_string()) {
+            let key = field_ref_key(record_ref);
+            if !seen_record_names.insert(key.clone()) {
                 continue;
             }
-            let trace_field = field_by_name.get(field_name).ok_or_else(|| {
-                anyhow!(
-                    "custom probe[{}] '{}': unknown field '{}'",
-                    idx,
-                    spec.probe_display_name,
-                    field_name
-                )
-            })?;
-            recorded_fields.push(CompiledCustomField {
-                field_id: (recorded_fields.len() + 1) as u16,
-                name: trace_field.name.clone(),
-                offset: trace_field.offset,
-                size: trace_field.size,
-                signed: trace_field.signed,
-            });
+            let compiled_field = match (kind.clone(), record_ref) {
+                (CompiledCustomProbeKind::Tracepoint, CustomProbeFieldRef::Field { name }) => {
+                    let field =
+                        schema
+                            .fields
+                            .iter()
+                            .find(|f| &f.name == name)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "custom probe[{}] '{}': unknown field '{}'",
+                                    idx,
+                                    spec.probe_display_name,
+                                    name
+                                )
+                            })?;
+                    CompiledCustomField {
+                        field_id: (recorded_fields.len() + 1) as u16,
+                        name: field_ref_display_name(record_ref),
+                        key,
+                        size: field.size,
+                        signed: field.is_signed,
+                        source: CompiledFieldSource::TracepointOffset(field.offset),
+                    }
+                }
+                (
+                    CompiledCustomProbeKind::Fentry | CompiledCustomProbeKind::Fexit,
+                    CustomProbeFieldRef::Arg { name },
+                ) => {
+                    let (arg_idx, arg) = schema
+                        .args
+                        .iter()
+                        .enumerate()
+                        .find(|(_, arg)| &arg.name == name)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "custom probe[{}] '{}': unknown arg '{}'",
+                                idx,
+                                spec.probe_display_name,
+                                name
+                            )
+                        })?;
+                    let (size, signed) =
+                        scalar_layout_from_type(&arg.arg_type).with_context(|| {
+                            format!(
+                                "custom probe[{}] '{}': unsupported arg type '{}' for '{}'",
+                                idx, spec.probe_display_name, arg.arg_type, name
+                            )
+                        })?;
+                    CompiledCustomField {
+                        field_id: (recorded_fields.len() + 1) as u16,
+                        name: field_ref_display_name(record_ref),
+                        key,
+                        size,
+                        signed,
+                        source: CompiledFieldSource::FunctionArg(arg_idx),
+                    }
+                }
+                (CompiledCustomProbeKind::Fexit, CustomProbeFieldRef::Return) => {
+                    let return_ty = schema.return_type.as_deref().ok_or_else(|| {
+                        anyhow!(
+                            "custom probe[{}] '{}': return type is missing",
+                            idx,
+                            spec.probe_display_name
+                        )
+                    })?;
+                    let (size, signed) = scalar_layout_from_type(return_ty).with_context(|| {
+                        format!(
+                            "custom probe[{}] '{}': unsupported return type '{}'",
+                            idx, spec.probe_display_name, return_ty
+                        )
+                    })?;
+                    CompiledCustomField {
+                        field_id: (recorded_fields.len() + 1) as u16,
+                        name: field_ref_display_name(record_ref),
+                        key,
+                        size,
+                        signed,
+                        source: CompiledFieldSource::FunctionReturn(schema.args.len()),
+                    }
+                }
+                (CompiledCustomProbeKind::Fentry, CustomProbeFieldRef::Return) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': fentry probes cannot use return value",
+                        idx,
+                        spec.probe_display_name
+                    ));
+                }
+                (CompiledCustomProbeKind::Tracepoint, CustomProbeFieldRef::Arg { name }) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': tracepoint probes do not support arg '{}'",
+                        idx,
+                        spec.probe_display_name,
+                        name
+                    ));
+                }
+                (CompiledCustomProbeKind::Tracepoint, CustomProbeFieldRef::Return) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': tracepoint probes do not support return value",
+                        idx,
+                        spec.probe_display_name
+                    ));
+                }
+                (
+                    CompiledCustomProbeKind::Fentry | CompiledCustomProbeKind::Fexit,
+                    CustomProbeFieldRef::Field { name },
+                ) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': function probes do not support tracepoint field '{}'",
+                        idx,
+                        spec.probe_display_name,
+                        name
+                    ));
+                }
+            };
+            recorded_fields.push(compiled_field);
         }
 
         if recorded_fields.len() > MAX_CUSTOM_VALUES {
@@ -462,41 +629,137 @@ pub(crate) fn compile_custom_probe_plan(
         let mut read_fields = recorded_fields.clone();
         let mut read_field_names = read_fields
             .iter()
-            .map(|field| field.name.clone())
+            .map(|field| field.key.clone())
             .collect::<HashSet<_>>();
 
         let mut filters = Vec::new();
         for filter in &spec.filters {
-            let field_name = canonical_tracepoint_field_ref(&filter.field)?;
-            let trace_field = field_by_name.get(field_name).ok_or_else(|| {
-                anyhow!(
-                    "custom probe[{}] '{}': unknown filter field '{}'",
-                    idx,
-                    spec.probe_display_name,
-                    field_name
-                )
-            })?;
-
-            if !read_field_names.contains(field_name) {
-                read_fields.push(CompiledCustomField {
-                    field_id: 0,
-                    name: trace_field.name.clone(),
-                    offset: trace_field.offset,
-                    size: trace_field.size,
-                    signed: trace_field.signed,
-                });
-                read_field_names.insert(field_name.to_string());
+            let key = field_ref_key(&filter.field);
+            let parsed_filter_field = match (kind.clone(), &filter.field) {
+                (CompiledCustomProbeKind::Tracepoint, CustomProbeFieldRef::Field { name }) => {
+                    let field =
+                        schema
+                            .fields
+                            .iter()
+                            .find(|f| &f.name == name)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "custom probe[{}] '{}': unknown filter field '{}'",
+                                    idx,
+                                    spec.probe_display_name,
+                                    name
+                                )
+                            })?;
+                    CompiledCustomField {
+                        field_id: 0,
+                        name: field_ref_display_name(&filter.field),
+                        key: key.clone(),
+                        size: field.size,
+                        signed: field.is_signed,
+                        source: CompiledFieldSource::TracepointOffset(field.offset),
+                    }
+                }
+                (
+                    CompiledCustomProbeKind::Fentry | CompiledCustomProbeKind::Fexit,
+                    CustomProbeFieldRef::Arg { name },
+                ) => {
+                    let (arg_idx, arg) = schema
+                        .args
+                        .iter()
+                        .enumerate()
+                        .find(|(_, arg)| &arg.name == name)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "custom probe[{}] '{}': unknown filter arg '{}'",
+                                idx,
+                                spec.probe_display_name,
+                                name
+                            )
+                        })?;
+                    let (size, signed) =
+                        scalar_layout_from_type(&arg.arg_type).with_context(|| {
+                            format!(
+                                "custom probe[{}] '{}': unsupported arg type '{}' for '{}'",
+                                idx, spec.probe_display_name, arg.arg_type, name
+                            )
+                        })?;
+                    CompiledCustomField {
+                        field_id: 0,
+                        name: field_ref_display_name(&filter.field),
+                        key: key.clone(),
+                        size,
+                        signed,
+                        source: CompiledFieldSource::FunctionArg(arg_idx),
+                    }
+                }
+                (CompiledCustomProbeKind::Fexit, CustomProbeFieldRef::Return) => {
+                    let return_ty = schema.return_type.as_deref().ok_or_else(|| {
+                        anyhow!(
+                            "custom probe[{}] '{}': return type is missing",
+                            idx,
+                            spec.probe_display_name
+                        )
+                    })?;
+                    let (size, signed) = scalar_layout_from_type(return_ty).with_context(|| {
+                        format!(
+                            "custom probe[{}] '{}': unsupported return type '{}'",
+                            idx, spec.probe_display_name, return_ty
+                        )
+                    })?;
+                    CompiledCustomField {
+                        field_id: 0,
+                        name: field_ref_display_name(&filter.field),
+                        key: key.clone(),
+                        size,
+                        signed,
+                        source: CompiledFieldSource::FunctionReturn(schema.args.len()),
+                    }
+                }
+                (CompiledCustomProbeKind::Fentry, CustomProbeFieldRef::Return) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': fentry probes cannot filter on return value",
+                        idx,
+                        spec.probe_display_name
+                    ));
+                }
+                (CompiledCustomProbeKind::Tracepoint, CustomProbeFieldRef::Arg { name }) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': tracepoint probes do not support filter arg '{}'",
+                        idx,
+                        spec.probe_display_name,
+                        name
+                    ));
+                }
+                (CompiledCustomProbeKind::Tracepoint, CustomProbeFieldRef::Return) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': tracepoint probes do not support return filter",
+                        idx,
+                        spec.probe_display_name
+                    ));
+                }
+                (
+                    CompiledCustomProbeKind::Fentry | CompiledCustomProbeKind::Fexit,
+                    CustomProbeFieldRef::Field { name },
+                ) => {
+                    return Err(anyhow!(
+                        "custom probe[{}] '{}': function probes do not support tracepoint filter field '{}'",
+                        idx,
+                        spec.probe_display_name,
+                        name
+                    ));
+                }
+            };
+            if !read_field_names.contains(&key) {
+                read_fields.push(parsed_filter_field.clone());
+                read_field_names.insert(key.clone());
             }
-
             filters.push(CompiledCustomFilter {
-                field_name: field_name.to_string(),
-                signed: trace_field.signed,
+                field_name: key,
+                signed: parsed_filter_field.signed,
                 op: filter.op.clone(),
                 value: filter.value.clone(),
             });
         }
-
-        read_fields.sort_by_key(|field| (field.offset, field.name.clone()));
 
         let probe_id = (idx + 1) as u32;
         let custom_event_type = format!("custom:{probe_name}");
@@ -506,6 +769,7 @@ pub(crate) fn compile_custom_probe_plan(
             custom_event_type: custom_event_type.clone(),
             category,
             probe_name,
+            kind,
             program_name: format!("custom_probe_{idx}"),
             record_stack_trace: spec.record_stack_trace,
             recorded_fields: recorded_fields.clone(),
