@@ -10,10 +10,13 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{CString, OsString},
     fs,
+    fs::OpenOptions,
     hash::{Hash, Hasher},
+    io::ErrorKind,
     os::unix::{ffi::OsStrExt, process::CommandExt},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant, SystemTime},
 };
 
 const MAX_CUSTOM_VALUES: usize = 8;
@@ -762,6 +765,17 @@ fn write_embedded_ebpf_scaffold(scaffold_root: &Path, probex_common_root: &Path)
     Ok(())
 }
 
+struct BuildLockGuard {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl Drop for BuildLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
@@ -789,21 +803,77 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
         });
     }
 
-    let drop_target = resolve_cargo_drop_target()?;
-    if build_root.exists() {
-        fs::remove_dir_all(&build_root).with_context(|| {
-            format!(
-                "failed to clear generated build directory '{}'",
-                build_root.display()
-            )
-        })?;
-    }
     fs::create_dir_all(&build_root).with_context(|| {
         format!(
             "failed to create generated build directory '{}'",
             build_root.display()
         )
     })?;
+
+    let lock_path = build_root.join(".build.lock");
+    let lock_wait_timeout = Duration::from_secs(300);
+    let lock_stale_after = Duration::from_secs(600);
+    let wait_start = Instant::now();
+    let lock_file = loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => break file,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if built_binary.is_file() {
+                    return fs::read(&built_binary).with_context(|| {
+                        format!(
+                            "failed to read cached generated ebpf binary '{}'",
+                            built_binary.display()
+                        )
+                    });
+                }
+                if let Ok(metadata) = fs::metadata(&lock_path)
+                    && let Ok(modified_at) = metadata.modified()
+                {
+                    let is_stale = SystemTime::now()
+                        .duration_since(modified_at)
+                        .map(|age| age > lock_stale_after)
+                        .unwrap_or(false);
+                    if is_stale {
+                        let _ = fs::remove_file(&lock_path);
+                        continue;
+                    }
+                }
+                if wait_start.elapsed() > lock_wait_timeout {
+                    return Err(anyhow!(
+                        "timed out waiting for generated ebpf build lock '{}'",
+                        lock_path.display()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "failed to create generated ebpf build lock '{}': {}",
+                    lock_path.display(),
+                    error
+                ));
+            }
+        }
+    };
+    let _lock_guard = BuildLockGuard {
+        path: lock_path,
+        _file: lock_file,
+    };
+
+    if built_binary.is_file() {
+        return fs::read(&built_binary).with_context(|| {
+            format!(
+                "failed to read cached generated ebpf binary '{}'",
+                built_binary.display()
+            )
+        });
+    }
+
+    let drop_target = resolve_cargo_drop_target()?;
     let generated_path = build_root.join("generated_probes.rs");
     fs::write(&generated_path, source).with_context(|| {
         format!(

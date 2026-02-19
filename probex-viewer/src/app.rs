@@ -400,29 +400,28 @@ fn TraceViewer() -> Element {
                                             let status = response.status;
                                             let should_poll =
                                                 matches!(status, TraceRunStatus::Running { .. });
-                                            let is_non_idle = !matches!(status, TraceRunStatus::Idle);
                                             trace_run_status.set(status);
-                                            if is_non_idle {
+                                            if should_poll {
                                                 trace_starting.set(false);
-                                            }
-                                            if should_poll && !trace_poller_active() {
-                                                trace_poller_active.set(true);
-                                                spawn_trace_status_poller(
-                                                    trace_status_sequence,
-                                                    trace_run_status,
-                                                    trace_last_loaded_run_id,
-                                                    trace_error,
-                                                    trace_poller_active,
-                                                    summary,
-                                                    histogram,
-                                                    selected_pid_event_counts,
-                                                    syscall_latency_stats,
-                                                    event_flamegraph,
-                                                    process_lifetimes,
-                                                    process_events,
-                                                    selected_pid,
-                                                    reload_nonce,
-                                                );
+                                                if !trace_poller_active() {
+                                                    trace_poller_active.set(true);
+                                                    spawn_trace_status_poller(
+                                                        trace_status_sequence,
+                                                        trace_run_status,
+                                                        trace_last_loaded_run_id,
+                                                        trace_error,
+                                                        trace_poller_active,
+                                                        summary,
+                                                        histogram,
+                                                        selected_pid_event_counts,
+                                                        syscall_latency_stats,
+                                                        event_flamegraph,
+                                                        process_lifetimes,
+                                                        process_events,
+                                                        selected_pid,
+                                                        reload_nonce,
+                                                    );
+                                                }
                                             }
                                         }
                                         Err(error) => {
