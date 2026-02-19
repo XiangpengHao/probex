@@ -611,6 +611,28 @@ fn parse_env_u32(name: &str) -> Result<Option<u32>> {
     Ok(Some(value))
 }
 
+fn generated_builds_root() -> PathBuf {
+    if let Ok(path) = std::env::var("PROBEX_GENERATED_ROOT")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+    if let Ok(path) = std::env::var("XDG_CACHE_HOME")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path).join("probex").join("generated");
+    }
+    if let Ok(path) = std::env::var("HOME")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path)
+            .join(".cache")
+            .join("probex")
+            .join("generated");
+    }
+    std::env::temp_dir().join("probex-generated")
+}
+
 fn resolve_cargo_drop_target() -> Result<Option<(u32, u32)>> {
     let euid = unsafe { libc::geteuid() };
     if euid != 0 {
@@ -751,9 +773,7 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     EMBEDDED_EBPF_MAIN_RS.hash(&mut hasher);
     let key = hasher.finish();
 
-    let build_root = std::env::temp_dir()
-        .join("probex-generated")
-        .join(format!("{key:016x}"));
+    let build_root = generated_builds_root().join(format!("{key:016x}"));
     let target = bpf_target_triple_runtime();
     let built_binary = build_root
         .join("target")
