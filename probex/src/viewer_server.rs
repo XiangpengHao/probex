@@ -105,12 +105,22 @@ struct EventListQuery {
 }
 
 pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
-    let parquet_path = Path::new(parquet_file)
-        .canonicalize()
-        .with_context(|| format!("failed to resolve path: {}", parquet_file))?;
-    viewer_backend::initialize(parquet_path.clone())
-        .await
-        .map_err(|error| anyhow!("failed to initialize viewer backend: {error}"))?;
+    launch_internal(Some(parquet_file), port).await
+}
+
+pub async fn launch_empty(port: u16) -> Result<()> {
+    launch_internal(None, port).await
+}
+
+async fn launch_internal(parquet_file: Option<&str>, port: u16) -> Result<()> {
+    if let Some(parquet_file) = parquet_file {
+        let parquet_path = Path::new(parquet_file)
+            .canonicalize()
+            .with_context(|| format!("failed to resolve path: {}", parquet_file))?;
+        viewer_backend::initialize(parquet_path)
+            .await
+            .map_err(|error| anyhow!("failed to initialize viewer backend: {error}"))?;
+    }
     viewer_trace_runtime::initialize()
         .map_err(|error| anyhow!("failed to initialize trace runtime: {error}"))?;
     if ViewerAssets::get(INDEX_HTML).is_none() {

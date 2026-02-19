@@ -24,7 +24,7 @@ use aya::{
     },
     util::kernel_symbols,
 };
-use clap::{ArgGroup, Parser};
+use clap::Parser;
 use log::{debug, info};
 use nix::{
     sys::{
@@ -76,11 +76,6 @@ const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
 #[command(name = "probex")]
 #[command(about = "eBPF process tracing tool")]
 #[command(version)]
-#[command(group(
-    ArgGroup::new("mode")
-        .args(["view", "command"])
-        .required(true)
-))]
 struct Args {
     /// Output parquet file (default: trace.parquet)
     #[arg(short, long, default_value = "trace.parquet")]
@@ -105,8 +100,7 @@ struct Args {
     /// Command to run
     #[arg(
         trailing_var_arg = true,
-        allow_hyphen_values = true,
-        required_unless_present = "view"
+        allow_hyphen_values = true
     )]
     command: Vec<String>,
 }
@@ -2266,6 +2260,9 @@ async fn main() -> Result<()> {
 
     if let Some(parquet_file) = args.view.as_deref() {
         return viewer_server::launch(parquet_file, args.port).await;
+    }
+    if args.command.is_empty() {
+        return viewer_server::launch_empty(args.port).await;
     }
     let (program, program_args) = args
         .command
