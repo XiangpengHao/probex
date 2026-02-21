@@ -127,8 +127,17 @@ fn TraceViewer() -> Element {
                 }
                 enabled_event_types.set(default_event_types);
                 summary.set(Some(s));
+                error_msg.set(None);
             }
-            Err(e) => error_msg.set(Some(format!("Failed to load summary: {}", e))),
+            Err(e) => {
+                // Initial empty viewer has no DataFusion session until a parquet file is loaded.
+                // Don't surface that as an error banner.
+                if e.contains("DataFusion session not initialized") {
+                    error_msg.set(None);
+                    return;
+                }
+                error_msg.set(Some(format!("Failed to load summary: {}", e)));
+            }
         }
     });
 
