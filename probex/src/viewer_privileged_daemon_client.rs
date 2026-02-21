@@ -1,6 +1,6 @@
 use crate::{
     TraceCommandConfig, TraceCommandOutcome, TraceMapFdBundle, consume_trace_from_map_fds,
-    custom_codegen,
+    custom_codegen, trace_privilege,
 };
 use anyhow::{Context as _, Result, anyhow};
 use probex_common::viewer_api::{
@@ -209,7 +209,10 @@ async fn ensure_daemon_running() -> Result<()> {
         .stdin(std::process::Stdio::piped())
         .spawn()
         .with_context(|| {
-            "failed to spawn privileged daemon via pkexec (is pkexec installed and authorized?)"
+            format!(
+                "failed to spawn privileged daemon via pkexec (is pkexec installed and authorized?). {}",
+                trace_privilege::privilege_hint()
+            )
         })?;
     let mut stdin: ChildStdin = child
         .stdin
@@ -234,7 +237,8 @@ async fn ensure_daemon_running() -> Result<()> {
         }
     }
     Err(anyhow!(
-        "privileged daemon did not become ready; ensure pkexec auth succeeded"
+        "privileged daemon did not become ready; ensure pkexec auth succeeded. {}",
+        trace_privilege::privilege_hint()
     ))
 }
 

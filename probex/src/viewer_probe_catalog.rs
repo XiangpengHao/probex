@@ -130,10 +130,6 @@ pub struct ProbeSchemasQuery {
     pub include_fields: bool,
 }
 
-pub fn initialize_probe_index_loading() {
-    ensure_probe_index_loading();
-}
-
 fn discover_tracepoints(events_root: &Path) -> ProbeCatalogResult<Vec<(String, String)>> {
     let mut discovered = Vec::new();
     for category_entry in fs::read_dir(events_root)? {
