@@ -1,9 +1,11 @@
 use dioxus::prelude::*;
+use std::collections::{HashMap, HashSet};
 
-use crate::api::{EventListResponse, get_event_list};
+use crate::api::{EventDetail, EventListResponse, get_event_list};
 use crate::app::formatting::format_duration_short;
 
 const PAGE_SIZE: usize = 50;
+const MAX_CUSTOM_COLUMNS: usize = 5;
 
 #[component]
 pub fn EventListCard(
@@ -68,6 +70,12 @@ pub fn EventListCard(
     let current_page = page();
     let total_pages = data.total_in_range.div_ceil(PAGE_SIZE);
     let expanded = expanded_idx();
+    let custom_columns = top_custom_columns(&data, MAX_CUSTOM_COLUMNS);
+    let custom_column_set = custom_columns
+        .iter()
+        .cloned()
+        .collect::<HashSet<String>>();
+    let expanded_colspan = 3 + custom_columns.len();
 
     rsx! {
         div { class: "bg-white border border-gray-200 rounded px-2 py-1.5 space-y-1",
@@ -108,6 +116,9 @@ pub fn EventListCard(
                             th { class: "text-left py-0.5 pr-2 font-medium", "Offset" }
                             th { class: "text-left py-0.5 px-1.5 font-medium", "Type" }
                             th { class: "text-left py-0.5 pl-1.5 font-medium", "Stack" }
+                            for field_name in custom_columns.iter() {
+                                th { class: "text-left py-0.5 px-1.5 font-medium font-mono", "{field_name}" }
+                            }
                         }
                     }
                     tbody {
@@ -121,6 +132,18 @@ pub fn EventListCard(
                                     .unwrap_or_else(|| "—".to_string());
                                 let is_expanded = expanded == Some(idx);
                                 let stack_trace = event.stack_trace.clone();
+                                let custom_payload = event.custom_payload.clone();
+                                let overflow_custom_fields = custom_payload
+                                    .as_ref()
+                                    .map(|payload| {
+                                        payload
+                                            .fields
+                                            .iter()
+                                            .filter(|f| !custom_column_set.contains(&f.name))
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
 
                                 rsx! {
                                     tr {
@@ -135,13 +158,37 @@ pub fn EventListCard(
                                         td { class: "py-0.5 pr-2 font-mono", "{formatted_offset}" }
                                         td { class: "py-0.5 px-1.5 font-mono", "{event_type}" }
                                         td { class: "py-0.5 pl-1.5 font-mono truncate max-w-xs", "{top_frame}" }
+                                        for field_name in custom_columns.iter() {
+                                            td { class: "py-0.5 px-1.5 font-mono text-gray-700 truncate max-w-[12rem]",
+                                                {
+                                                    custom_field_value(event, field_name)
+                                                        .unwrap_or_else(|| "—".to_string())
+                                                }
+                                            }
+                                        }
                                     }
                                     if is_expanded {
                                         tr {
-                                            td { colspan: "3",
+                                            td { colspan: "{expanded_colspan}", class: "px-2 py-1 space-y-2",
+                                                if let Some(_payload) = custom_payload {
+                                                    if !overflow_custom_fields.is_empty() {
+                                                        div { class: "bg-amber-50 border-l-2 border-amber-300 px-2 py-1 rounded-sm",
+                                                            div { class: "flex flex-wrap gap-1",
+                                                                for field in overflow_custom_fields {
+                                                                    span { class: "inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-amber-200 bg-white text-[11px] font-mono text-amber-900",
+                                                                        "{field.name}="
+                                                                        span { class: "text-amber-800", "{field.display_value}" }
+                                                                        span { class: "text-amber-500", "({field.type_kind:?})" }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
                                                 if let Some(ref st) = stack_trace {
                                                     if st.is_empty() {
-                                                        div { class: "text-[11px] text-gray-400 px-2 py-1", "No stack trace available" }
+                                                        div { class: "text-[11px] text-gray-400", "No stack trace available" }
                                                     } else {
                                                         div { class: "bg-gray-50 border-l-2 border-blue-300 px-2 py-1",
                                                             for (i, frame) in st.iter().enumerate() {
@@ -150,7 +197,7 @@ pub fn EventListCard(
                                                         }
                                                     }
                                                 } else {
-                                                    div { class: "text-[11px] text-gray-400 px-2 py-1", "No stack trace available" }
+                                                    div { class: "text-[11px] text-gray-400", "No stack trace available" }
                                                 }
                                             }
                                         }
@@ -163,4 +210,32 @@ pub fn EventListCard(
             }
         }
     }
+}
+
+fn top_custom_columns(data: &EventListResponse, limit: usize) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for event in &data.events {
+        if let Some(payload) = &event.custom_payload {
+            for field in &payload.fields {
+                *counts.entry(field.name.clone()).or_default() += 1;
+            }
+        }
+    }
+    let mut fields = counts.into_iter().collect::<Vec<_>>();
+    fields.sort_by(|(name_a, count_a), (name_b, count_b)| {
+        count_b.cmp(count_a).then_with(|| name_a.cmp(name_b))
+    });
+    fields
+        .into_iter()
+        .take(limit)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn custom_field_value(event: &EventDetail, field_name: &str) -> Option<String> {
+    event
+        .custom_payload
+        .as_ref()
+        .and_then(|payload| payload.fields.iter().find(|f| f.name == field_name))
+        .map(|field| field.display_value.clone())
 }

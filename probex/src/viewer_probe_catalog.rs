@@ -1,5 +1,9 @@
 use crate::tracepoint_format;
 use btf_rs::{Btf, BtfType, Type};
+use nucleo_matcher::{
+    Config, Matcher, Utf32String,
+    pattern::{CaseMatching, Normalization, Pattern},
+};
 use probex_common::viewer_api::{
     ProbeSchema, ProbeSchemaArg, ProbeSchemaField, ProbeSchemaKind, ProbeSchemaSource,
     ProbeSchemasPageResponse, ProbeSchemasResponse,
@@ -24,8 +28,14 @@ static TRACEPOINT_FIELD_CACHE: OnceLock<Mutex<HashMap<String, Vec<ProbeSchemaFie
 struct ProbeIndexState {
     started: AtomicBool,
     ready: AtomicBool,
-    entries: Mutex<Vec<ProbeSchema>>,
+    entries: Mutex<Vec<ProbeIndexEntry>>,
     error: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct ProbeIndexEntry {
+    schema: ProbeSchema,
+    search_text: Utf32String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -426,14 +436,15 @@ fn kind_rank(kind: &ProbeSchemaKind) -> u8 {
     }
 }
 
-fn sort_probe_index(probes: &mut [ProbeSchema]) {
+fn sort_probe_index(probes: &mut [ProbeIndexEntry]) {
     probes.sort_by(|a, b| {
-        a.probe
-            .cmp(&b.probe)
-            .then_with(|| a.target.cmp(&b.target))
-            .then_with(|| kind_rank(&a.kind).cmp(&kind_rank(&b.kind)))
-            .then_with(|| a.provider.cmp(&b.provider))
-            .then_with(|| a.display_name.cmp(&b.display_name))
+        a.schema
+            .probe
+            .cmp(&b.schema.probe)
+            .then_with(|| a.schema.target.cmp(&b.schema.target))
+            .then_with(|| kind_rank(&a.schema.kind).cmp(&kind_rank(&b.schema.kind)))
+            .then_with(|| a.schema.provider.cmp(&b.schema.provider))
+            .then_with(|| a.schema.display_name.cmp(&b.schema.display_name))
     });
 }
 
@@ -460,7 +471,7 @@ fn ensure_probe_index_loading() {
 
             let mut chunk = Vec::with_capacity(512);
             for (category, probe) in specs {
-                chunk.push(ProbeSchema {
+                let schema = ProbeSchema {
                     display_name: format!("tracepoint:{category}:{probe}"),
                     provider: "tracepoint".to_string(),
                     target: category,
@@ -473,6 +484,10 @@ fn ensure_probe_index_loading() {
                     return_unsupported_reason: None,
                     args: Vec::new(),
                     fields: Vec::new(),
+                };
+                chunk.push(ProbeIndexEntry {
+                    search_text: probe_search_text(&schema).into(),
+                    schema,
                 });
                 if chunk.len() >= 512 {
                     let mut entries = state
@@ -495,11 +510,18 @@ fn ensure_probe_index_loading() {
             {
                 let signatures = build_function_signatures_from_btf(&btf).unwrap_or_default();
                 let function_probes = build_function_probe_schemas(&symbols, &signatures);
+                let function_entries = function_probes
+                    .into_iter()
+                    .map(|schema| ProbeIndexEntry {
+                        search_text: probe_search_text(&schema).into(),
+                        schema,
+                    })
+                    .collect::<Vec<_>>();
                 let mut entries = state
                     .entries
                     .lock()
                     .map_err(|_| IoError::other("failed to lock probe index entries"))?;
-                entries.extend(function_probes);
+                entries.extend(function_entries);
             }
 
             let mut entries = state
@@ -593,22 +615,25 @@ fn probe_matches_query(probe: &ProbeSchema, query: &ProbeSchemasQuery) -> bool {
     {
         return false;
     }
-    if let Some(search) = query.search.as_deref() {
-        let q = search.to_ascii_lowercase();
-        let mut haystacks = vec![
-            probe.display_name.to_ascii_lowercase(),
-            probe.provider.to_ascii_lowercase(),
-            probe.target.to_ascii_lowercase(),
-            probe.probe.to_ascii_lowercase(),
-        ];
-        if let Some(symbol) = &probe.symbol {
-            haystacks.push(symbol.to_ascii_lowercase());
-        }
-        if !haystacks.iter().any(|value| value.contains(&q)) {
-            return false;
-        }
-    }
     true
+}
+
+fn probe_search_text(probe: &ProbeSchema) -> String {
+    probe.probe.clone()
+}
+
+fn search_kind_boost(kind: &ProbeSchemaKind) -> u32 {
+    match kind {
+        ProbeSchemaKind::Tracepoint => 500,
+        ProbeSchemaKind::Fentry | ProbeSchemaKind::Fexit => 0,
+    }
+}
+
+fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
 }
 
 pub async fn query_probe_schemas_page(
@@ -635,17 +660,54 @@ pub async fn query_probe_schemas_page(
         .entries
         .lock()
         .map_err(|_| IoError::other("failed to lock probe index entries"))?;
-    let matching = entries
+    let mut matching = entries
         .iter()
-        .filter(|probe| probe_matches_query(probe, &query))
-        .collect::<Vec<&ProbeSchema>>();
+        .filter(|entry| probe_matches_query(&entry.schema, &query))
+        .collect::<Vec<&ProbeIndexEntry>>();
+    if let Some(search) = query.search.as_deref() {
+        let trimmed = search.trim();
+        if !trimmed.is_empty() {
+            let mut matcher = Matcher::new(Config::DEFAULT);
+            let pattern = Pattern::parse(trimmed, CaseMatching::Ignore, Normalization::Smart);
+            let mut scored = matching
+                .into_iter()
+                .filter_map(|entry| {
+                    let score = pattern.score(entry.search_text.slice(..), &mut matcher)?;
+                    let substring_match =
+                        contains_case_insensitive(&entry.schema.probe, trimmed);
+                    let kind_boost = if substring_match {
+                        search_kind_boost(&entry.schema.kind)
+                    } else {
+                        0
+                    };
+                    let boosted = score.saturating_add(kind_boost);
+                    Some((boosted, score, entry))
+                })
+                .collect::<Vec<_>>();
+            scored.sort_by(|(boosted_a, score_a, entry_a), (boosted_b, score_b, entry_b)| {
+                boosted_b.cmp(boosted_a).then_with(|| {
+                    score_b.cmp(score_a).then_with(|| {
+                    entry_a
+                        .schema
+                        .display_name
+                        .cmp(&entry_b.schema.display_name)
+                        .then_with(|| entry_a.schema.target.cmp(&entry_b.schema.target))
+                        .then_with(|| {
+                            kind_rank(&entry_a.schema.kind).cmp(&kind_rank(&entry_b.schema.kind))
+                        })
+                    })
+                })
+            });
+            matching = scored.into_iter().map(|(_, _, entry)| entry).collect();
+        }
+    }
     let total = matching.len();
     let page = matching
         .into_iter()
         .skip(query.offset)
         .take(query.limit)
-        .map(|probe| {
-            let mut cloned = probe.clone();
+        .map(|entry| {
+            let mut cloned = entry.schema.clone();
             if query.include_fields && cloned.kind == ProbeSchemaKind::Tracepoint {
                 cloned.fields = load_tracepoint_fields(&cloned)?;
             } else {
@@ -684,7 +746,7 @@ pub async fn query_probe_schema_detail(display_name: String) -> ProbeCatalogResu
         .map_err(|_| IoError::other("failed to lock probe index entries"))?;
     let schema = entries
         .iter()
-        .find(|probe| probe.display_name == display_name)
+        .find(|entry| entry.schema.display_name == display_name)
         .ok_or_else(|| {
             if !state.ready.load(Ordering::SeqCst) {
                 IoError::new(
@@ -698,6 +760,7 @@ pub async fn query_probe_schema_detail(display_name: String) -> ProbeCatalogResu
                 )
             }
         })?
+        .schema
         .clone();
 
     if schema.kind == ProbeSchemaKind::Tracepoint {
@@ -717,6 +780,6 @@ pub async fn query_probe_schemas() -> ProbeCatalogResult<ProbeSchemasResponse> {
         .lock()
         .map_err(|_| IoError::other("failed to lock probe index entries"))?;
     Ok(ProbeSchemasResponse {
-        probes: entries.clone(),
+        probes: entries.iter().map(|entry| entry.schema.clone()).collect(),
     })
 }

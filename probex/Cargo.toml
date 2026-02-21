@@ -47,6 +47,7 @@ serde = { workspace = true, features = ["derive"] }
 rust-embed = { version = "8.11.0", features = ["mime-guess"] }
 chrono = "0.4.43"
 btf-rs = "1.1.1"
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 parquet = { workspace = true }

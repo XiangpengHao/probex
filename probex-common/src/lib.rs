@@ -500,6 +500,22 @@ pub mod viewer_api {
         pub fields: Vec<CustomEventDebugField>,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventField {
+        pub field_id: u16,
+        pub name: String,
+        pub type_kind: CustomPayloadTypeKind,
+        pub value_u64: u64,
+        pub value_i64: Option<i64>,
+        pub display_value: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventPayload {
+        pub schema_id: u32,
+        pub fields: Vec<CustomEventField>,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
     pub struct CustomEventsDebugResponse {
         pub events: Vec<CustomEventDebugRow>,
@@ -556,6 +572,7 @@ pub mod viewer_api {
         pub event_type: String,
         pub pid: u32,
         pub stack_trace: Option<Vec<String>>,
+        pub custom_payload: Option<CustomEventPayload>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

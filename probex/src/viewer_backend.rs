@@ -4,11 +4,12 @@
 
 pub use probex_common::viewer_api::{
     CumulativeMemoryPoint, CustomEventDebugField, CustomEventDebugRow, CustomEventsDebugResponse,
-    CustomPayloadSchema, CustomPayloadTypeKind, EventDetail, EventFlamegraphResponse,
-    EventListResponse, EventMarker, EventTypeCounts, HistogramBucket, HistogramResponse,
-    IoStatistics, IoTypeStats, LatencySummary, MemoryStatistics, ProbeSchema, ProbeSchemaKind,
-    ProbeSchemaSource, ProbeSchemasPageResponse, ProbeSchemasResponse, ProcessEventsResponse,
-    ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats, TraceSummary,
+    CustomEventField, CustomEventPayload, CustomPayloadSchema, CustomPayloadTypeKind, EventDetail,
+    EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts, HistogramBucket,
+    HistogramResponse, IoStatistics, IoTypeStats, LatencySummary, MemoryStatistics, ProbeSchema,
+    ProbeSchemaKind, ProbeSchemaSource, ProbeSchemasPageResponse, ProbeSchemasResponse,
+    ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats,
+    TraceSummary,
 };
 use std::error::Error;
 
@@ -36,6 +37,15 @@ mod backend {
     const PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY: &str = "probex.custom_payload_schemas_v1";
     const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
     type BackendResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    #[derive(Debug, Deserialize)]
+    struct JsonPayloadValue {
+        field_id: u16,
+        name: String,
+        type_kind: String,
+        value_u64: u64,
+        value_i64: Option<i64>,
+    }
 
     #[derive(Clone, Debug)]
     struct TraceFileMetadata {
@@ -450,6 +460,50 @@ mod backend {
             "stack_trace list items must be Utf8View/Utf8",
         )
         .into())
+    }
+
+    fn parse_custom_payload_json(
+        payload_raw: &str,
+        ctx_label: &str,
+    ) -> BackendResult<Vec<CustomEventField>> {
+        let payload_values: Vec<JsonPayloadValue> =
+            serde_json::from_str(payload_raw).map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid custom_payload_json at {ctx_label}: {error}"),
+                )
+            })?;
+
+        payload_values
+            .into_iter()
+            .map(|value| {
+                let type_kind = match value.type_kind.as_str() {
+                    "u64" => CustomPayloadTypeKind::U64,
+                    "i64" => CustomPayloadTypeKind::I64,
+                    other => {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidData,
+                            format!("unsupported custom payload type kind '{other}'"),
+                        )
+                        .into());
+                    }
+                };
+                let display_value = match type_kind {
+                    CustomPayloadTypeKind::U64 => value.value_u64.to_string(),
+                    CustomPayloadTypeKind::I64 => {
+                        value.value_i64.unwrap_or(value.value_u64 as i64).to_string()
+                    }
+                };
+                Ok(CustomEventField {
+                    field_id: value.field_id,
+                    name: value.name,
+                    type_kind,
+                    value_u64: value.value_u64,
+                    value_i64: value.value_i64,
+                    display_value,
+                })
+            })
+            .collect()
     }
 
     fn extract_u64(
@@ -1435,6 +1489,7 @@ mod backend {
                 event_type: operation.clone(),
                 pid,
                 stack_trace: stack.clone(),
+                custom_payload: None,
             })
         };
 
@@ -1775,15 +1830,6 @@ mod backend {
     pub async fn query_custom_events_debug() -> BackendResult<CustomEventsDebugResponse> {
         const CUSTOM_EVENTS_DEBUG_LIMIT: usize = 500;
 
-        #[derive(Debug, Deserialize)]
-        struct JsonPayloadValue {
-            field_id: u16,
-            name: String,
-            type_kind: String,
-            value_u64: u64,
-            value_i64: Option<i64>,
-        }
-
         let ctx = get_ctx()?;
         let sql = format!(
             "SELECT ts_ns, event_type, pid, tgid, process_name, custom_schema_id, custom_payload_json \
@@ -1812,45 +1858,20 @@ mod backend {
                     })?;
                 let payload_raw = extract_option_string(batch, "custom_payload_json", row)?
                     .unwrap_or_else(|| "[]".to_string());
-                let payload_values: Vec<JsonPayloadValue> = serde_json::from_str(&payload_raw)
-                    .map_err(|error| {
-                        IoError::new(
-                            ErrorKind::InvalidData,
-                            format!(
-                                "invalid custom_payload_json at ts_ns={ts_ns}, pid={pid}: {error}"
-                            ),
-                        )
-                    })?;
-                let fields = payload_values
-                    .into_iter()
-                    .map(|value| {
-                        let type_kind = match value.type_kind.as_str() {
-                            "u64" => CustomPayloadTypeKind::U64,
-                            "i64" => CustomPayloadTypeKind::I64,
-                            other => {
-                                return Err(IoError::new(
-                                    ErrorKind::InvalidData,
-                                    format!("unsupported custom payload type kind '{other}'"),
-                                ));
-                            }
-                        };
-                        let display_value = match type_kind {
-                            CustomPayloadTypeKind::U64 => value.value_u64.to_string(),
-                            CustomPayloadTypeKind::I64 => value
-                                .value_i64
-                                .unwrap_or(value.value_u64 as i64)
-                                .to_string(),
-                        };
-                        Ok(CustomEventDebugField {
-                            field_id: value.field_id,
-                            name: value.name,
-                            type_kind,
-                            value_u64: value.value_u64,
-                            value_i64: value.value_i64,
-                            display_value,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, IoError>>()?;
+                let fields = parse_custom_payload_json(
+                    &payload_raw,
+                    format!("ts_ns={ts_ns}, pid={pid}").as_str(),
+                )?
+                .into_iter()
+                .map(|field| CustomEventDebugField {
+                    field_id: field.field_id,
+                    name: field.name,
+                    type_kind: field.type_kind,
+                    value_u64: field.value_u64,
+                    value_i64: field.value_i64,
+                    display_value: field.display_value,
+                })
+                .collect::<Vec<_>>();
 
                 events.push(CustomEventDebugRow {
                     ts_ns,
@@ -1902,7 +1923,7 @@ mod backend {
         )? as usize;
 
         let sql = format!(
-            "SELECT ts_ns, event_type, pid, stack_trace FROM events \
+            "SELECT ts_ns, event_type, pid, stack_trace, custom_schema_id, custom_payload_json FROM events \
              WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter} \
              ORDER BY ts_ns LIMIT {limit} OFFSET {offset}"
         );
@@ -1916,12 +1937,25 @@ mod backend {
                 let event_type = extract_string(batch, "event_type", row)?;
                 let pid = extract_u32(batch, "pid", row)?;
                 let stack_trace = extract_option_stack_trace_labels(batch, row)?;
+                let custom_payload = match extract_option_u32(batch, "custom_schema_id", row)? {
+                    Some(schema_id) => {
+                        let payload_raw = extract_option_string(batch, "custom_payload_json", row)?
+                            .unwrap_or_else(|| "[]".to_string());
+                        let fields = parse_custom_payload_json(
+                            &payload_raw,
+                            format!("ts_ns={ts_ns}, pid={pid}").as_str(),
+                        )?;
+                        Some(CustomEventPayload { schema_id, fields })
+                    }
+                    None => None,
+                };
                 events.push(EventDetail {
                     ts_ns,
                     latency_ns: None,
                     event_type,
                     pid,
                     stack_trace,
+                    custom_payload,
                 });
             }
         }
