@@ -1,5 +1,5 @@
 use crate::tracepoint_format;
-use aya::Btf;
+use btf_rs::{Btf, BtfType, Type};
 use probex_common::viewer_api::{
     ProbeSchema, ProbeSchemaArg, ProbeSchemaField, ProbeSchemaKind, ProbeSchemaSource,
     ProbeSchemasPageResponse, ProbeSchemasResponse,
@@ -234,30 +234,144 @@ fn parse_available_filter_functions() -> ProbeCatalogResult<Vec<FunctionCandidat
 fn build_function_signatures_from_btf(
     btf: &Btf,
 ) -> ProbeCatalogResult<HashMap<String, FunctionSignature>> {
-    let signatures = btf.function_signatures().map_err(|error| {
-        IoError::other(format!(
-            "failed to parse function signatures from BTF: {error}"
-        ))
-    })?;
-    let mut by_name = HashMap::with_capacity(signatures.len());
-    for (symbol, return_type, params) in signatures {
-        let args = params
-            .into_iter()
+    fn type_name_or<'a>(btf: &Btf, ty: &dyn BtfType, fallback: &'a str) -> String {
+        btf.resolve_name(ty)
+            .ok()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+
+    fn render_type_by_id(btf: &Btf, type_id: u32) -> String {
+        let ty = match btf.resolve_type_by_id(type_id) {
+            Ok(ty) => ty,
+            Err(_) => return format!("type_id_{type_id}"),
+        };
+        render_type(btf, &ty)
+    }
+
+    fn render_type(btf: &Btf, ty: &Type) -> String {
+        match ty {
+            Type::Void => "void".to_string(),
+            Type::Int(i) => {
+                if i.is_bool() {
+                    return "bool".to_string();
+                }
+                let named = type_name_or(btf, i, "");
+                if !named.is_empty() {
+                    named
+                } else if i.is_char() {
+                    if i.is_signed() {
+                        "char".to_string()
+                    } else {
+                        "unsigned char".to_string()
+                    }
+                } else {
+                    let bits = i.size() * 8;
+                    if i.is_signed() {
+                        format!("i{bits}")
+                    } else {
+                        format!("u{bits}")
+                    }
+                }
+            }
+            Type::Ptr(p) => {
+                let pointee = btf
+                    .resolve_chained_type(p)
+                    .ok()
+                    .map(|inner| render_type(btf, &inner))
+                    .unwrap_or_else(|| "void".to_string());
+                format!("{pointee} *")
+            }
+            Type::Array(a) => {
+                let item = render_type_by_id(btf, a.get_type_id().unwrap_or(0));
+                format!("{item}[{}]", a.len())
+            }
+            Type::Struct(s) => format!("struct {}", type_name_or(btf, s, "<anon>")),
+            Type::Union(u) => format!("union {}", type_name_or(btf, u, "<anon>")),
+            Type::Enum(e) => format!("enum {}", type_name_or(btf, e, "<anon>")),
+            Type::Enum64(e) => format!("enum64 {}", type_name_or(btf, e, "<anon>")),
+            Type::Fwd(f) => {
+                if f.is_union() {
+                    format!("union {}", type_name_or(btf, f, "<fwd>"))
+                } else {
+                    format!("struct {}", type_name_or(btf, f, "<fwd>"))
+                }
+            }
+            Type::Typedef(td) => type_name_or(btf, td, "typedef"),
+            Type::TypeTag(tt) => {
+                let base = render_type_by_id(btf, tt.get_type_id().unwrap_or(0));
+                format!("type_tag {base}")
+            }
+            Type::Volatile(v) => {
+                let base = render_type_by_id(btf, v.get_type_id().unwrap_or(0));
+                format!("volatile {base}")
+            }
+            Type::Const(c) => {
+                let base = render_type_by_id(btf, c.get_type_id().unwrap_or(0));
+                format!("const {base}")
+            }
+            Type::Restrict(r) => {
+                let base = render_type_by_id(btf, r.get_type_id().unwrap_or(0));
+                format!("restrict {base}")
+            }
+            Type::Float(f) => {
+                let named = type_name_or(btf, f, "");
+                if !named.is_empty() {
+                    named
+                } else {
+                    format!("f{}", f.size() * 8)
+                }
+            }
+            Type::FuncProto(fp) => {
+                let ret = render_type_by_id(btf, fp.return_type_id());
+                format!("fn(...) -> {ret}")
+            }
+            Type::Func(fun) => type_name_or(btf, fun, "func"),
+            Type::Var(v) => format!("var {}", type_name_or(btf, v, "<anon>")),
+            Type::Datasec(ds) => format!("datasec {}", type_name_or(btf, ds, "<anon>")),
+            Type::DeclTag(dt) => format!("decl_tag {}", type_name_or(btf, dt, "<anon>")),
+        }
+    }
+
+    let mut by_name = HashMap::new();
+    let ids = (1..u32::MAX)
+        .map_while(|id| btf.resolve_type_by_id(id).ok().map(|ty| (id, ty)))
+        .collect::<Vec<_>>();
+    for (_, ty) in ids {
+        let Type::Func(func) = ty else {
+            continue;
+        };
+        let symbol = match btf.resolve_name(&func) {
+            Ok(name) if !name.is_empty() => name,
+            _ => continue,
+        };
+        let proto = match btf.resolve_chained_type(&func) {
+            Ok(Type::FuncProto(proto)) => proto,
+            _ => continue,
+        };
+        let return_type = render_type_by_id(btf, proto.return_type_id());
+        let args = proto
+            .parameters
+            .iter()
             .enumerate()
-            .map(|(idx, (name, arg_type))| {
+            .filter(|(_, param)| !param.is_variadic())
+            .map(|(idx, param)| {
+                let name = btf
+                    .resolve_name(param)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("arg{idx}"));
+                let arg_type = render_type_by_id(btf, param.get_type_id().unwrap_or(0));
                 let unsupported_reason = supported_integer_type_reason(&arg_type);
                 ProbeSchemaArg {
-                    name: if name.is_empty() {
-                        format!("arg{idx}")
-                    } else {
-                        name
-                    },
+                    name,
                     arg_type,
                     is_supported: unsupported_reason.is_none(),
                     unsupported_reason,
                 }
             })
             .collect::<Vec<_>>();
+
         by_name.insert(
             symbol,
             FunctionSignature {
@@ -376,7 +490,7 @@ fn ensure_probe_index_loading() {
                 entries.extend(chunk.drain(..));
             }
 
-            if let Ok(btf) = Btf::from_sys_fs()
+            if let Ok(btf) = Btf::from_file("/sys/kernel/btf/vmlinux")
                 && let Ok(symbols) = parse_available_filter_functions()
             {
                 let signatures = build_function_signatures_from_btf(&btf).unwrap_or_default();

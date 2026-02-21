@@ -627,6 +627,7 @@ dependencies = [
 [[package]]
 name = "aya-obj"
 version = "0.2.1"
+source = "git+https://github.com/MikeWalrus/aya?rev=6480120f1a4c268246ce21cd4f8249f8b3238d3d#6480120f1a4c268246ce21cd4f8249f8b3238d3d"
 dependencies = [
  "bytes",
  "core-error",
@@ -695,6 +696,16 @@ checksum = "874bb8112abecc98cbd6d81ea4fa7e94fb9449648c93cc89aa40c81c24d7de03"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
+]
+
+[[package]]
+name = "btf-rs"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe86bb5e4b3b6428b947ecfd9bef6c504c000c0174200dc52a2df432d5fd88fc"
+dependencies = [
+ "anyhow",
+ "byteorder",
 ]
 
 [[package]]
@@ -4094,6 +4105,7 @@ dependencies = [
  "axum",
  "aya",
  "aya-log",
+ "btf-rs",
  "cargo_metadata",
  "chrono",
  "clap",
