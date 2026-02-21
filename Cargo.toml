@@ -43,6 +43,3 @@ datafusion = { version = "52", default-features = false, features = ["parquet", 
 [profile.release.package.probex-ebpf]
 debug = 2
 codegen-units = 1
-
-[patch.crates-io]
-aya-obj = { git = "https://github.com/MikeWalrus/aya", rev = "6480120f1a4c268246ce21cd4f8249f8b3238d3d" }

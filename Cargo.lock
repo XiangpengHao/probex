@@ -627,7 +627,8 @@ dependencies = [
 [[package]]
 name = "aya-obj"
 version = "0.2.1"
-source = "git+https://github.com/MikeWalrus/aya?rev=6480120f1a4c268246ce21cd4f8249f8b3238d3d#6480120f1a4c268246ce21cd4f8249f8b3238d3d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c51b96c5a8ed8705b40d655273bc4212cbbf38d4e3be2788f36306f154523ec7"
 dependencies = [
  "bytes",
  "core-error",
