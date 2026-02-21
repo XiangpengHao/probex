@@ -1748,7 +1748,7 @@ fn drop_process_privileges(target: PrivilegeDropTarget) -> Result<()> {
     Ok(())
 }
 
-fn spawn_child(
+pub(crate) fn spawn_child(
     program: &str,
     args: &[String],
     privilege_drop: Option<PrivilegeDropTarget>,
@@ -1783,7 +1783,7 @@ fn spawn_child(
     }
 }
 
-fn wait_for_child_stop(pid: Pid) -> Result<()> {
+pub(crate) fn wait_for_child_stop(pid: Pid) -> Result<()> {
     match waitpid(pid, Some(WaitPidFlag::WUNTRACED)) {
         Ok(WaitStatus::Stopped(_, _)) => Ok(()),
         Ok(WaitStatus::Exited(_, status)) => {
@@ -1833,6 +1833,11 @@ pub(crate) struct PreparedTraceSession {
     privilege_drop_target: Option<PrivilegeDropTarget>,
 }
 
+pub(crate) struct PreparedAttachSession {
+    pub ebpf: aya::Ebpf,
+    pub custom_mode: bool,
+}
+
 fn map_data_ref(map: &Map) -> &MapData {
     match map {
         Map::Array(v) => v,
@@ -1866,19 +1871,20 @@ fn map_raw_fd(ebpf: &mut aya::Ebpf, map_name: &str) -> Result<i32> {
     Ok(map_data_ref(map).fd().as_fd().as_raw_fd())
 }
 
-pub(crate) fn trace_map_fds_from_prepared_session(
-    session: &mut PreparedTraceSession,
+pub(crate) fn trace_map_fds_from_parts(
+    ebpf: &mut aya::Ebpf,
+    custom_mode: bool,
 ) -> Result<TraceMapFdBundle> {
     Ok(TraceMapFdBundle {
-        events_fd: map_raw_fd(&mut session.ebpf, "EVENTS")
+        events_fd: map_raw_fd(ebpf, "EVENTS")
             .with_context(|| "failed to resolve EVENTS map fd")?,
-        stack_traces_fd: map_raw_fd(&mut session.ebpf, "STACK_TRACES")
+        stack_traces_fd: map_raw_fd(ebpf, "STACK_TRACES")
             .with_context(|| "failed to resolve STACK_TRACES map fd")?,
-        cpu_sample_stats_fd: map_raw_fd(&mut session.ebpf, "CPU_SAMPLE_STATS")
+        cpu_sample_stats_fd: map_raw_fd(ebpf, "CPU_SAMPLE_STATS")
             .with_context(|| "failed to resolve CPU_SAMPLE_STATS map fd")?,
-        custom_events_fd: if session.custom_mode {
+        custom_events_fd: if custom_mode {
             Some(
-                map_raw_fd(&mut session.ebpf, "CUSTOM_EVENTS")
+                map_raw_fd(ebpf, "CUSTOM_EVENTS")
                     .with_context(|| "failed to resolve CUSTOM_EVENTS map fd")?,
             )
         } else {
@@ -2400,6 +2406,261 @@ pub(crate) async fn prepare_trace_session(
         custom_payload_schemas_json,
         privilege_drop_target,
     })
+}
+
+pub(crate) async fn prepare_trace_session_for_existing_pid(
+    target_pid: u32,
+    sample_freq_hz: u64,
+    custom_probes: &[probex_common::viewer_api::CustomProbeSpec],
+    prebuilt_generated_ebpf_path: Option<String>,
+) -> Result<PreparedAttachSession> {
+    let resolved_custom_probe_schemas = resolve_custom_probe_schemas(custom_probes)
+        .await
+        .with_context(|| "step=resolve_custom_probe_schemas failed")?;
+    let custom_probe_plan = compile_custom_probe_plan(custom_probes, &resolved_custom_probe_schemas)
+        .with_context(|| "step=compile_custom_probe_plan failed")?;
+    let custom_mode = !custom_probe_plan.by_probe_id.is_empty();
+    if custom_mode {
+        info!(
+            "Custom probes enabled: {} generated probe(s), {} custom probe spec(s)",
+            custom_probe_plan.by_probe_id.len(),
+            custom_probes.len()
+        );
+    }
+
+    let rlim = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
+    if ret != 0 {
+        debug!("remove limit on locked memory failed, ret is: {ret}");
+    }
+
+    let mut ebpf = if custom_mode {
+        let generated_binary = if let Some(prebuilt_path) = prebuilt_generated_ebpf_path.as_ref() {
+            std::fs::read(prebuilt_path).with_context(|| {
+                format!("step=load_prebuilt_generated_ebpf failed: {prebuilt_path}")
+            })?
+        } else {
+            let generated_source = generate_custom_probe_source(&custom_probe_plan)
+                .with_context(|| "step=generate_rust_code failed")?;
+            tokio::task::spawn_blocking(move || build_generated_ebpf_binary(&generated_source))
+                .await
+                .with_context(|| "step=build_generated_ebpf failed: task join error")?
+                .with_context(|| "step=build_generated_ebpf failed")?
+        };
+        aya::Ebpf::load(&generated_binary).with_context(|| "step=load_ebpf failed")?
+    } else {
+        aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/probex"
+        )))
+        .with_context(|| "step=load_ebpf failed")?
+    };
+
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+        debug!("failed to initialize eBPF logger: {e}");
+    }
+
+    {
+        let mut traced_pids: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+            ebpf.map_mut("TRACED_PIDS")
+                .ok_or_else(|| anyhow!("map TRACED_PIDS not found"))?,
+        )
+        .with_context(|| "step=open_traced_pids_map failed")?;
+        traced_pids
+            .insert(target_pid, 1, 0)
+            .with_context(|| "step=insert_traced_pid failed")?;
+    }
+
+    attach_tracepoint(&mut ebpf, "sched_switch", "sched", "sched_switch")
+        .with_context(|| "step=attach_tracepoint failed: sched_switch")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sched_process_fork",
+        "sched",
+        "sched_process_fork",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sched_process_fork")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sched_process_exit",
+        "sched",
+        "sched_process_exit",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sched_process_exit")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "page_fault_user",
+        "exceptions",
+        "page_fault_user",
+    )
+    .with_context(|| "step=attach_tracepoint failed: page_fault_user")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_read", "syscalls", "sys_enter_read")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_read")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_read", "syscalls", "sys_exit_read")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_read")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_write", "syscalls", "sys_enter_write")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_write")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_write", "syscalls", "sys_exit_write")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_write")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_mmap", "syscalls", "sys_enter_mmap")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_mmap")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_mmap", "syscalls", "sys_exit_mmap")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_mmap")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_munmap",
+        "syscalls",
+        "sys_enter_munmap",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_munmap")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_munmap", "syscalls", "sys_exit_munmap")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_munmap")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_brk", "syscalls", "sys_enter_brk")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_brk")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_brk", "syscalls", "sys_exit_brk")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_brk")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_io_uring_setup",
+        "syscalls",
+        "sys_enter_io_uring_setup",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_io_uring_setup")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_io_uring_setup",
+        "syscalls",
+        "sys_exit_io_uring_setup",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_io_uring_setup")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_io_uring_enter",
+        "syscalls",
+        "sys_enter_io_uring_enter",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_io_uring_enter")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_io_uring_enter",
+        "syscalls",
+        "sys_exit_io_uring_enter",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_io_uring_enter")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_io_uring_register",
+        "syscalls",
+        "sys_enter_io_uring_register",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_io_uring_register")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_io_uring_register",
+        "syscalls",
+        "sys_exit_io_uring_register",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_io_uring_register")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_fsync", "syscalls", "sys_enter_fsync")
+        .with_context(|| "step=attach_tracepoint failed: sys_enter_fsync")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_fsync", "syscalls", "sys_exit_fsync")
+        .with_context(|| "step=attach_tracepoint failed: sys_exit_fsync")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_fdatasync",
+        "syscalls",
+        "sys_enter_fdatasync",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_enter_fdatasync")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_fdatasync",
+        "syscalls",
+        "sys_exit_fdatasync",
+    )
+    .with_context(|| "step=attach_tracepoint failed: sys_exit_fdatasync")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "io_uring_submit_req",
+        "io_uring",
+        "io_uring_submit_req",
+    )
+    .with_context(|| "step=attach_tracepoint failed: io_uring_submit_req")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "io_uring_complete",
+        "io_uring",
+        "io_uring_complete",
+    )
+    .with_context(|| "step=attach_tracepoint failed: io_uring_complete")?;
+
+    if custom_mode {
+        let mut probes = custom_probe_plan
+            .by_probe_id
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        probes.sort_by_key(|probe| probe.probe_id);
+        let mut kernel_btf = None;
+        for probe in probes {
+            match probe.kind {
+                CompiledCustomProbeKind::Tracepoint => {
+                    attach_tracepoint(
+                        &mut ebpf,
+                        probe.program_name.as_str(),
+                        probe.category.as_str(),
+                        probe.probe_name.as_str(),
+                    )
+                    .with_context(|| {
+                        format!("step=attach_tracepoint failed: {}", probe.program_name)
+                    })?;
+                }
+                CompiledCustomProbeKind::Fentry => {
+                    if kernel_btf.is_none() {
+                        kernel_btf = Some(Btf::from_sys_fs().with_context(
+                            || "step=load_kernel_btf failed for fentry/fexit custom probes",
+                        )?);
+                    }
+                    let btf = kernel_btf
+                        .as_ref()
+                        .expect("kernel_btf should be initialized before fentry attach");
+                    attach_fentry(
+                        &mut ebpf,
+                        btf,
+                        probe.program_name.as_str(),
+                        probe.probe_name.as_str(),
+                    )
+                    .with_context(|| {
+                        format!("step=attach_fentry failed: {}", probe.program_name)
+                    })?;
+                }
+                CompiledCustomProbeKind::Fexit => {
+                    if kernel_btf.is_none() {
+                        kernel_btf = Some(Btf::from_sys_fs().with_context(
+                            || "step=load_kernel_btf failed for fentry/fexit custom probes",
+                        )?);
+                    }
+                    let btf = kernel_btf
+                        .as_ref()
+                        .expect("kernel_btf should be initialized before fexit attach");
+                    attach_fexit(
+                        &mut ebpf,
+                        btf,
+                        probe.program_name.as_str(),
+                        probe.probe_name.as_str(),
+                    )
+                    .with_context(|| format!("step=attach_fexit failed: {}", probe.program_name))?;
+                }
+            }
+        }
+    }
+
+    attach_cpu_sampler(&mut ebpf, target_pid, sample_freq_hz)?;
+
+    Ok(PreparedAttachSession { ebpf, custom_mode })
 }
 
 pub(crate) async fn consume_trace_session(

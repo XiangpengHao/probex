@@ -1,19 +1,19 @@
 use crate::{
-    TraceCommandConfig, TraceMapFdBundle, prepare_trace_session,
-    trace_map_fds_from_prepared_session,
+    PreparedAttachSession, TraceMapFdBundle, prepare_trace_session_for_existing_pid,
+    trace_map_fds_from_parts,
 };
 use anyhow::{Context as _, Result, anyhow};
 use nix::{
     sys::{
-        signal::{Signal, kill},
-        wait::WaitStatus,
+        signal::Signal,
+        signal::kill,
     },
     unistd::Pid,
 };
 use probex_common::viewer_api::{
     PrivilegedDaemonEnvelope, PrivilegedDaemonRequest, PrivilegedDaemonResponse,
     PrivilegedProbeSchemasQuery, PrivilegedTraceMapFdsResponse,
-    StartTraceRequest, TraceRunStatus, TraceRunStatusResponse,
+    TraceRunStatus, TraceRunStatusResponse,
 };
 use std::os::fd::AsRawFd as _;
 use std::path::Path;
@@ -25,31 +25,19 @@ use tokio::sync::Mutex;
 
 struct ActiveRun {
     run_id: u64,
+    target_pid: u32,
     command: Vec<String>,
     output_parquet: String,
     started_at_unix_ms: u64,
-    session: crate::PreparedTraceSession,
+    _session: PreparedAttachSession,
     map_fds: TraceMapFdBundle,
     has_custom_events: bool,
-}
-
-#[derive(Clone)]
-struct FinishedRun {
-    run_id: u64,
-    command: Vec<String>,
-    output_parquet: String,
-    started_at_unix_ms: u64,
-    finished_at_unix_ms: u64,
-    exit_code: i32,
-    success: bool,
-    error: Option<String>,
 }
 
 struct DaemonState {
     next_run_id: u64,
     sequence: u64,
     active: Option<ActiveRun>,
-    finished: Option<FinishedRun>,
 }
 
 impl DaemonState {
@@ -58,7 +46,6 @@ impl DaemonState {
             next_run_id: 0,
             sequence: 0,
             active: None,
-            finished: None,
         }
     }
 }
@@ -78,17 +65,6 @@ fn status_response(state: &DaemonState) -> TraceRunStatusResponse {
             output_parquet: active.output_parquet.clone(),
             started_at_unix_ms: active.started_at_unix_ms,
         }
-    } else if let Some(finished) = state.finished.as_ref() {
-        TraceRunStatus::Finished {
-            run_id: finished.run_id,
-            command: finished.command.clone(),
-            output_parquet: finished.output_parquet.clone(),
-            started_at_unix_ms: finished.started_at_unix_ms,
-            finished_at_unix_ms: finished.finished_at_unix_ms,
-            exit_code: finished.exit_code,
-            success: finished.success,
-            error: finished.error.clone(),
-        }
     } else {
         TraceRunStatus::Idle
     };
@@ -99,91 +75,8 @@ fn status_response(state: &DaemonState) -> TraceRunStatusResponse {
 }
 
 async fn refresh(state: &mut DaemonState) -> Result<()> {
-    let is_finished = state
-        .active
-        .as_ref()
-        .is_some_and(|active| active.session.child_wait.is_finished());
-    if !is_finished {
-        return Ok(());
-    }
-    let active = state
-        .active
-        .take()
-        .ok_or_else(|| anyhow!("active run missing while refreshing"))?;
-    let finished_at_unix_ms = now_unix_ms();
-    let finished = match active.session.child_wait.await {
-        Ok(Ok(WaitStatus::Exited(_, code))) => FinishedRun {
-            run_id: active.run_id,
-            command: active.command,
-            output_parquet: active.output_parquet,
-            started_at_unix_ms: active.started_at_unix_ms,
-            finished_at_unix_ms,
-            exit_code: code,
-            success: code == 0,
-            error: if code == 0 {
-                None
-            } else {
-                Some(format!("child exited with status {code}"))
-            },
-        },
-        Ok(Ok(WaitStatus::Signaled(_, signal, _))) => FinishedRun {
-            run_id: active.run_id,
-            command: active.command,
-            output_parquet: active.output_parquet,
-            started_at_unix_ms: active.started_at_unix_ms,
-            finished_at_unix_ms,
-            exit_code: 1,
-            success: false,
-            error: Some(format!("child terminated by signal {signal}")),
-        },
-        Ok(Ok(status)) => FinishedRun {
-            run_id: active.run_id,
-            command: active.command,
-            output_parquet: active.output_parquet,
-            started_at_unix_ms: active.started_at_unix_ms,
-            finished_at_unix_ms,
-            exit_code: 1,
-            success: false,
-            error: Some(format!("unexpected wait status: {status:?}")),
-        },
-        Ok(Err(error)) => FinishedRun {
-            run_id: active.run_id,
-            command: active.command,
-            output_parquet: active.output_parquet,
-            started_at_unix_ms: active.started_at_unix_ms,
-            finished_at_unix_ms,
-            exit_code: 1,
-            success: false,
-            error: Some(format!("waitpid failed: {error}")),
-        },
-        Err(error) => FinishedRun {
-            run_id: active.run_id,
-            command: active.command,
-            output_parquet: active.output_parquet,
-            started_at_unix_ms: active.started_at_unix_ms,
-            finished_at_unix_ms,
-            exit_code: 1,
-            success: false,
-            error: Some(format!("wait task failed: {error}")),
-        },
-    };
-    state.finished = Some(finished);
-    state.sequence = state.sequence.saturating_add(1);
+    let _ = state;
     Ok(())
-}
-
-fn config_from_request(
-    request: StartTraceRequest,
-    prebuilt_generated_ebpf_path: Option<String>,
-) -> TraceCommandConfig {
-    TraceCommandConfig {
-        output: request.output_parquet,
-        sample_freq_hz: request.sample_freq_hz,
-        program: request.program,
-        args: request.args,
-        custom_probes: request.custom_probes,
-        prebuilt_generated_ebpf_path,
-    }
 }
 
 fn to_probe_schemas_query(query: PrivilegedProbeSchemasQuery) -> crate::viewer_probe_catalog::ProbeSchemasQuery {
@@ -204,8 +97,12 @@ async fn handle_request(
     request: PrivilegedDaemonRequest,
 ) -> PrivilegedDaemonResponse {
     match request {
-        PrivilegedDaemonRequest::StartTrace {
-            request,
+        PrivilegedDaemonRequest::AttachTrace {
+            target_pid,
+            command,
+            output_parquet,
+            sample_freq_hz,
+            custom_probes,
             prebuilt_generated_ebpf_path,
         } => {
             let mut guard = state.lock().await;
@@ -230,10 +127,6 @@ async fn handle_request(
             let run_id = guard.next_run_id;
             guard.next_run_id = guard.next_run_id.saturating_add(1);
             let started_at_unix_ms = now_unix_ms();
-            let mut command = Vec::with_capacity(request.args.len() + 1);
-            command.push(request.program.clone());
-            command.extend(request.args.clone());
-            let output_parquet = request.output_parquet.clone();
             if let Some(path) = prebuilt_generated_ebpf_path.as_deref() {
                 let candidate = std::path::Path::new(path);
                 if !candidate.is_absolute() {
@@ -261,8 +154,14 @@ async fn handle_request(
                     };
                 }
             }
-            let config = config_from_request(request, prebuilt_generated_ebpf_path);
-            let mut prepared = match prepare_trace_session(&config).await {
+            let mut prepared = match prepare_trace_session_for_existing_pid(
+                target_pid,
+                sample_freq_hz,
+                &custom_probes,
+                prebuilt_generated_ebpf_path,
+            )
+            .await
+            {
                 Ok(session) => session,
                 Err(error) => {
                     return PrivilegedDaemonResponse {
@@ -276,7 +175,7 @@ async fn handle_request(
                     };
                 }
             };
-            let map_fds = match trace_map_fds_from_prepared_session(&mut prepared) {
+            let map_fds = match trace_map_fds_from_parts(&mut prepared.ebpf, prepared.custom_mode) {
                 Ok(fds) => fds,
                 Err(error) => {
                     return PrivilegedDaemonResponse {
@@ -291,25 +190,13 @@ async fn handle_request(
                 }
             };
             let has_custom_events = map_fds.custom_events_fd.is_some();
-            let child_pid = prepared.child_pid;
-            if let Err(error) = kill(child_pid, Signal::SIGCONT).with_context(|| {
-                format!("failed to resume child process {} in privileged daemon", child_pid)
-            }) {
-                return PrivilegedDaemonResponse {
-                    ok: false,
-                    status: Some(status_response(&guard)),
-                    probe_schemas_page: None,
-                    probe_schema_detail: None,
-                    error: Some(format!("{error:#}")),
-                };
-            }
-            guard.finished = None;
             guard.active = Some(ActiveRun {
                 run_id,
+                target_pid,
                 command,
                 output_parquet,
                 started_at_unix_ms,
-                session: prepared,
+                _session: prepared,
                 map_fds,
                 has_custom_events,
             });
@@ -355,10 +242,11 @@ async fn handle_request(
                 };
             }
             if let Some(active) = guard.active.as_ref() {
-                let pid = active.session.child_pid;
-                let _ = kill(Pid::from_raw(pid.as_raw()), Signal::SIGTERM);
+                let pid = Pid::from_raw(active.target_pid as i32);
+                let _ = kill(pid, Signal::SIGTERM);
                 guard.sequence = guard.sequence.saturating_add(1);
             }
+            guard.active = None;
             PrivilegedDaemonResponse {
                 ok: true,
                 status: Some(status_response(&guard)),

@@ -3,11 +3,16 @@ use crate::{
     custom_codegen, trace_privilege,
 };
 use anyhow::{Context as _, Result, anyhow};
+use nix::{
+    sys::{
+        signal::{Signal, kill},
+        wait::waitpid,
+    },
+};
 use probex_common::viewer_api::{
     PrivilegedDaemonEnvelope, PrivilegedDaemonRequest, PrivilegedDaemonResponse,
     PrivilegedProbeSchemasQuery,
-    PrivilegedTraceMapFdsResponse, ProbeSchema, ProbeSchemasPageResponse, StartTraceRequest,
-    TraceRunStatus,
+    PrivilegedTraceMapFdsResponse, ProbeSchema, ProbeSchemasPageResponse,
 };
 use std::env;
 use std::io::Read as _;
@@ -46,16 +51,6 @@ fn daemon_session_token() -> Result<&'static str> {
         .get()
         .expect("daemon session token set")
         .as_str())
-}
-
-fn to_start_request(config: TraceCommandConfig) -> StartTraceRequest {
-    StartTraceRequest {
-        program: config.program,
-        args: config.args,
-        output_parquet: config.output,
-        sample_freq_hz: config.sample_freq_hz,
-        custom_probes: config.custom_probes,
-    }
 }
 
 async fn resolve_custom_probe_schemas(
@@ -135,24 +130,6 @@ fn parse_trace_map_fd_bundle(
         cpu_sample_stats_fd,
         custom_events_fd,
     })
-}
-
-async fn wait_for_daemon_finish() -> Result<TraceCommandOutcome> {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let response = send_request(PrivilegedDaemonRequest::Status).await?;
-        if !response.ok {
-            return Err(anyhow!(
-                "{}",
-                response
-                    .error
-                    .unwrap_or_else(|| "privileged daemon status query failed".to_string())
-            ));
-        }
-        if let Some(status) = response.status.and_then(|s| status_to_outcome(s.status)) {
-            return status;
-        }
-    }
 }
 
 async fn send_request(request: PrivilegedDaemonRequest) -> Result<PrivilegedDaemonResponse> {
@@ -242,30 +219,6 @@ async fn ensure_daemon_running() -> Result<()> {
     ))
 }
 
-fn status_to_outcome(status: TraceRunStatus) -> Option<Result<TraceCommandOutcome>> {
-    match status {
-        TraceRunStatus::Finished {
-            success,
-            error,
-            output_parquet,
-            ..
-        } => {
-            if success {
-                Some(Ok(TraceCommandOutcome {
-                    total_events: 0,
-                    output_path: output_parquet,
-                }))
-            } else {
-                Some(Err(anyhow!(
-                    "{}",
-                    error.unwrap_or_else(|| "privileged trace failed".to_string())
-                )))
-            }
-        }
-        _ => None,
-    }
-}
-
 pub(crate) async fn run_trace_via_daemon(
     config: TraceCommandConfig,
     mut stop_signal: Option<watch::Receiver<bool>>,
@@ -275,8 +228,23 @@ pub(crate) async fn run_trace_via_daemon(
     let (runtime_custom_probe_plan, runtime_payload_schemas_json) =
         compile_custom_probe_runtime_plan(&runtime_config).await?;
     let prebuilt_generated_ebpf_path = maybe_build_prebuilt_generated_ebpf(&config).await?;
-    let start_resp = send_request(PrivilegedDaemonRequest::StartTrace {
-        request: to_start_request(config),
+    let child_pid = crate::spawn_child(&config.program, &config.args, None)
+        .with_context(|| "step=spawn_child failed in unprivileged backend")?;
+    crate::wait_for_child_stop(child_pid)
+        .with_context(|| "step=wait_child_stop failed in unprivileged backend")?;
+    let child_wait = tokio::task::spawn_blocking(move || waitpid(child_pid, None));
+    let mut command = Vec::with_capacity(config.args.len() + 1);
+    command.push(config.program.clone());
+    command.extend(config.args.clone());
+
+    let target_pid = u32::try_from(child_pid.as_raw())
+        .with_context(|| format!("child pid must be non-negative, got {}", child_pid.as_raw()))?;
+    let start_resp = send_request(PrivilegedDaemonRequest::AttachTrace {
+        target_pid,
+        command,
+        output_parquet: config.output.clone(),
+        sample_freq_hz: config.sample_freq_hz,
+        custom_probes: config.custom_probes.clone(),
         prebuilt_generated_ebpf_path,
     })
     .await?;
@@ -287,9 +255,6 @@ pub(crate) async fn run_trace_via_daemon(
                 .error
                 .unwrap_or_else(|| "privileged daemon rejected start request".to_string())
         ));
-    }
-    if let Some(status) = start_resp.status.and_then(|s| status_to_outcome(s.status)) {
-        return status;
     }
     let (fd_response, fds) = take_trace_map_fds_via_daemon().await?;
     let map_fds = match parse_trace_map_fd_bundle(&fd_response, &fds) {
@@ -302,24 +267,13 @@ pub(crate) async fn run_trace_via_daemon(
         }
     };
 
+    kill(child_pid, Signal::SIGCONT)
+        .with_context(|| format!("failed to resume child process {}", child_pid))?;
+
     let (finished_tx, finished_rx) = watch::channel(false);
-    let status_poller = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            let response = send_request(PrivilegedDaemonRequest::Status).await?;
-            if !response.ok {
-                return Err(anyhow!(
-                    "{}",
-                    response
-                        .error
-                        .unwrap_or_else(|| "privileged daemon status query failed".to_string())
-                ));
-            }
-            if let Some(TraceRunStatus::Finished { .. }) = response.status.map(|s| s.status) {
-                let _ = finished_tx.send(true);
-                return Ok(());
-            }
-        }
+    let child_wait_task = tokio::spawn(async move {
+        let _ = child_wait.await;
+        let _ = finished_tx.send(true);
     });
 
     let consume_result = consume_trace_from_map_fds(
@@ -337,23 +291,18 @@ pub(crate) async fn run_trace_via_daemon(
             .to_string()
             .contains("trace stopped by request")
         {
+            let _ = kill(child_pid, Signal::SIGTERM);
             let _ = send_request(PrivilegedDaemonRequest::StopTrace).await;
-            let _ = wait_for_daemon_finish().await;
         }
-        let _ = status_poller.await;
+        let _ = child_wait_task.await;
         return Err(error);
     } else {
         consume_result.expect("consume result checked above")
     };
 
-    match status_poller.await {
-        Ok(Ok(())) => {
-            wait_for_daemon_finish().await?;
-            Ok(consume_outcome)
-        }
-        Ok(Err(error)) => Err(error),
-        Err(error) => Err(anyhow!("daemon status poller task failed: {error}")),
-    }
+    let _ = child_wait_task.await;
+    let _ = send_request(PrivilegedDaemonRequest::StopTrace).await;
+    Ok(consume_outcome)
 }
 
 pub(crate) async fn query_probe_schemas_page_via_daemon(

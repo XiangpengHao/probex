@@ -493,8 +493,12 @@ pub mod viewer_api {
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub enum PrivilegedDaemonRequest {
-        StartTrace {
-            request: StartTraceRequest,
+        AttachTrace {
+            target_pid: u32,
+            command: Vec<String>,
+            output_parquet: String,
+            sample_freq_hz: u64,
+            custom_probes: Vec<CustomProbeSpec>,
             prebuilt_generated_ebpf_path: Option<String>,
         },
         TakeTraceMapFds,
