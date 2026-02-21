@@ -51,8 +51,12 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
     let mut last_scroll_top = use_signal(|| 0.0f64);
     let mut probe_error = use_signal(|| Option::<String>::None);
     let mut refresh_nonce = use_signal(|| 0u64);
+    let mut catalog_initialized = use_signal(|| false);
 
     use_resource(move || async move {
+        if !catalog_initialized() {
+            return;
+        }
         page_request_in_flight.set(true);
         probes_loading.set(true);
         probe_error.set(None);
@@ -129,7 +133,20 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
 
     rsx! {
         details { class: "rounded border border-gray-200 bg-gray-50 px-2 py-1",
-            summary { class: "cursor-pointer text-xs text-gray-700 select-none", "Probe Schemas" }
+            ontoggle: move |_| {
+                if !catalog_initialized() {
+                    catalog_initialized.set(true);
+                }
+            },
+            summary {
+                class: "cursor-pointer text-xs text-gray-700 select-none",
+                onclick: move |_| {
+                    if !catalog_initialized() {
+                        catalog_initialized.set(true);
+                    }
+                },
+                "Custom Probes"
+            }
 
             div { class: "mt-1 grid grid-cols-1 lg:grid-cols-5 gap-2",
                 div { class: "lg:col-span-2 xl:col-span-2 rounded border border-gray-200 bg-white p-2 space-y-2",

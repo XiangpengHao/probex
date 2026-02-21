@@ -2682,6 +2682,14 @@ pub(crate) async fn run_trace_command(
     consume_trace_session(config, session, stop_signal, allow_ctrl_c).await
 }
 
+fn looks_like_permission_error(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("eperm")
+        || lower.contains("eacces")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -2719,19 +2727,28 @@ async fn main() -> Result<()> {
         .command
         .split_first()
         .ok_or_else(|| anyhow!("clap invariant violated: missing command in trace mode"))?;
-    let outcome = run_trace_command(
-        TraceCommandConfig {
-            output: args.output.clone(),
-            sample_freq_hz: args.sample_freq,
-            program: program.clone(),
-            args: program_args.to_vec(),
-            custom_probes: Vec::new(),
-            prebuilt_generated_ebpf_path: None,
-        },
-        None,
-        true,
-    )
-    .await?;
+    let config = TraceCommandConfig {
+        output: args.output.clone(),
+        sample_freq_hz: args.sample_freq,
+        program: program.clone(),
+        args: program_args.to_vec(),
+        custom_probes: Vec::new(),
+        prebuilt_generated_ebpf_path: None,
+    };
+    let outcome = match run_trace_command(config.clone(), None, true).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let error_text = format!("{error:#}");
+            if !looks_like_permission_error(&error_text) {
+                return Err(error);
+            }
+            log::warn!(
+                "Direct tracing failed with permission error; trying privileged daemon fallback: {}",
+                error_text
+            );
+            viewer_privileged_daemon_client::run_trace_via_daemon(config, None).await?
+        }
+    };
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if outcome.total_events > 0 && !args.no_viewer {

@@ -112,7 +112,6 @@ mod backend {
 
     pub async fn initialize(parquet_file: PathBuf) -> BackendResult<()> {
         load_trace_file(parquet_file).await?;
-        viewer_probe_catalog::initialize_probe_index_loading();
         Ok(())
     }
 
