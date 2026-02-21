@@ -1783,6 +1783,7 @@ pub(crate) struct TraceCommandConfig {
     pub program: String,
     pub args: Vec<String>,
     pub custom_probes: Vec<probex_common::viewer_api::CustomProbeSpec>,
+    pub prebuilt_generated_ebpf_path: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1846,13 +1847,19 @@ pub(crate) async fn run_trace_command(
 
     // Load eBPF program (embedded by default, generated when custom probes are present).
     let mut ebpf = if custom_mode {
-        let generated_source = generate_custom_probe_source(&custom_probe_plan)
-            .with_context(|| "step=generate_rust_code failed")?;
-        let generated_binary =
+        let generated_binary = if let Some(prebuilt_path) = config.prebuilt_generated_ebpf_path.as_ref()
+        {
+            std::fs::read(prebuilt_path).with_context(|| {
+                format!("step=load_prebuilt_generated_ebpf failed: {prebuilt_path}")
+            })?
+        } else {
+            let generated_source = generate_custom_probe_source(&custom_probe_plan)
+                .with_context(|| "step=generate_rust_code failed")?;
             tokio::task::spawn_blocking(move || build_generated_ebpf_binary(&generated_source))
                 .await
                 .with_context(|| "step=build_generated_ebpf failed: task join error")?
-                .with_context(|| "step=build_generated_ebpf failed")?;
+                .with_context(|| "step=build_generated_ebpf failed")?
+        };
         aya::Ebpf::load(&generated_binary).with_context(|| "step=load_ebpf failed")?
     } else {
         aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -2364,6 +2371,7 @@ async fn main() -> Result<()> {
             program: program.clone(),
             args: program_args.to_vec(),
             custom_probes: Vec::new(),
+            prebuilt_generated_ebpf_path: None,
         },
         None,
         true,
