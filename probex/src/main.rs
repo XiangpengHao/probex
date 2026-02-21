@@ -1792,7 +1792,7 @@ pub(crate) struct TraceCommandOutcome {
     pub output_path: String,
 }
 
-struct PreparedTraceSession {
+pub(crate) struct PreparedTraceSession {
     ebpf: aya::Ebpf,
     child_pid: Pid,
     child_wait: tokio::task::JoinHandle<Result<WaitStatus, nix::Error>>,
@@ -1821,7 +1821,9 @@ async fn resolve_custom_probe_schemas(
     Ok(resolved)
 }
 
-async fn prepare_trace_session(config: &TraceCommandConfig) -> Result<PreparedTraceSession> {
+pub(crate) async fn prepare_trace_session(
+    config: &TraceCommandConfig,
+) -> Result<PreparedTraceSession> {
     let resolved_custom_probe_schemas =
         resolve_custom_probe_schemas(&config.custom_probes)
             .await
@@ -2103,7 +2105,7 @@ async fn prepare_trace_session(config: &TraceCommandConfig) -> Result<PreparedTr
     })
 }
 
-async fn consume_trace_session(
+pub(crate) async fn consume_trace_session(
     config: TraceCommandConfig,
     mut session: PreparedTraceSession,
     mut stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
