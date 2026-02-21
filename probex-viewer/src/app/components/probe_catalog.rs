@@ -355,6 +355,30 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
                                                             if active_editor_probe().is_none() {
                                                                 active_editor_probe.set(Some(id.clone()));
                                                             }
+                                                            let needs_detail = selected_probe_schemas()
+                                                                .get(&id)
+                                                                .map(|p| p.kind == ProbeSchemaKind::Tracepoint && p.fields.is_empty())
+                                                                .unwrap_or(true);
+                                                            if needs_detail {
+                                                                let detail_id = id.clone();
+                                                                spawn(async move {
+                                                                    match get_probe_schema_detail(detail_id.clone()).await {
+                                                                        Ok(detail) => {
+                                                                            let mut items = probes();
+                                                                            if let Some(slot) = items.iter_mut().find(|p| p.display_name == detail_id) {
+                                                                                *slot = detail.clone();
+                                                                            }
+                                                                            probes.set(items);
+                                                                            let mut schemas = selected_probe_schemas();
+                                                                            if schemas.contains_key(&detail_id) {
+                                                                                schemas.insert(detail_id, detail);
+                                                                                selected_probe_schemas.set(schemas);
+                                                                            }
+                                                                        }
+                                                                        Err(error) => probe_error.set(Some(error)),
+                                                                    }
+                                                                });
+                                                            }
                                                         }
                                                         selected_probes.set(selected);
                                                     }
