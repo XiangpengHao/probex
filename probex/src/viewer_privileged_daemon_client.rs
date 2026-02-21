@@ -4,23 +4,48 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use probex_common::viewer_api::{
-    PrivilegedDaemonRequest, PrivilegedDaemonResponse, PrivilegedProbeSchemasQuery,
+    PrivilegedDaemonEnvelope, PrivilegedDaemonRequest, PrivilegedDaemonResponse,
+    PrivilegedProbeSchemasQuery,
     PrivilegedTraceMapFdsResponse, ProbeSchema, ProbeSchemasPageResponse, StartTraceRequest,
     TraceRunStatus,
 };
 use std::env;
+use std::io::Read as _;
 use std::os::fd::AsRawFd as _;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
 use tokio::process::Command;
+use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, OnceCell, watch};
 
 static DAEMON_START_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
+static DAEMON_SESSION_TOKEN: OnceLock<String> = OnceLock::new();
 
 fn daemon_socket_path() -> PathBuf {
     let uid = unsafe { libc::geteuid() };
     PathBuf::from(format!("/tmp/probex-privileged-{uid}.sock"))
+}
+
+fn daemon_session_token() -> Result<&'static str> {
+    if let Some(token) = DAEMON_SESSION_TOKEN.get() {
+        return Ok(token.as_str());
+    }
+    let mut bytes = [0u8; 32];
+    let mut file = std::fs::File::open("/dev/urandom")
+        .with_context(|| "failed to open /dev/urandom for daemon session token")?;
+    file.read_exact(&mut bytes)
+        .with_context(|| "failed to read daemon session token bytes from /dev/urandom")?;
+    let token = bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let _ = DAEMON_SESSION_TOKEN.set(token);
+    Ok(DAEMON_SESSION_TOKEN
+        .get()
+        .expect("daemon session token set")
+        .as_str())
 }
 
 fn to_start_request(config: TraceCommandConfig) -> StartTraceRequest {
@@ -135,7 +160,11 @@ async fn send_request(request: PrivilegedDaemonRequest) -> Result<PrivilegedDaem
     let mut stream = UnixStream::connect(&socket)
         .await
         .with_context(|| format!("failed to connect privileged daemon socket {:?}", socket))?;
-    let payload = serde_json::to_vec(&request).with_context(|| "failed to encode daemon request")?;
+    let payload = serde_json::to_vec(&PrivilegedDaemonEnvelope {
+        session_token: daemon_session_token()?.to_string(),
+        request,
+    })
+    .with_context(|| "failed to encode daemon request")?;
     stream
         .write_all(&payload)
         .await
@@ -169,6 +198,7 @@ async fn ensure_daemon_running() -> Result<()> {
 
     let socket = daemon_socket_path();
     let exe = env::current_exe().with_context(|| "failed to resolve current executable path")?;
+    let session_token = daemon_session_token()?.to_string();
     let mut child = Command::new("pkexec")
         .arg(exe)
         .arg("--privileged-daemon")
@@ -176,10 +206,20 @@ async fn ensure_daemon_running() -> Result<()> {
         .arg(socket.as_os_str())
         .arg("--privileged-daemon-owner-uid")
         .arg(format!("{}", unsafe { libc::geteuid() }))
+        .stdin(std::process::Stdio::piped())
         .spawn()
         .with_context(|| {
             "failed to spawn privileged daemon via pkexec (is pkexec installed and authorized?)"
         })?;
+    let mut stdin: ChildStdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open privileged daemon stdin for token transfer"))?;
+    stdin
+        .write_all(format!("{session_token}\n").as_bytes())
+        .await
+        .with_context(|| "failed to write privileged daemon session token")?;
+    drop(stdin);
 
     // Wait briefly for daemon socket readiness. Keep pkexec process running in background.
     for _ in 0..50u32 {
@@ -355,8 +395,11 @@ pub(crate) async fn take_trace_map_fds_via_daemon(
 ) -> Result<(PrivilegedTraceMapFdsResponse, Vec<i32>)> {
     ensure_daemon_running().await?;
     let socket = daemon_socket_path();
-    let request = PrivilegedDaemonRequest::TakeTraceMapFds;
-    let payload = serde_json::to_vec(&request).with_context(|| "failed to encode daemon request")?;
+    let payload = serde_json::to_vec(&PrivilegedDaemonEnvelope {
+        session_token: daemon_session_token()?.to_string(),
+        request: PrivilegedDaemonRequest::TakeTraceMapFds,
+    })
+    .with_context(|| "failed to encode daemon request")?;
     let socket_clone = socket.clone();
     tokio::task::spawn_blocking(move || -> Result<(PrivilegedTraceMapFdsResponse, Vec<i32>)> {
         use std::io::{Read as _, Write as _};

@@ -11,7 +11,8 @@ use nix::{
     unistd::Pid,
 };
 use probex_common::viewer_api::{
-    PrivilegedDaemonRequest, PrivilegedDaemonResponse, PrivilegedProbeSchemasQuery, PrivilegedTraceMapFdsResponse,
+    PrivilegedDaemonEnvelope, PrivilegedDaemonRequest, PrivilegedDaemonResponse,
+    PrivilegedProbeSchemasQuery, PrivilegedTraceMapFdsResponse,
     StartTraceRequest, TraceRunStatus, TraceRunStatusResponse,
 };
 use std::os::fd::AsRawFd as _;
@@ -430,6 +431,7 @@ async fn handle_conn(
     state: Arc<Mutex<DaemonState>>,
     mut stream: UnixStream,
     owner_uid: u32,
+    expected_session_token: Arc<String>,
 ) -> Result<()> {
     let peer = stream
         .peer_cred()
@@ -449,8 +451,12 @@ async fn handle_conn(
     if buf.is_empty() {
         return Ok(());
     }
-    let request: PrivilegedDaemonRequest = serde_json::from_slice(&buf)
-        .with_context(|| "failed to parse daemon request")?;
+    let envelope: PrivilegedDaemonEnvelope = serde_json::from_slice(&buf)
+        .with_context(|| "failed to parse daemon request envelope")?;
+    if envelope.session_token != *expected_session_token {
+        return Err(anyhow!("unauthorized daemon client: invalid session token"));
+    }
+    let request = envelope.request;
     if matches!(request, PrivilegedDaemonRequest::TakeTraceMapFds) {
         let mut guard = state.lock().await;
         if let Err(error) = refresh(&mut guard).await {
@@ -511,7 +517,7 @@ async fn handle_conn(
     Ok(())
 }
 
-pub(crate) async fn run(socket_path: &Path, owner_uid: u32) -> Result<()> {
+pub(crate) async fn run(socket_path: &Path, owner_uid: u32, session_token: String) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(socket_path)
             .with_context(|| format!("failed to remove stale daemon socket {:?}", socket_path))?;
@@ -543,12 +549,14 @@ pub(crate) async fn run(socket_path: &Path, owner_uid: u32) -> Result<()> {
     }
 
     let state = Arc::new(Mutex::new(DaemonState::new()));
+    let expected_session_token = Arc::new(session_token);
     loop {
         let (stream, _) = listener.accept().await.with_context(|| "daemon accept failed")?;
         let state = Arc::clone(&state);
         let owner_uid = owner_uid;
+        let expected_session_token = Arc::clone(&expected_session_token);
         tokio::spawn(async move {
-            if let Err(error) = handle_conn(state, stream, owner_uid).await {
+            if let Err(error) = handle_conn(state, stream, owner_uid, expected_session_token).await {
                 log::error!("privileged daemon connection error: {error:#}");
             }
         });

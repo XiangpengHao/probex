@@ -2691,7 +2691,22 @@ async fn main() -> Result<()> {
         let owner_uid = args.privileged_daemon_owner_uid.ok_or_else(|| {
             anyhow!("--privileged-daemon requires --privileged-daemon-owner-uid")
         })?;
-        return privileged_daemon::run(std::path::Path::new(&args.privileged_daemon_socket), owner_uid).await;
+        let mut token_buf = String::new();
+        std::io::stdin()
+            .read_line(&mut token_buf)
+            .with_context(|| "failed to read privileged daemon token from stdin")?;
+        let session_token = token_buf.trim().to_string();
+        if session_token.is_empty() {
+            return Err(anyhow!(
+                "privileged daemon requires non-empty token on stdin"
+            ));
+        }
+        return privileged_daemon::run(
+            std::path::Path::new(&args.privileged_daemon_socket),
+            owner_uid,
+            session_token,
+        )
+        .await;
     }
 
     if let Some(parquet_file) = args.view.as_deref() {

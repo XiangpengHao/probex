@@ -518,6 +518,12 @@ pub mod viewer_api {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedDaemonEnvelope {
+        pub session_token: String,
+        pub request: PrivilegedDaemonRequest,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct PrivilegedTraceMapFdsResponse {
         pub ok: bool,
         pub run_id: Option<u64>,
