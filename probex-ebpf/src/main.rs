@@ -9,6 +9,11 @@ use aya_ebpf::{
     maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
     programs::{PerfEventContext, TracePointContext},
 };
+#[cfg(probex_generated_probes)]
+use aya_ebpf::{
+    macros::{fentry, fexit},
+    programs::{FEntryContext, FExitContext},
+};
 use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STAT_USER_STACK,
@@ -302,9 +307,9 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
 
 fn try_sched_process_fork(ctx: &TracePointContext) -> Result<u32, i64> {
     // Read parent_pid at offset 24
-    let parent_pid: u32 = unsafe { ctx.read_at(24)? };
+    let parent_pid: u32 = unsafe { ctx.read_at(12)? };
     // Read child_pid at offset 44
-    let child_pid: u32 = unsafe { ctx.read_at(44)? };
+    let child_pid: u32 = unsafe { ctx.read_at(20)? };
 
     // Only track if parent is being traced
     if !is_traced(parent_pid) {
@@ -1219,6 +1224,9 @@ fn try_sys_exit_fdatasync(ctx: &TracePointContext) -> Result<u32, i64> {
 
     Ok(0)
 }
+
+#[cfg(probex_generated_probes)]
+include!(env!("PROBEX_GENERATED_PROBES_RS"));
 
 #[cfg(not(test))]
 #[panic_handler]

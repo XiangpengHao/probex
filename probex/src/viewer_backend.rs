@@ -3,15 +3,19 @@
 //! Uses DataFusion to query parquet trace files.
 
 pub use probex_common::viewer_api::{
-    CumulativeMemoryPoint, EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker,
-    EventTypeCounts, HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencySummary,
-    MemoryStatistics, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
+    CumulativeMemoryPoint, CustomEventDebugField, CustomEventDebugRow, CustomEventField,
+    CustomEventPayload, CustomEventsDebugResponse, CustomPayloadSchema, CustomPayloadTypeKind,
+    EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts,
+    HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencySummary,
+    MemoryStatistics, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource, ProbeSchemasPageResponse,
+    ProbeSchemasResponse, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
     SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
 mod backend {
     use super::*;
+    use crate::{viewer_privileged_daemon_client, viewer_probe_catalog};
     use datafusion::arrow::array::{
         Array, Int32Array, Int64Array, ListArray, StringArray, StringViewArray, UInt32Array,
         UInt64Array,
@@ -20,38 +24,98 @@ mod backend {
     use datafusion::prelude::*;
     use inferno::flamegraph;
     use parquet::file::reader::{FileReader, SerializedFileReader};
+    use serde::Deserialize;
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
     use std::path::PathBuf;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::{Arc, OnceLock, RwLock};
 
-    static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
-    static TRACE_FILE_METADATA: OnceLock<TraceFileMetadata> = OnceLock::new();
+    static LOADED_TRACE: OnceLock<RwLock<Option<LoadedTrace>>> = OnceLock::new();
 
     const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "probex.sample_freq_hz";
     const PARQUET_METADATA_STACK_TRACE_FORMAT_KEY: &str = "probex.stack_trace_format";
+    const PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY: &str = "probex.custom_payload_schemas_v1";
     const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
     type BackendResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    fn looks_like_permission_error(error_text: &str) -> bool {
+        let lower = error_text.to_ascii_lowercase();
+        lower.contains("permission denied")
+            || lower.contains("operation not permitted")
+            || lower.contains("eperm")
+            || lower.contains("eacces")
+    }
+
+    fn wants_function_kinds(query: &viewer_probe_catalog::ProbeSchemasQuery) -> bool {
+        query.kinds.as_ref().is_none_or(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, ProbeSchemaKind::Fentry | ProbeSchemaKind::Fexit))
+        })
+    }
+
+    fn to_privileged_query(
+        query: viewer_probe_catalog::ProbeSchemasQuery,
+    ) -> probex_common::viewer_api::PrivilegedProbeSchemasQuery {
+        probex_common::viewer_api::PrivilegedProbeSchemasQuery {
+            search: query.search,
+            category: query.category,
+            provider: query.provider,
+            kinds: query.kinds,
+            source: query.source,
+            offset: query.offset,
+            limit: query.limit,
+            include_fields: query.include_fields,
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct JsonPayloadValue {
+        field_id: u16,
+        name: String,
+        type_kind: String,
+        value_u64: u64,
+        value_i64: Option<i64>,
+    }
 
     #[derive(Clone, Debug)]
     struct TraceFileMetadata {
         cpu_sample_frequency_hz: u64,
+        _custom_payload_schemas: Vec<CustomPayloadSchema>,
     }
 
-    fn get_ctx() -> BackendResult<&'static Arc<SessionContext>> {
-        SESSION_CTX
-            .get()
+    #[derive(Clone)]
+    struct LoadedTrace {
+        ctx: Arc<SessionContext>,
+        metadata: TraceFileMetadata,
+    }
+
+    fn loaded_trace_lock() -> &'static RwLock<Option<LoadedTrace>> {
+        LOADED_TRACE.get_or_init(|| RwLock::new(None))
+    }
+
+    fn get_loaded_trace() -> BackendResult<LoadedTrace> {
+        loaded_trace_lock()
+            .read()
+            .map_err(|_| IoError::other("failed to lock loaded trace state"))?
+            .clone()
             .ok_or_else(|| "DataFusion session not initialized".into())
     }
 
+    fn get_ctx() -> BackendResult<Arc<SessionContext>> {
+        Ok(get_loaded_trace()?.ctx)
+    }
+
+    fn get_trace_metadata() -> BackendResult<TraceFileMetadata> {
+        Ok(get_loaded_trace()?.metadata)
+    }
+
     pub async fn initialize(parquet_file: PathBuf) -> BackendResult<()> {
-        if SESSION_CTX.get().is_some() {
-            return Err(IoError::new(
-                ErrorKind::AlreadyExists,
-                "DataFusion session is already initialized",
-            )
-            .into());
-        }
+        load_trace_file(parquet_file).await?;
+        Ok(())
+    }
+
+    pub async fn load_trace_file(parquet_file: PathBuf) -> BackendResult<()> {
         if !parquet_file.exists() {
             return Err(IoError::new(
                 ErrorKind::NotFound,
@@ -61,7 +125,6 @@ mod backend {
         }
 
         let metadata = read_trace_file_metadata(&parquet_file)?;
-        let _ = TRACE_FILE_METADATA.set(metadata);
 
         let ctx = SessionContext::new();
 
@@ -78,6 +141,12 @@ mod backend {
         let has_legacy_proc_maps = events_table
             .schema()
             .has_column_with_unqualified_name("proc_maps_snapshot");
+        let has_custom_schema_id = events_table
+            .schema()
+            .has_column_with_unqualified_name("custom_schema_id");
+        let has_custom_payload_json = events_table
+            .schema()
+            .has_column_with_unqualified_name("custom_payload_json");
 
         if !has_stack_trace {
             return Err(IoError::new(
@@ -94,6 +163,16 @@ mod backend {
                 ErrorKind::InvalidData,
                 format!(
                     "Trace {} uses legacy stack columns. Regenerate with current probex.",
+                    parquet_file.display()
+                ),
+            )
+            .into());
+        }
+        if !has_custom_schema_id || !has_custom_payload_json {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "Trace {} is missing required custom payload columns. Regenerate with current probex.",
                     parquet_file.display()
                 ),
             )
@@ -121,6 +200,45 @@ mod backend {
             )
             .into());
         }
+        let custom_schema_id_field = events_table
+            .schema()
+            .field_with_unqualified_name("custom_schema_id")
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to resolve custom_schema_id field: {error}"),
+                )
+            })?;
+        if custom_schema_id_field.data_type() != &DataType::UInt32 {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "column 'custom_schema_id' must have type UInt32, got {:?}",
+                    custom_schema_id_field.data_type()
+                ),
+            )
+            .into());
+        }
+        let custom_payload_json_field = events_table
+            .schema()
+            .field_with_unqualified_name("custom_payload_json")
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to resolve custom_payload_json field: {error}"),
+                )
+            })?;
+        let custom_payload_ty = custom_payload_json_field.data_type();
+        if custom_payload_ty != &DataType::Utf8 && custom_payload_ty != &DataType::Utf8View {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "column 'custom_payload_json' must have type Utf8 or Utf8View, got {:?}",
+                    custom_payload_ty
+                ),
+            )
+            .into());
+        }
 
         // Verify we can read the table
         let df = ctx.sql("SELECT COUNT(*) as cnt FROM events").await?;
@@ -130,12 +248,13 @@ mod backend {
         })?;
         let count = extract_i64(count_batch, "cnt", 0)?;
 
-        SESSION_CTX.set(Arc::new(ctx)).map_err(|_| {
-            IoError::new(
-                ErrorKind::AlreadyExists,
-                "DataFusion session already initialized",
-            )
-        })?;
+        let mut loaded = loaded_trace_lock()
+            .write()
+            .map_err(|_| IoError::other("failed to lock loaded trace state"))?;
+        *loaded = Some(LoadedTrace {
+            ctx: Arc::new(ctx),
+            metadata,
+        });
 
         log::info!("Loaded {count} events from {:?}", parquet_file);
         Ok(())
@@ -206,10 +325,132 @@ mod backend {
             )
             .into());
         }
+        let custom_payload_schemas_json =
+            metadata_value(PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY).ok_or_else(|| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "required parquet metadata key '{}' missing",
+                        PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY
+                    ),
+                )
+            })?;
+        let custom_payload_schemas: Vec<CustomPayloadSchema> =
+            serde_json::from_str(custom_payload_schemas_json).map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "invalid '{}' metadata value: {}",
+                        PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY, error
+                    ),
+                )
+            })?;
 
         Ok(TraceFileMetadata {
             cpu_sample_frequency_hz,
+            _custom_payload_schemas: custom_payload_schemas,
         })
+    }
+
+    pub async fn query_probe_schemas_page(
+        query: viewer_probe_catalog::ProbeSchemasQuery,
+    ) -> BackendResult<ProbeSchemasPageResponse> {
+        match viewer_probe_catalog::query_probe_schemas_page(query.clone()).await {
+            Ok(page) => {
+                if wants_function_kinds(&query) {
+                    match viewer_probe_catalog::has_function_probes_loaded() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return viewer_privileged_daemon_client::query_probe_schemas_page_via_daemon(
+                                to_privileged_query(query),
+                            )
+                            .await
+                            .map_err(|fallback_error| {
+                                IoError::new(
+                                    ErrorKind::PermissionDenied,
+                                    format!(
+                                        "local catalog has no fentry/fexit probes; privileged daemon fallback failed: {fallback_error:#}"
+                                    ),
+                                )
+                            })
+                            .map_err(Into::into);
+                        }
+                        Err(error) => {
+                            let error_text = error.to_string();
+                            if looks_like_permission_error(&error_text) {
+                                return viewer_privileged_daemon_client::query_probe_schemas_page_via_daemon(
+                                    to_privileged_query(query),
+                                )
+                                .await
+                                .map_err(|fallback_error| {
+                                    IoError::new(
+                                        ErrorKind::PermissionDenied,
+                                        format!(
+                                            "probe schemas page local function probe check failed: {error_text}; privileged daemon fallback failed: {fallback_error:#}"
+                                        ),
+                                    )
+                                })
+                                .map_err(Into::into);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(page)
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                if !looks_like_permission_error(&error_text) {
+                    return Err(error);
+                }
+                let page = viewer_privileged_daemon_client::query_probe_schemas_page_via_daemon(
+                    to_privileged_query(query),
+                )
+                .await
+                .map_err(|fallback_error| {
+                    IoError::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "probe schemas page query failed: {error_text}; privileged daemon fallback failed: {fallback_error:#}"
+                        ),
+                    )
+                })?;
+                Ok(page)
+            }
+        }
+    }
+
+    pub async fn query_probe_schema_detail(display_name: String) -> BackendResult<ProbeSchema> {
+        match viewer_probe_catalog::query_probe_schema_detail(display_name.clone()).await {
+            Ok(schema) => Ok(schema),
+            Err(error) => {
+                let error_text = error.to_string();
+                let is_function_probe =
+                    display_name.starts_with("fentry:") || display_name.starts_with("fexit:");
+                if !looks_like_permission_error(&error_text)
+                    && !(is_function_probe && error_text.to_ascii_lowercase().contains("not found"))
+                {
+                    return Err(error);
+                }
+                let schema = viewer_privileged_daemon_client::query_probe_schema_detail_via_daemon(
+                    display_name,
+                )
+                .await
+                .map_err(|fallback_error| {
+                    IoError::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "probe schema detail query failed: {error_text}; privileged daemon fallback failed: {fallback_error:#}"
+                        ),
+                    )
+                })?;
+                Ok(schema)
+            }
+        }
+    }
+
+    pub async fn query_probe_schemas() -> BackendResult<ProbeSchemasResponse> {
+        viewer_probe_catalog::query_probe_schemas().await
     }
 
     fn extract_string(
@@ -336,6 +577,51 @@ mod backend {
             "stack_trace list items must be Utf8View/Utf8",
         )
         .into())
+    }
+
+    fn parse_custom_payload_json(
+        payload_raw: &str,
+        ctx_label: &str,
+    ) -> BackendResult<Vec<CustomEventField>> {
+        let payload_values: Vec<JsonPayloadValue> =
+            serde_json::from_str(payload_raw).map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid custom_payload_json at {ctx_label}: {error}"),
+                )
+            })?;
+
+        payload_values
+            .into_iter()
+            .map(|value| {
+                let type_kind = match value.type_kind.as_str() {
+                    "u64" => CustomPayloadTypeKind::U64,
+                    "i64" => CustomPayloadTypeKind::I64,
+                    other => {
+                        return Err(IoError::new(
+                            ErrorKind::InvalidData,
+                            format!("unsupported custom payload type kind '{other}'"),
+                        )
+                        .into());
+                    }
+                };
+                let display_value = match type_kind {
+                    CustomPayloadTypeKind::U64 => value.value_u64.to_string(),
+                    CustomPayloadTypeKind::I64 => value
+                        .value_i64
+                        .unwrap_or(value.value_u64 as i64)
+                        .to_string(),
+                };
+                Ok(CustomEventField {
+                    field_id: value.field_id,
+                    name: value.name,
+                    type_kind,
+                    value_u64: value.value_u64,
+                    value_i64: value.value_i64,
+                    display_value,
+                })
+            })
+            .collect()
     }
 
     fn extract_u64(
@@ -763,6 +1049,7 @@ mod backend {
 
     pub async fn query_summary() -> BackendResult<TraceSummary> {
         let ctx = get_ctx()?;
+        let metadata = get_trace_metadata()?;
 
         // Get total count
         let count_df = ctx.sql("SELECT COUNT(*) as cnt FROM events").await?;
@@ -818,12 +1105,7 @@ mod backend {
             unique_pids,
             min_ts_ns,
             max_ts_ns,
-            cpu_sample_frequency_hz: TRACE_FILE_METADATA
-                .get()
-                .ok_or_else(|| {
-                    IoError::new(ErrorKind::InvalidData, "trace metadata not initialized")
-                })?
-                .cpu_sample_frequency_hz,
+            cpu_sample_frequency_hz: metadata.cpu_sample_frequency_hz,
         })
     }
 
@@ -977,10 +1259,7 @@ mod backend {
         let mut cpu_sample_counts_by_pid: std::collections::HashMap<u32, Vec<u16>> =
             std::collections::HashMap::new();
 
-        let sample_frequency_hz = TRACE_FILE_METADATA
-            .get()
-            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "trace metadata not initialized"))?
-            .cpu_sample_frequency_hz;
+        let sample_frequency_hz = get_trace_metadata()?.cpu_sample_frequency_hz;
         let range_ns = end_ns.saturating_sub(start_ns).max(1);
         let expected_samples_total =
             (sample_frequency_hz as f64) * (range_ns as f64 / 1_000_000_000.0);
@@ -1328,6 +1607,7 @@ mod backend {
                 event_type: operation.clone(),
                 pid,
                 stack_trace: stack.clone(),
+                custom_payload: None,
             })
         };
 
@@ -1665,6 +1945,71 @@ mod backend {
         })
     }
 
+    pub async fn query_custom_events_debug() -> BackendResult<CustomEventsDebugResponse> {
+        const CUSTOM_EVENTS_DEBUG_LIMIT: usize = 500;
+
+        let ctx = get_ctx()?;
+        let sql = format!(
+            "SELECT ts_ns, event_type, pid, tgid, process_name, custom_schema_id, custom_payload_json \
+             FROM events \
+             WHERE custom_schema_id IS NOT NULL \
+             ORDER BY ts_ns ASC \
+             LIMIT {CUSTOM_EVENTS_DEBUG_LIMIT}"
+        );
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        let mut events = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let ts_ns = extract_u64(batch, "ts_ns", row)?;
+                let event_type = extract_string(batch, "event_type", row)?;
+                let pid = extract_u32(batch, "pid", row)?;
+                let tgid = extract_u32(batch, "tgid", row)?;
+                let process_name = extract_option_string(batch, "process_name", row)?;
+                let schema_id =
+                    extract_option_u32(batch, "custom_schema_id", row)?.ok_or_else(|| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            "custom event row is missing custom_schema_id",
+                        )
+                    })?;
+                let payload_raw = extract_option_string(batch, "custom_payload_json", row)?
+                    .unwrap_or_else(|| "[]".to_string());
+                let fields = parse_custom_payload_json(
+                    &payload_raw,
+                    format!("ts_ns={ts_ns}, pid={pid}").as_str(),
+                )?
+                .into_iter()
+                .map(|field| CustomEventDebugField {
+                    field_id: field.field_id,
+                    name: field.name,
+                    type_kind: field.type_kind,
+                    value_u64: field.value_u64,
+                    value_i64: field.value_i64,
+                    display_value: field.display_value,
+                })
+                .collect::<Vec<_>>();
+
+                events.push(CustomEventDebugRow {
+                    ts_ns,
+                    event_type,
+                    pid,
+                    tgid,
+                    process_name,
+                    schema_id,
+                    fields,
+                });
+            }
+        }
+
+        Ok(CustomEventsDebugResponse {
+            shown: events.len(),
+            events,
+            limit: CUSTOM_EVENTS_DEBUG_LIMIT,
+        })
+    }
+
     pub async fn query_event_list(
         start_ns: u64,
         end_ns: u64,
@@ -1696,7 +2041,7 @@ mod backend {
         )? as usize;
 
         let sql = format!(
-            "SELECT ts_ns, event_type, pid, stack_trace FROM events \
+            "SELECT ts_ns, event_type, pid, stack_trace, custom_schema_id, custom_payload_json FROM events \
              WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter} \
              ORDER BY ts_ns LIMIT {limit} OFFSET {offset}"
         );
@@ -1710,12 +2055,25 @@ mod backend {
                 let event_type = extract_string(batch, "event_type", row)?;
                 let pid = extract_u32(batch, "pid", row)?;
                 let stack_trace = extract_option_stack_trace_labels(batch, row)?;
+                let custom_payload = match extract_option_u32(batch, "custom_schema_id", row)? {
+                    Some(schema_id) => {
+                        let payload_raw = extract_option_string(batch, "custom_payload_json", row)?
+                            .unwrap_or_else(|| "[]".to_string());
+                        let fields = parse_custom_payload_json(
+                            &payload_raw,
+                            format!("ts_ns={ts_ns}, pid={pid}").as_str(),
+                        )?;
+                        Some(CustomEventPayload { schema_id, fields })
+                    }
+                    None => None,
+                };
                 events.push(EventDetail {
                     ts_ns,
                     latency_ns: None,
                     event_type,
                     pid,
                     stack_trace,
+                    custom_payload,
                 });
             }
         }
@@ -1727,10 +2085,18 @@ mod backend {
     }
 }
 
+pub use crate::viewer_probe_catalog::ProbeSchemasQuery;
+
 pub async fn initialize(
     parquet_file: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     backend::initialize(parquet_file).await
+}
+
+pub async fn load_trace_file(
+    parquet_file: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    backend::load_trace_file(parquet_file).await
 }
 
 pub async fn query_summary() -> Result<TraceSummary, Box<dyn std::error::Error + Send + Sync>> {
@@ -1789,6 +2155,28 @@ pub async fn query_event_flamegraph(
     max_stacks: usize,
 ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
     backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks).await
+}
+
+pub async fn query_custom_events_debug()
+-> Result<CustomEventsDebugResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_custom_events_debug().await
+}
+
+pub async fn query_probe_schemas()
+-> Result<ProbeSchemasResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_probe_schemas().await
+}
+
+pub async fn query_probe_schemas_page(
+    query: ProbeSchemasQuery,
+) -> Result<ProbeSchemasPageResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_probe_schemas_page(query).await
+}
+
+pub async fn query_probe_schema_detail(
+    display_name: String,
+) -> Result<ProbeSchema, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_probe_schema_detail(display_name).await
 }
 
 pub async fn query_io_statistics(

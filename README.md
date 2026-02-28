@@ -17,13 +17,28 @@ You need to have the `bpf-linker` tool installed.
 ```shell
 cargo install bpf-linker
 cargo install probex
-sudo probex -- sleep 1
+probex -- sleep 1
 ```
 
 Or build from source:
 ```shell
 cargo build --release -p probex --locked
-sudo target/release/probex -- sleep 1
+target/release/probex -- sleep 1
+```
+
+### Launch modes
+
+`probex` supports three user-facing modes:
+
+```shell
+# Launch backend + frontend only (no initial trace loaded)
+probex
+
+# Open an existing trace file
+probex --view trace.parquet
+
+# Trace a command, then open the result in the viewer
+probex -- sleep 1
 ```
 
 ### Download binary
@@ -33,7 +48,6 @@ wget -O probex.tar.gz $(curl -s https://api.github.com/repos/XiangpengHao/probex
 tar -xzf probex.tar.gz
 sudo ./probex -- sleep 1
 ```
-
 ## Demo 
 <video src="https://github.com/user-attachments/assets/5d66ac40-fefc-4cbb-9edc-2fa31e358ae7" controls="controls"></video>
 

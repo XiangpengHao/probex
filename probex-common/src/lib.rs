@@ -291,6 +291,294 @@ pub mod viewer_api {
         pub svg: Option<String>,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum ProbeSchemaSource {
+        TraceFsFormat,
+        KernelBtf,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum ProbeSchemaKind {
+        Tracepoint,
+        Fentry,
+        Fexit,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct ProbeSchemaArg {
+        pub name: String,
+        pub arg_type: String,
+        pub is_supported: bool,
+        pub unsupported_reason: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct ProbeSchemaField {
+        pub declaration: String,
+        pub name: String,
+        pub field_type: String,
+        pub offset: u32,
+        pub size: u32,
+        pub is_signed: bool,
+        pub is_common: bool,
+        pub is_supported: bool,
+        pub unsupported_reason: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct ProbeSchema {
+        pub display_name: String,
+        pub provider: String,
+        pub target: String,
+        pub probe: String,
+        pub symbol: Option<String>,
+        pub kind: ProbeSchemaKind,
+        pub source: ProbeSchemaSource,
+        pub return_type: Option<String>,
+        pub return_supported: bool,
+        pub return_unsupported_reason: Option<String>,
+        pub args: Vec<ProbeSchemaArg>,
+        pub fields: Vec<ProbeSchemaField>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum CustomProbeFieldRef {
+        Field { name: String },
+        Arg { name: String },
+        Return,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum CustomProbeFilterOp {
+        Eq,
+        Ne,
+        Gt,
+        Ge,
+        Lt,
+        Le,
+        Contains,
+        StartsWith,
+        EndsWith,
+        IsNull,
+        IsNotNull,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomProbeFilter {
+        pub field: CustomProbeFieldRef,
+        pub op: CustomProbeFilterOp,
+        pub value: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomProbeSpec {
+        pub probe_display_name: String,
+        pub record_fields: Vec<CustomProbeFieldRef>,
+        pub record_stack_trace: bool,
+        pub filters: Vec<CustomProbeFilter>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum CustomPayloadTypeKind {
+        U64,
+        I64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomPayloadFieldSchema {
+        pub field_id: u16,
+        pub name: String,
+        pub type_kind: CustomPayloadTypeKind,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomPayloadSchema {
+        pub schema_id: u32,
+        pub probe_display_name: String,
+        pub event_type: String,
+        pub fields: Vec<CustomPayloadFieldSchema>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct ProbeSchemasResponse {
+        pub probes: Vec<ProbeSchema>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct ProbeSchemasPageResponse {
+        pub probes: Vec<ProbeSchema>,
+        pub total: usize,
+        pub offset: usize,
+        pub limit: usize,
+        pub has_more: bool,
+        pub is_loading: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedProbeSchemasQuery {
+        pub search: Option<String>,
+        pub category: Option<String>,
+        pub provider: Option<String>,
+        pub kinds: Option<Vec<ProbeSchemaKind>>,
+        pub source: Option<ProbeSchemaSource>,
+        pub offset: usize,
+        pub limit: usize,
+        pub include_fields: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct StartTraceRequest {
+        pub program: String,
+        pub args: Vec<String>,
+        pub output_parquet: String,
+        pub sample_freq_hz: u64,
+        pub custom_probes: Vec<CustomProbeSpec>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct LoadTraceRequest {
+        pub parquet_path: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum TraceRunStatus {
+        Idle,
+        Running {
+            run_id: u64,
+            command: Vec<String>,
+            output_parquet: String,
+            started_at_unix_ms: u64,
+        },
+        Finished {
+            run_id: u64,
+            command: Vec<String>,
+            output_parquet: String,
+            started_at_unix_ms: u64,
+            finished_at_unix_ms: u64,
+            exit_code: i32,
+            success: bool,
+            error: Option<String>,
+        },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TraceRunStatusResponse {
+        pub sequence: u64,
+        pub status: TraceRunStatus,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum TraceDebugStepStatus {
+        Pending,
+        Running,
+        Success,
+        Failed,
+        Skipped,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TraceDebugStep {
+        pub step: String,
+        pub status: TraceDebugStepStatus,
+        pub detail: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct TraceDebugInfo {
+        pub generated_rust_code: String,
+        pub steps: Vec<TraceDebugStep>,
+        pub last_error: Option<String>,
+        pub updated_at_unix_ms: u64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum PrivilegedDaemonRequest {
+        AttachTrace {
+            target_pid: u32,
+            command: Vec<String>,
+            output_parquet: String,
+            sample_freq_hz: u64,
+            custom_probes: Vec<CustomProbeSpec>,
+            prebuilt_generated_ebpf_path: Option<String>,
+        },
+        TakeTraceMapFds,
+        StopTrace,
+        Status,
+        QueryProbeSchemasPage {
+            query: PrivilegedProbeSchemasQuery,
+        },
+        QueryProbeSchemaDetail {
+            display_name: String,
+        },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedDaemonResponse {
+        pub ok: bool,
+        pub status: Option<TraceRunStatusResponse>,
+        pub probe_schemas_page: Option<ProbeSchemasPageResponse>,
+        pub probe_schema_detail: Option<ProbeSchema>,
+        pub error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedDaemonEnvelope {
+        pub session_token: String,
+        pub request: PrivilegedDaemonRequest,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedTraceMapFdsResponse {
+        pub ok: bool,
+        pub run_id: Option<u64>,
+        pub has_custom_events: bool,
+        pub error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventDebugField {
+        pub field_id: u16,
+        pub name: String,
+        pub type_kind: CustomPayloadTypeKind,
+        pub value_u64: u64,
+        pub value_i64: Option<i64>,
+        pub display_value: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventDebugRow {
+        pub ts_ns: u64,
+        pub event_type: String,
+        pub pid: u32,
+        pub tgid: u32,
+        pub process_name: Option<String>,
+        pub schema_id: u32,
+        pub fields: Vec<CustomEventDebugField>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventField {
+        pub field_id: u16,
+        pub name: String,
+        pub type_kind: CustomPayloadTypeKind,
+        pub value_u64: u64,
+        pub value_i64: Option<i64>,
+        pub display_value: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomEventPayload {
+        pub schema_id: u32,
+        pub fields: Vec<CustomEventField>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct CustomEventsDebugResponse {
+        pub events: Vec<CustomEventDebugRow>,
+        pub shown: usize,
+        pub limit: usize,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct IoTypeStats {
         pub operation: String,
@@ -340,6 +628,7 @@ pub mod viewer_api {
         pub event_type: String,
         pub pid: u32,
         pub stack_trace: Option<Vec<String>>,
+        pub custom_payload: Option<CustomEventPayload>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

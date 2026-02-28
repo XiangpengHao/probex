@@ -1,7 +1,10 @@
 pub use probex_common::viewer_api::{
-    EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts,
-    HistogramResponse, IoStatistics, IoTypeStats, MemoryStatistics, ProcessEventsResponse,
-    ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats, TraceSummary,
+    CustomEventsDebugResponse, CustomProbeFieldRef, CustomProbeFilter, CustomProbeFilterOp,
+    CustomProbeSpec, EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker,
+    EventTypeCounts, HistogramResponse, IoStatistics, IoTypeStats, MemoryStatistics, ProbeSchema,
+    ProbeSchemaKind, ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime,
+    ProcessLifetimesResponse, StartTraceRequest, SyscallLatencyStats, TraceDebugInfo,
+    TraceDebugStepStatus, TraceRunStatus, TraceRunStatusResponse, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
@@ -21,7 +24,7 @@ where
             }
             url.push_str(key);
             url.push('=');
-            url.push_str(value);
+            url.push_str(&percent_encode_component(value));
         }
     }
 
@@ -45,8 +48,122 @@ where
         .map_err(|error| error.to_string())
 }
 
+async fn post_json<B, T>(path: &str, body: &B) -> ApiResult<T>
+where
+    B: serde::Serialize + ?Sized,
+    T: serde::de::DeserializeOwned,
+{
+    use gloo_net::http::Request;
+
+    let response = Request::post(path)
+        .header("content-type", "application/json")
+        .json(body)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if !response.ok() {
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("HTTP {status}: failed to read response body: {error}"))?;
+        return Err(format!("HTTP {status}: {text}"));
+    }
+
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn percent_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
+}
+
 pub async fn get_summary() -> ApiResult<TraceSummary> {
     get_json("/api/summary", &[]).await
+}
+
+pub async fn get_probe_schemas_page(
+    search: Option<String>,
+    category: Option<String>,
+    kinds: Option<String>,
+    source: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> ApiResult<ProbeSchemasPageResponse> {
+    let mut query = vec![("offset", offset.to_string()), ("limit", limit.to_string())];
+    if let Some(search) = search {
+        query.push(("search", search));
+    }
+    if let Some(category) = category {
+        query.push(("category", category));
+    }
+    if let Some(kinds) = kinds {
+        query.push(("kinds", kinds));
+    }
+    if let Some(source) = source {
+        query.push(("source", source));
+    }
+    get_json("/api/probe_schemas_page", &query).await
+}
+
+pub async fn get_probe_schema_detail(display_name: String) -> ApiResult<ProbeSchema> {
+    get_json(
+        "/api/probe_schema_detail",
+        &[("display_name", display_name)],
+    )
+    .await
+}
+
+pub async fn get_trace_run_status(
+    last_sequence: Option<u64>,
+    wait_ms: Option<u64>,
+) -> ApiResult<TraceRunStatusResponse> {
+    let mut query = Vec::new();
+    if let Some(last_sequence) = last_sequence {
+        query.push(("last_sequence", last_sequence.to_string()));
+    }
+    if let Some(wait_ms) = wait_ms {
+        query.push(("wait_ms", wait_ms.to_string()));
+    }
+    get_json("/api/trace/status", &query).await
+}
+
+pub async fn get_trace_debug_info() -> ApiResult<TraceDebugInfo> {
+    get_json("/api/trace/debug", &[]).await
+}
+
+pub async fn get_custom_events_debug() -> ApiResult<CustomEventsDebugResponse> {
+    get_json("/api/custom_events_debug", &[]).await
+}
+
+pub async fn start_trace_run(request: StartTraceRequest) -> ApiResult<TraceRunStatusResponse> {
+    post_json("/api/trace/start", &request).await
+}
+
+pub async fn stop_trace_run() -> ApiResult<TraceRunStatusResponse> {
+    post_json::<_, TraceRunStatusResponse>("/api/trace/stop", &()).await
+}
+
+pub async fn load_trace_file(parquet_path: String) -> ApiResult<TraceSummary> {
+    post_json(
+        "/api/trace/load",
+        &probex_common::viewer_api::LoadTraceRequest { parquet_path },
+    )
+    .await
 }
 
 pub async fn get_histogram(

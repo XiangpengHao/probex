@@ -27,7 +27,7 @@ clap = { workspace = true, features = ["derive", "help"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "socket", "uio"] }
 arrow = { workspace = true }
 parquet = { workspace = true }
 tokio = { workspace = true, features = [
@@ -35,6 +35,8 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "net",
     "signal",
+    "process",
+    "time",
 ] }
 datafusion = { workspace = true }
 inferno = "0.12"
@@ -44,6 +46,8 @@ serde_json = "1"
 serde = { workspace = true, features = ["derive"] }
 rust-embed = { version = "8.11.0", features = ["mime-guess"] }
 chrono = "0.4.43"
+btf-rs = "1.1.1"
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 parquet = { workspace = true }
