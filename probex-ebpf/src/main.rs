@@ -307,9 +307,9 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
 
 fn try_sched_process_fork(ctx: &TracePointContext) -> Result<u32, i64> {
     // Read parent_pid at offset 24
-    let parent_pid: u32 = unsafe { ctx.read_at(24)? };
+    let parent_pid: u32 = unsafe { ctx.read_at(12)? };
     // Read child_pid at offset 44
-    let child_pid: u32 = unsafe { ctx.read_at(44)? };
+    let child_pid: u32 = unsafe { ctx.read_at(20)? };
 
     // Only track if parent is being traced
     if !is_traced(parent_pid) {
