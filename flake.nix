@@ -101,8 +101,7 @@
             set -euo pipefail
 
             if [ "$#" -eq 0 ]; then
-              echo "Usage: nix run .#probex -- [--view trace.parquet] | <program> [args...]"
-              exit 2
+              echo "Launching probex viewer (no trace file specified)..."
             fi
 
             if [ ! -f Cargo.toml ] || [ ! -d probex ] || [ ! -d probex-viewer ]; then
