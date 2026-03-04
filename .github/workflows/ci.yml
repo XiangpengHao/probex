@@ -19,21 +19,38 @@ jobs:
       - name: Enable Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@v8
 
-      - name: Run CI in Nix Dev Shell
+      - name: Check formatting
+        run: nix develop --accept-flake-config -c cargo fmt --all -- --check
+
+      - name: Build frontend bundle
+        run: nix develop --accept-flake-config -c dx bundle --release --platform web -p probex-viewer
+
+      - name: Sync bundled frontend assets
         run: |
-          nix develop --accept-flake-config -c bash -lc '
-            set -euo pipefail
+          rm -rf probex/assets/viewer
+          mkdir -p probex/assets/viewer
+          cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
 
-            cargo fmt --all -- --check
+      - name: Clippy
+        env:
+          PROBEX_SKIP_FRONTEND_BUNDLE: "1"
+        run: nix develop --accept-flake-config -c cargo clippy -p probex -p probex-common -p probex-viewer --all-targets
 
-            dx bundle --release --platform web -p probex-viewer
-            rm -rf probex/assets/viewer
-            mkdir -p probex/assets/viewer
-            cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
+      - name: Check host crates
+        env:
+          PROBEX_SKIP_FRONTEND_BUNDLE: "1"
+        run: nix develop --accept-flake-config -c cargo check -p probex -p probex-common
 
-            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo clippy -p probex -p probex-common -p probex-viewer --all-targets
-            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo check -p probex -p probex-common
-            cargo check -p probex-viewer --target wasm32-unknown-unknown
-            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo build --release -p probex
-            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo package -p probex --allow-dirty --no-verify --list | grep "^assets/viewer/index.html$"
-          '
+      - name: Check viewer wasm target
+        run: nix develop --accept-flake-config -c cargo check -p probex-viewer --target wasm32-unknown-unknown
+
+      - name: Build release binary
+        env:
+          PROBEX_SKIP_FRONTEND_BUNDLE: "1"
+        run: nix develop --accept-flake-config -c cargo build --release -p probex
+
+      - name: Verify packaged frontend asset
+        env:
+          PROBEX_SKIP_FRONTEND_BUNDLE: "1"
+        run: |
+          nix develop --accept-flake-config -c cargo package -p probex --allow-dirty --no-verify --list | grep "^assets/viewer/index.html$"
