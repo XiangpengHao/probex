@@ -84,8 +84,14 @@ fn build_ebpf_from_source(output_binary: &Path) -> anyhow::Result<()> {
         cmd.args(["-Z", "build-std=core"]);
     }
 
-    cmd.args(["--bins", "--release", "--target", target.as_str(), "--target-dir"])
-        .arg(&target_dir);
+    cmd.args([
+        "--bins",
+        "--release",
+        "--target",
+        target.as_str(),
+        "--target-dir",
+    ])
+    .arg(&target_dir);
 
     let status = cmd
         .status()
